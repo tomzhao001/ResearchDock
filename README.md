@@ -21,7 +21,7 @@
 
 ## 本地开发（命令行启动，推荐调试）
 
-适合在本机改代码、看实时日志。需已安装：**Python 3.12+**、**Node.js 18+**、以及 **PostgreSQL（含 pgvector）** 或通过 Compose **仅启动数据库容器**。
+适合在本机改代码、看实时日志。需已安装：**Python 3.12+**、**Node.js 18+**、以及 **PostgreSQL（含 pgvector）** 或通过 Compose **仅启动数据库容器**。若要在本机运行 PDF OCR worker，还需安装 **Redis**，并在 `.env` 中配置可用的 GLM-OCR API key。
 
 ### 1. 环境与数据库
 
@@ -73,7 +73,53 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 健康检查：[http://localhost:8000/health](http://localhost:8000/health)
 
-### 3. 启动前端（Next.js）
+### 3. 启动 Celery Worker（PDF OCR 异步任务）
+
+本地命令行开发时，`celery worker` 需要**单独启动一个终端**。若使用 `docker compose up -d --build` 启全部服务，则 `celery-worker` 会随 Compose 一起启动，无需再手动执行。
+
+默认依赖：
+
+- `REDIS_URL=redis://localhost:6379/1`
+- `OCR_PROVIDER=glm_ocr`
+- `LLM_OCR_API_KEY=your-api-key`
+- `LLM_OCR_MODEL=glm-ocr`
+
+**Bash / zsh：**
+
+```bash
+cd backend
+source .venv/bin/activate
+export REDIS_URL=redis://localhost:6379/1
+export CELERY_BROKER_URL=redis://localhost:6379/1
+export CELERY_RESULT_BACKEND=redis://localhost:6379/1
+export OCR_PROVIDER=glm_ocr
+export LLM_OCR_API_KEY=your-api-key
+export LLM_OCR_MODEL=glm-ocr
+celery -A app.celery_app.celery_app worker --loglevel=info
+```
+
+**PowerShell（Windows，Conda）：**
+
+```powershell
+cd backend
+conda activate researchdock
+$env:REDIS_URL = "redis://localhost:6379/1"
+$env:CELERY_BROKER_URL = "redis://localhost:6379/1"
+$env:CELERY_RESULT_BACKEND = "redis://localhost:6379/1"
+$env:OCR_PROVIDER = "glm_ocr"
+$env:LLM_OCR_API_KEY = "your-api-key"
+$env:LLM_OCR_MODEL = "glm-ocr"
+celery -A app.celery_app.celery_app worker --loglevel=info
+```
+
+说明：
+
+- 上传 PDF 后，后端 API 只负责入队；真正的文本提取与 OCR 在 worker 中执行。
+- 当前实现优先读取 PDF 文本层；只有页级文本质量不足时才会触发 OCR fallback。
+- 当前 OCR fallback 通过智谱官方 `GLM-OCR` 接口完成，不再依赖本地 `tesseract`。
+- 本机运行 worker 时，请确认 `redis-server` 已启动，且 `.env` 中已配置 `LLM_OCR_API_KEY`。
+
+### 4. 启动前端（Next.js）
 
 另开终端（日志在当前终端）：
 
@@ -99,7 +145,7 @@ npm run dev
 
 开发地址通常为 [http://localhost:3000](http://localhost:3000)。
 
-### 4. 启动 n8n（命令行）
+### 5. 启动 n8n（命令行）
 
 若不使用 Compose 里的 n8n 容器，可在本机用 **npx** 启动（需 Node.js；日志在当前终端）：
 
@@ -185,5 +231,8 @@ npx n8n
 - `NEXT_PUBLIC_N8N_URL`：前端「打开 n8n」链接（默认 `http://localhost:5678`）。
 - `FRONTEND_ORIGIN`：后端 CORS 允许的前端源（默认 `http://localhost:3000`）。
 - `APP_SECRET_KEY`：JWT 签名密钥，生产环境务必更换。
+- `OCR_PROVIDER`：当前默认 `glm_ocr`，通过 adapter 统一接入 OCR 服务。
+- `LLM_OCR_API_KEY`：智谱 GLM-OCR 的 API key；worker 触发 OCR fallback 时必填。
+- `LLM_OCR_BASE_URL` / `LLM_OCR_MODEL`：默认分别为智谱官方 `layout_parsing` 接口与 `glm-ocr` 模型。
 - 生产环境若走 HTTPS，请将 `COOKIE_SECURE` 设为 `true`。
 

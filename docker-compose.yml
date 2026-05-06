@@ -16,6 +16,11 @@ services:
       timeout: 5s
       retries: 10
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
   backend:
     build: ./backend
     ports:
@@ -30,11 +35,55 @@ services:
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:3000}
       COOKIE_SECURE: "${COOKIE_SECURE:-false}"
       FILE_STORAGE_PATH: /data/files
+      REDIS_URL: redis://redis:6379/1
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      CELERY_TASK_ALWAYS_EAGER: "false"
+      OCR_PROVIDER: ${OCR_PROVIDER:-glm_ocr}
+      LLM_OCR_BASE_URL: ${LLM_OCR_BASE_URL:-https://api.z.ai/api/paas/v4/layout_parsing}
+      LLM_OCR_API_KEY: ${LLM_OCR_API_KEY:-}
+      LLM_OCR_MODEL: ${LLM_OCR_MODEL:-glm-ocr}
+      LLM_OCR_TIMEOUT_SECONDS: ${LLM_OCR_TIMEOUT_SECONDS:-120}
+      LLM_OCR_MAX_RETRIES: ${LLM_OCR_MAX_RETRIES:-2}
+      LLM_OCR_RETRY_BACKOFF_SECONDS: ${LLM_OCR_RETRY_BACKOFF_SECONDS:-0.5}
+      LLM_OCR_VERIFY_SSL: "${LLM_OCR_VERIFY_SSL:-true}"
     volumes:
       - files_data:/data/files
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_started
+
+  celery-worker:
+    build: ./backend
+    command: ["celery", "-A", "app.celery_app.celery_app", "worker", "--loglevel=info"]
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: paper_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me}
+      POSTGRES_DB: paper_archive
+      FILE_STORAGE_PATH: /data/files
+      REDIS_URL: redis://redis:6379/1
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      CELERY_TASK_ALWAYS_EAGER: "false"
+      OCR_PROVIDER: ${OCR_PROVIDER:-glm_ocr}
+      LLM_OCR_BASE_URL: ${LLM_OCR_BASE_URL:-https://api.z.ai/api/paas/v4/layout_parsing}
+      LLM_OCR_API_KEY: ${LLM_OCR_API_KEY:-}
+      LLM_OCR_MODEL: ${LLM_OCR_MODEL:-glm-ocr}
+      LLM_OCR_TIMEOUT_SECONDS: ${LLM_OCR_TIMEOUT_SECONDS:-120}
+      LLM_OCR_MAX_RETRIES: ${LLM_OCR_MAX_RETRIES:-2}
+      LLM_OCR_RETRY_BACKOFF_SECONDS: ${LLM_OCR_RETRY_BACKOFF_SECONDS:-0.5}
+      LLM_OCR_VERIFY_SSL: "${LLM_OCR_VERIFY_SSL:-true}"
+    volumes:
+      - files_data:/data/files
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
 
   frontend:
     build:

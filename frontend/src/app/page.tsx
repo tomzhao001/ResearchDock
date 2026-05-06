@@ -3,6 +3,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
 
+import { UploadPanel } from "@/components/upload-panel";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { apiFetch } from "@/lib/api";
@@ -50,7 +51,7 @@ export default function Home() {
       <header className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">ResearchDock</h1>
-          <p className="text-muted-foreground text-sm">论文归档与问答系统 — Milestone 1 工程骨架</p>
+          <p className="text-muted-foreground text-sm">论文归档与问答系统 — Milestone 2 PDF 上传与异步 OCR</p>
         </div>
         <div className="flex items-center gap-2">
           <span className="text-muted-foreground text-sm">已登录：{me.username}</span>
@@ -69,13 +70,14 @@ export default function Home() {
           <Row label="当前用户" value={me.username} />
           <Row label="前端" value="Next.js + Tailwind + shadcn/ui" />
           <Row label="后端 API" value={process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"} />
+          <Row label="异步任务" value="Celery + Redis worker" />
         </CardContent>
         <CardFooter className="flex flex-col items-start gap-3 border-t pt-6 sm:flex-row sm:flex-wrap">
           <PlaceholderButton disabled>设置（即将推出）</PlaceholderButton>
           <PlaceholderButton disabled>抓取源（即将推出）</PlaceholderButton>
-          <PlaceholderButton disabled>论文库（即将推出）</PlaceholderButton>
+          <PlaceholderButton disabled>论文库（Milestone 3）</PlaceholderButton>
           <PlaceholderButton disabled>问答（即将推出）</PlaceholderButton>
-          <PlaceholderButton disabled>任务（即将推出）</PlaceholderButton>
+          <PlaceholderButton disabled>任务列表（下一步）</PlaceholderButton>
           <a
             href={n8nUrl}
             target="_blank"
@@ -86,6 +88,8 @@ export default function Home() {
           </a>
         </CardFooter>
       </Card>
+
+      <UploadPanel />
     </div>
   );
 }

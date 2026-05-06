@@ -52,6 +52,36 @@ class Settings(BaseSettings):
     frontend_origin: str = "http://localhost:3000"
     cookie_name: str = "rd_access_token"
     cookie_secure: bool = False  # set COOKIE_SECURE=true behind HTTPS in production
+    file_storage_path: Path = _REPO_ROOT / "data" / "files"
+    redis_url: str = "redis://localhost:6379/1"
+    celery_broker_url: str = ""
+    celery_result_backend: str = ""
+    celery_task_always_eager: bool = False
+    ocr_provider: str = "glm_ocr"
+    llm_ocr_base_url: str = "https://api.z.ai/api/paas/v4/layout_parsing"
+    llm_ocr_api_key: str = ""
+    llm_ocr_model: str = "glm-ocr"
+    llm_ocr_timeout_seconds: int = 120
+    llm_ocr_max_retries: int = 2
+    llm_ocr_retry_backoff_seconds: float = 0.5
+    llm_ocr_verify_ssl: bool = True
+    ocr_min_chars_per_page: int = 300
+    ocr_min_alpha_ratio: float = 0.6
+    ocr_max_empty_page_ratio: float = 0.4
+    ocr_min_average_chars_per_page: int = 800
+
+    @model_validator(mode="after")
+    def _resolve_paths_and_queue(self) -> Self:
+        storage_path = self.file_storage_path
+        if not storage_path.is_absolute():
+            storage_path = (_REPO_ROOT / storage_path).resolve()
+        object.__setattr__(self, "file_storage_path", storage_path)
+
+        broker = (self.celery_broker_url or "").strip() or self.redis_url
+        backend = (self.celery_result_backend or "").strip() or broker
+        object.__setattr__(self, "celery_broker_url", broker)
+        object.__setattr__(self, "celery_result_backend", backend)
+        return self
 
 
 settings = Settings()
