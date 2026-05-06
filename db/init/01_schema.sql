@@ -51,7 +51,8 @@ CREATE TABLE papers (
     ingest_type VARCHAR(32),
     status VARCHAR(32),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ
 );
 
 CREATE TABLE paper_assets (

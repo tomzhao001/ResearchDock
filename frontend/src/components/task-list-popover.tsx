@@ -99,7 +99,7 @@ export function TaskListPopover({ onOpenPaper }: TaskListPopoverProps) {
       </Button>
 
       {open ? (
-        <Card className="absolute right-0 top-11 z-20 w-[360px] border-none bg-white/95 shadow-xl ring-1 ring-slate-200 backdrop-blur">
+        <Card className="absolute right-0 top-11 z-20 w-[420px] border-none bg-white/95 shadow-xl ring-1 ring-slate-200 backdrop-blur">
           <CardHeader className="border-b border-slate-200/80">
             <CardTitle className="flex items-center justify-between text-sm">
               <span>最近任务</span>
@@ -144,6 +144,8 @@ export function TaskListPopover({ onOpenPaper }: TaskListPopoverProps) {
                   <p>类型：{job.job_type || "-"}</p>
                   <p>论文：{job.paper_id ? `#${job.paper_id}` : "-"}</p>
                   <p>创建：{formatTime(job.created_at)}</p>
+                  <p>开始：{formatTime(job.started_at)}</p>
+                  <p>结束：{formatTime(job.finished_at)}</p>
                   {job.error_message ? <p className="text-rose-600">错误：{job.error_message}</p> : null}
                 </div>
               </button>

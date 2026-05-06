@@ -30,14 +30,58 @@ class PaperDetailData:
     latest_job: Job | None
 
 
+class DuplicateFilenameError(RuntimeError):
+    def __init__(self, filename: str, existing_paper_id: int):
+        super().__init__(f"Duplicate filename: {filename}")
+        self.filename = filename
+        self.existing_paper_id = existing_paper_id
+
+
+def normalize_filename(filename: str) -> str:
+    return Path(filename or "upload.pdf").name.strip().casefold()
+
+
+def _active_paper_asset_rows(db: Session) -> list[tuple[Paper, PaperAsset]]:
+    rows = db.execute(
+        select(Paper, PaperAsset)
+        .join(PaperAsset, PaperAsset.paper_id == Paper.id)
+        .where(
+            Paper.deleted_at.is_(None),
+            PaperAsset.asset_type == "original_pdf",
+        )
+    ).all()
+    return [(paper, asset) for paper, asset in rows]
+
+
+def find_active_paper_by_original_filename(db: Session, filename: str) -> Paper | None:
+    normalized = normalize_filename(filename)
+    for paper, asset in _active_paper_asset_rows(db):
+        metadata = asset.metadata_json or {}
+        original_filename = metadata.get("original_filename") if isinstance(metadata, dict) else None
+        if isinstance(original_filename, str) and normalize_filename(original_filename) == normalized:
+            return paper
+    return None
+
+
 def create_upload_artifacts(
     db: Session,
     *,
     filename: str,
     content_type: str,
     payload: bytes,
+    overwrite: bool = False,
 ) -> UploadArtifacts:
     safe_name = Path(filename or "upload.pdf").name
+    existing_paper = find_active_paper_by_original_filename(db, safe_name)
+    if existing_paper is not None and not overwrite:
+        raise DuplicateFilenameError(safe_name, existing_paper.id)
+
+    if existing_paper is not None and overwrite:
+        now = datetime.now(timezone.utc)
+        existing_paper.deleted_at = now
+        existing_paper.updated_at = now
+        existing_paper.status = "deleted"
+
     content_hash = hashlib.sha256(payload).hexdigest()
     storage_dir = settings.file_storage_path / content_hash[:2]
     storage_dir.mkdir(parents=True, exist_ok=True)
@@ -77,12 +121,17 @@ def create_upload_artifacts(
 
 
 def list_papers(db: Session, *, limit: int = 50) -> list[Paper]:
-    statement = select(Paper).order_by(Paper.updated_at.desc(), Paper.id.desc()).limit(limit)
+    statement = (
+        select(Paper)
+        .where(Paper.deleted_at.is_(None))
+        .order_by(Paper.updated_at.desc(), Paper.id.desc())
+        .limit(limit)
+    )
     return db.scalars(statement).all()
 
 
 def get_paper_detail(db: Session, paper_id: int) -> PaperDetailData | None:
-    paper = db.get(Paper, paper_id)
+    paper = db.scalar(select(Paper).where(Paper.id == paper_id, Paper.deleted_at.is_(None)))
     if paper is None:
         return None
 
@@ -96,6 +145,29 @@ def get_paper_detail(db: Session, paper_id: int) -> PaperDetailData | None:
         select(Job).where(Job.paper_id == paper_id).order_by(Job.id.desc()).limit(1)
     )
     return PaperDetailData(paper=paper, asset=asset, latest_job=latest_job)
+
+
+def get_original_filename(asset: PaperAsset | None) -> str | None:
+    metadata = asset.metadata_json if asset else None
+    if not isinstance(metadata, dict):
+        return None
+    original_filename = metadata.get("original_filename")
+    return original_filename if isinstance(original_filename, str) else None
+
+
+def update_paper_title(db: Session, paper_id: int, title: str) -> PaperDetailData | None:
+    paper = db.scalar(select(Paper).where(Paper.id == paper_id, Paper.deleted_at.is_(None)))
+    if paper is None:
+        return None
+
+    normalized_title = title.strip()
+    if not normalized_title:
+        raise ValueError("Title is required")
+
+    paper.title = normalized_title
+    paper.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    return get_paper_detail(db, paper_id)
 
 
 def run_pdf_ingest_job(

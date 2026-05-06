@@ -1,14 +1,17 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { FileText, LoaderCircle, ScanText } from "lucide-react";
+import { LoaderCircle, PencilLine, Save, ScanText, Upload, X } from "lucide-react";
 
-import { UploadPanel } from "@/components/upload-panel";
+import { PaperUploadDialog } from "@/components/paper-upload-dialog";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { TabPanel, Tabs } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 import {
   fetchPaper,
   fetchPapers,
+  updatePaperTitle,
   type JobPublic,
   type PaperDetail,
   type PaperListItem,
@@ -57,6 +60,12 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
+  const [uploadDialogOpen, setUploadDialogOpen] = useState(false);
+  const [previewTab, setPreviewTab] = useState<"summary" | "ocr">("summary");
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState("");
+  const [titleError, setTitleError] = useState<string | null>(null);
+  const [titleSaving, setTitleSaving] = useState(false);
 
   const loadPapers = useCallback(
     async (preferredPaperId?: number | null) => {
@@ -151,30 +160,56 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
     await loadDetail(job.paper_id ?? selectedPaperId);
   }
 
-  return (
-    <div className="grid gap-6 xl:grid-cols-[minmax(340px,420px)_minmax(0,1fr)]">
-      <div className="grid gap-6">
-        <Card className="border-none bg-gradient-to-br from-slate-950 via-slate-900 to-slate-800 text-slate-50 ring-1 ring-slate-800/80">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-lg">
-              <FileText className="size-4" />
-              论文归档
-            </CardTitle>
-            <CardDescription className="text-slate-300">
-              首页直接展示已归档论文，上传后的处理进度也会继续在这里更新。
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="grid gap-4">
-            <UploadPanel pollDelayMs={2000} onUploadAccepted={handleUploadAccepted} onJobUpdate={handleJobUpdate} />
-          </CardContent>
-        </Card>
+  useEffect(() => {
+    setTitleDraft(paperDetail?.title ?? "");
+    setEditingTitle(false);
+    setTitleError(null);
+  }, [paperDetail?.id, paperDetail?.title]);
 
-        <Card className="border-none bg-white/80 shadow-sm ring-1 ring-slate-200 backdrop-blur">
-          <CardHeader>
-            <CardTitle>论文列表</CardTitle>
-            <CardDescription>按更新时间倒序展示，左侧选中后右侧查看摘要和 OCR 预览。</CardDescription>
+  async function handleSaveTitle() {
+    if (!paperDetail) {
+      return;
+    }
+
+    setTitleSaving(true);
+    setTitleError(null);
+    try {
+      const nextDetail = await updatePaperTitle(paperDetail.id, titleDraft);
+      setPaperDetail(nextDetail);
+      setEditingTitle(false);
+      await loadPapers(nextDetail.id);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "保存失败";
+      setTitleError(message);
+    } finally {
+      setTitleSaving(false);
+    }
+  }
+
+  return (
+    <>
+      <PaperUploadDialog
+        open={uploadDialogOpen}
+        onClose={() => setUploadDialogOpen(false)}
+        onUploadAccepted={handleUploadAccepted}
+        onJobUpdate={handleJobUpdate}
+      />
+
+      <div className="grid h-full min-h-0 gap-6 xl:grid-cols-[minmax(320px,420px)_minmax(0,1fr)]">
+        <Card className="min-h-0 border-none bg-white/80 shadow-sm ring-1 ring-slate-200 backdrop-blur">
+          <CardHeader className="gap-3">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <CardTitle>论文列表</CardTitle>
+                <CardDescription>按更新时间倒序展示，点击左侧条目后在右侧查看摘要、展示名和 OCR 预览。</CardDescription>
+              </div>
+              <Button type="button" size="sm" className="gap-2" onClick={() => setUploadDialogOpen(true)}>
+                <Upload className="size-4" />
+                上传 PDF
+              </Button>
+            </div>
           </CardHeader>
-          <CardContent className="grid gap-3">
+          <CardContent className="grid min-h-0 gap-3 overflow-y-auto">
             {loadingList ? (
               <div className="flex items-center gap-2 rounded-xl border border-dashed border-slate-200 px-4 py-6 text-sm text-slate-500">
                 <LoaderCircle className="size-4 animate-spin" />
@@ -206,6 +241,9 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                   <div>
                     <p className="font-medium leading-6">{paper.title || `未命名论文 #${paper.id}`}</p>
                     <p className={cn("mt-1 text-xs", selectedPaperId === paper.id ? "text-slate-300" : "text-slate-500")}>
+                      原始文件名：{paper.original_filename || "-"}
+                    </p>
+                    <p className={cn("mt-1 text-xs", selectedPaperId === paper.id ? "text-slate-300" : "text-slate-500")}>
                       更新于 {formatTime(paper.updated_at)}
                     </p>
                   </div>
@@ -225,103 +263,168 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
             ))}
           </CardContent>
         </Card>
-      </div>
-
-      <Card className="border-none bg-white/85 shadow-sm ring-1 ring-slate-200 backdrop-blur">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-lg">
-            <ScanText className="size-4" />
-            OCR / 摘要预览
-          </CardTitle>
-          <CardDescription>查看当前选中论文的摘要、结构化信息和提取文本预览。</CardDescription>
-        </CardHeader>
-        <CardContent className="grid gap-5">
-          {loadingDetail ? (
-            <div className="flex items-center gap-2 rounded-xl border border-dashed border-slate-200 px-4 py-6 text-sm text-slate-500">
-              <LoaderCircle className="size-4 animate-spin" />
-              正在加载论文详情...
-            </div>
-          ) : null}
-
-          {detailError ? <p className="text-sm text-destructive">{detailError}</p> : null}
-
-          {!selectedPaperId && !loadingDetail ? (
-            <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 px-6 py-12 text-center text-sm text-slate-500">
-              从左侧选择一篇论文，即可查看 OCR 预览和摘要结果。
-            </div>
-          ) : null}
-
-          {paperDetail && !loadingDetail ? (
-            <>
-              <div className="grid gap-4 rounded-2xl border border-slate-200 bg-slate-50/80 p-5">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div className="grid gap-1">
-                    <h2 className="text-xl font-semibold text-slate-950">{paperDetail.title || `未命名论文 #${paperDetail.id}`}</h2>
-                    <p className="text-sm text-slate-500">
-                      文件名：{paperDetail.original_filename || "-"} | 更新时间：{formatTime(paperDetail.updated_at)}
-                    </p>
-                  </div>
-                  <span className={cn("rounded-full px-3 py-1 text-xs font-medium ring-1", getStatusClassName(paperDetail.status))}>
-                    {statusLabel(paperDetail.status)}
-                  </span>
-                </div>
-
-                <section className="grid gap-2">
-                  <h3 className="text-sm font-medium text-slate-700">中文摘要</h3>
-                  <p className="rounded-2xl bg-white px-4 py-4 leading-7 text-slate-700 shadow-sm ring-1 ring-slate-200">
-                    {paperDetail.abstract_raw || "当前还没有生成摘要，可先检查模型配置是否已完成。"}
-                  </p>
-                </section>
-
-                {paperDetail.structured_summary ? (
-                  <section className="grid gap-3">
-                    <h3 className="text-sm font-medium text-slate-700">结构化信息</h3>
-                    <div className="grid gap-3 md:grid-cols-2">
-                      <SummaryBlock label="研究问题" value={paperDetail.structured_summary.research_question} />
-                      <SummaryBlock label="方法" value={paperDetail.structured_summary.method} />
-                      <SummaryBlock label="主要发现" value={paperDetail.structured_summary.findings} />
-                      <SummaryBlock label="局限性" value={paperDetail.structured_summary.limitations} />
-                    </div>
-                    {paperDetail.structured_summary.key_points.length > 0 ? (
-                      <div className="rounded-2xl bg-white px-4 py-4 shadow-sm ring-1 ring-slate-200">
-                        <h4 className="text-sm font-medium text-slate-700">要点总结</h4>
-                        <ul className="mt-3 grid gap-2 text-sm text-slate-600">
-                          {paperDetail.structured_summary.key_points.map((point) => (
-                            <li key={point}>- {point}</li>
-                          ))}
-                        </ul>
-                      </div>
-                    ) : null}
-                  </section>
-                ) : null}
+        <Card className="min-h-0 border-none bg-white/85 shadow-sm ring-1 ring-slate-200 backdrop-blur">
+          <CardHeader className="gap-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <CardTitle className="flex items-center gap-2 text-lg">
+                  <ScanText className="size-4" />
+                  OCR / 摘要预览
+                </CardTitle>
+                <CardDescription>查看当前选中论文的展示名、原始文件名、摘要信息和 OCR 文本内容。</CardDescription>
               </div>
+              <Tabs
+                value={previewTab}
+                onValueChange={setPreviewTab}
+                items={[
+                  { value: "summary", label: "摘要和文档信息" },
+                  { value: "ocr", label: "OCR 文本预览" },
+                ]}
+              />
+            </div>
+          </CardHeader>
+          <CardContent className="min-h-0 overflow-hidden">
+            {loadingDetail ? (
+              <div className="flex items-center gap-2 rounded-xl border border-dashed border-slate-200 px-4 py-6 text-sm text-slate-500">
+                <LoaderCircle className="size-4 animate-spin" />
+                正在加载论文详情...
+              </div>
+            ) : null}
 
-              <section className="grid gap-3">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div>
-                    <h3 className="text-sm font-medium text-slate-700">文本 / OCR 预览</h3>
-                    <p className="text-xs text-slate-500">
-                      总页数：{paperDetail.extraction_metadata?.page_count ?? "-"}，OCR 页：{" "}
-                      {(paperDetail.extraction_metadata?.used_ocr_pages || []).join(", ") || "-"}
-                    </p>
+            {detailError ? <p className="text-sm text-destructive">{detailError}</p> : null}
+
+            {!selectedPaperId && !loadingDetail ? (
+              <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 px-6 py-12 text-center text-sm text-slate-500">
+                从左侧选择一篇论文，即可查看 OCR 预览和摘要结果。
+              </div>
+            ) : null}
+
+            {paperDetail && !loadingDetail ? (
+              <div className="h-full overflow-y-auto pr-1">
+                <TabPanel active={previewTab === "summary"} className="grid gap-5">
+                  <div className="grid gap-4 rounded-2xl border border-slate-200 bg-slate-50/80 p-5">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="grid gap-3">
+                        {!editingTitle ? (
+                          <>
+                            <div>
+                              <h2 className="text-xl font-semibold text-slate-950">{paperDetail.title || `未命名论文 #${paperDetail.id}`}</h2>
+                              <p className="mt-1 text-sm text-slate-500">
+                                原始文件名：{paperDetail.original_filename || "-"} | 更新时间：{formatTime(paperDetail.updated_at)}
+                              </p>
+                            </div>
+                            <div className="flex flex-wrap gap-3">
+                              <Button type="button" variant="outline" size="sm" className="gap-2" onClick={() => setEditingTitle(true)}>
+                                <PencilLine className="size-4" />
+                                编辑展示名
+                              </Button>
+                            </div>
+                          </>
+                        ) : (
+                          <div className="grid gap-3">
+                            <label className="grid gap-2 text-sm font-medium text-slate-700">
+                              展示名
+                              <input
+                                value={titleDraft}
+                                onChange={(event) => setTitleDraft(event.target.value)}
+                                className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-slate-400 focus:ring-4 focus:ring-slate-200"
+                              />
+                            </label>
+                            {titleError ? <p className="text-sm text-destructive">{titleError}</p> : null}
+                            <div className="flex flex-wrap gap-3">
+                              <Button type="button" size="sm" className="gap-2" onClick={() => void handleSaveTitle()} disabled={titleSaving}>
+                                <Save className="size-4" />
+                                {titleSaving ? "保存中..." : "保存"}
+                              </Button>
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                className="gap-2"
+                                onClick={() => {
+                                  setEditingTitle(false);
+                                  setTitleDraft(paperDetail.title ?? "");
+                                  setTitleError(null);
+                                }}
+                                disabled={titleSaving}
+                              >
+                                <X className="size-4" />
+                                取消
+                              </Button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                      <div className="grid gap-2">
+                        <span className={cn("w-fit rounded-full px-3 py-1 text-xs font-medium ring-1", getStatusClassName(paperDetail.status))}>
+                          {statusLabel(paperDetail.status)}
+                        </span>
+                        {paperDetail.latest_job ? (
+                          <span
+                            className={cn(
+                              "w-fit rounded-full px-3 py-1 text-xs font-medium ring-1",
+                              getStatusClassName(paperDetail.latest_job.status)
+                            )}
+                          >
+                            最近任务：{statusLabel(paperDetail.latest_job.status)}
+                          </span>
+                        ) : null}
+                      </div>
+                    </div>
+
+                    <section className="grid gap-2">
+                      <h3 className="text-sm font-medium text-slate-700">中文摘要</h3>
+                      <p className="rounded-2xl bg-white px-4 py-4 leading-7 text-slate-700 shadow-sm ring-1 ring-slate-200">
+                        {paperDetail.abstract_raw || "当前还没有生成摘要，可先检查模型配置是否已完成。"}
+                      </p>
+                    </section>
+
+                    {paperDetail.structured_summary ? (
+                      <section className="grid gap-3">
+                        <h3 className="text-sm font-medium text-slate-700">结构化信息</h3>
+                        <div className="grid gap-3 md:grid-cols-2">
+                          <SummaryBlock label="研究问题" value={paperDetail.structured_summary.research_question} />
+                          <SummaryBlock label="方法" value={paperDetail.structured_summary.method} />
+                          <SummaryBlock label="主要发现" value={paperDetail.structured_summary.findings} />
+                          <SummaryBlock label="局限性" value={paperDetail.structured_summary.limitations} />
+                        </div>
+                        {paperDetail.structured_summary.key_points.length > 0 ? (
+                          <div className="rounded-2xl bg-white px-4 py-4 shadow-sm ring-1 ring-slate-200">
+                            <h4 className="text-sm font-medium text-slate-700">要点总结</h4>
+                            <ul className="mt-3 grid gap-2 text-sm text-slate-600">
+                              {paperDetail.structured_summary.key_points.map((point) => (
+                                <li key={point}>- {point}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        ) : null}
+                      </section>
+                    ) : null}
                   </div>
-                  {paperDetail.latest_job ? (
-                    <span className={cn("rounded-full px-3 py-1 text-xs font-medium ring-1", getStatusClassName(paperDetail.latest_job.status))}>
-                      最近任务：{statusLabel(paperDetail.latest_job.status)}
-                    </span>
-                  ) : null}
-                </div>
-                <div className="min-h-72 rounded-2xl border border-slate-200 bg-slate-950 px-5 py-5 font-mono text-sm leading-7 text-slate-200 shadow-inner">
-                  <pre className="overflow-x-auto whitespace-pre-wrap break-words">
-                    {paperDetail.preview_text || "当前还没有可预览的文本，任务完成后会在这里显示。"}
-                  </pre>
-                </div>
-              </section>
-            </>
-          ) : null}
-        </CardContent>
-      </Card>
-    </div>
+                </TabPanel>
+
+                <TabPanel active={previewTab === "ocr"} className="grid gap-3">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <h3 className="text-sm font-medium text-slate-700">文本 / OCR 预览</h3>
+                      <p className="text-xs text-slate-500">
+                        总页数：{paperDetail.extraction_metadata?.page_count ?? "-"}，OCR 页：{" "}
+                        {(paperDetail.extraction_metadata?.used_ocr_pages || []).join(", ") || "-"}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="min-h-[420px] rounded-2xl border border-slate-200 bg-slate-950 px-5 py-5 font-mono text-sm leading-7 text-slate-200 shadow-inner">
+                    <pre className="overflow-x-auto whitespace-pre-wrap break-words">
+                      {paperDetail.preview_text || "当前还没有可预览的文本，任务完成后会在这里显示。"}
+                    </pre>
+                  </div>
+                </TabPanel>
+              </div>
+            ) : null}
+          </CardContent>
+        </Card>
+      </div>
+    </>
   );
 }
 

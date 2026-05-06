@@ -3,9 +3,18 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { UploadPanel } from "@/components/upload-panel";
-import { fetchJob, uploadPaper } from "@/lib/papers";
+import { UploadConflictError, fetchJob, uploadPaper } from "@/lib/papers";
 
 vi.mock("@/lib/papers", () => ({
+  UploadConflictError: class UploadConflictError extends Error {
+    detail: { message: string; existing_paper_id: number; filename: string };
+
+    constructor(detail: { message: string; existing_paper_id: number; filename: string }) {
+      super(detail.message);
+      this.detail = detail;
+      this.name = "UploadConflictError";
+    }
+  },
   uploadPaper: vi.fn(),
   fetchJob: vi.fn(),
 }));
@@ -60,8 +69,7 @@ describe("UploadPanel", () => {
 
     await waitFor(() => expect(uploadPaper).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(fetchJob).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(screen.getByText("已完成")).toBeInTheDocument());
-    expect(screen.getByText("paper.pdf")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText(/当前上传已创建任务 #9/)).toBeInTheDocument());
   });
 
   it("上传失败时显示错误", async () => {
@@ -75,5 +83,25 @@ describe("UploadPanel", () => {
     await user.click(screen.getByRole("button", { name: "上传 PDF" }));
 
     expect(await screen.findByText("Only PDF files are supported")).toBeInTheDocument();
+  });
+
+  it("遇到同名文件时提示是否覆盖上传", async () => {
+    const user = userEvent.setup();
+    vi.mocked(uploadPaper).mockRejectedValue(
+      new UploadConflictError({
+        message: "已有相同文件名的文档，是否需要覆盖上传？",
+        existing_paper_id: 2,
+        filename: "paper.pdf",
+      })
+    );
+
+    render(<UploadPanel pollDelayMs={1} />);
+
+    const input = screen.getByLabelText("选择 PDF");
+    await user.upload(input, new File(["pdf"], "paper.pdf", { type: "application/pdf" }));
+    await user.click(screen.getByRole("button", { name: "上传 PDF" }));
+
+    expect(await screen.findByText("已有相同原始文件名的文档：paper.pdf。")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "确认覆盖上传" })).toBeInTheDocument();
   });
 });

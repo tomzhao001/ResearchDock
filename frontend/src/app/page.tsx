@@ -49,8 +49,8 @@ export default function Home() {
   }
 
   return (
-    <div className="min-h-screen bg-[radial-gradient(circle_at_top,rgba(148,163,184,0.18),transparent_34%),linear-gradient(180deg,#f8fafc_0%,#eef2ff_45%,#f8fafc_100%)]">
-      <div className="mx-auto flex min-h-screen max-w-7xl flex-col gap-8 px-6 py-8 lg:px-10">
+    <div className="h-dvh overflow-hidden bg-[radial-gradient(circle_at_top,rgba(148,163,184,0.18),transparent_34%),linear-gradient(180deg,#f8fafc_0%,#eef2ff_45%,#f8fafc_100%)]">
+      <div className="mx-auto flex h-full min-h-0 max-w-7xl flex-col gap-6 px-6 py-6 lg:px-10">
         <header className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
           <div className="grid gap-3">
             <div className="inline-flex w-fit items-center rounded-full border border-slate-200 bg-white/80 px-3 py-1 text-xs font-medium text-slate-600 shadow-sm backdrop-blur">
@@ -89,11 +89,13 @@ export default function Home() {
           </TabButton>
         </div>
 
-        {activeTab === "papers" ? (
-          <PaperWorkbench selectedPaperId={selectedPaperId} onSelectedPaperChange={setSelectedPaperId} />
-        ) : (
-          <ChatPanel />
-        )}
+        <div className="min-h-0 flex-1 overflow-hidden">
+          {activeTab === "papers" ? (
+            <PaperWorkbench selectedPaperId={selectedPaperId} onSelectedPaperChange={setSelectedPaperId} />
+          ) : (
+            <ChatPanel />
+          )}
+        </div>
       </div>
     </div>
   );

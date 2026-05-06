@@ -194,3 +194,140 @@ def test_paper_list_and_detail_return_preview_data(
     assert detail["original_filename"] == "milestone3.pdf"
     assert detail["structured_summary"]["method"] == "研究方法"
     assert detail["latest_job"]["status"] == "completed"
+
+
+def test_upload_rejects_duplicate_filename_without_overwrite(
+    client,
+    user,
+    monkeypatch: pytest.MonkeyPatch,
+    session_factory: sessionmaker,
+) -> None:
+    login(client)
+
+    original_delay = papers_router.process_uploaded_pdf.delay
+
+    def eager_delay(job_id: int):
+        run_pdf_ingest_job(
+            job_id,
+            session_factory=session_factory,
+            extractor=SuccessfulTextExtractor(),
+        )
+        return None
+
+    monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", eager_delay)
+
+    try:
+        first = client.post(
+            "/api/papers/upload",
+            files={"file": ("duplicate.pdf", make_pdf_bytes("first"), "application/pdf")},
+        )
+        second = client.post(
+            "/api/papers/upload",
+            files={"file": ("duplicate.pdf", make_pdf_bytes("second"), "application/pdf")},
+        )
+    finally:
+        monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", original_delay)
+
+    assert first.status_code == 202
+    assert second.status_code == 409
+    assert second.json()["detail"]["filename"] == "duplicate.pdf"
+
+    list_response = client.get("/api/papers")
+    assert list_response.status_code == 200
+    items = list_response.json()["items"]
+    assert len(items) == 1
+    assert items[0]["original_filename"] == "duplicate.pdf"
+
+
+def test_upload_overwrite_soft_deletes_previous_paper(
+    client,
+    user,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    session_factory: sessionmaker,
+) -> None:
+    login(client)
+
+    original_delay = papers_router.process_uploaded_pdf.delay
+
+    def eager_delay(job_id: int):
+        run_pdf_ingest_job(
+            job_id,
+            session_factory=session_factory,
+            extractor=SuccessfulTextExtractor(),
+        )
+        return None
+
+    monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", eager_delay)
+
+    try:
+        first = client.post(
+            "/api/papers/upload",
+            files={"file": ("replace.pdf", make_pdf_bytes("first"), "application/pdf")},
+        )
+        second = client.post(
+            "/api/papers/upload",
+            files={"file": ("replace.pdf", make_pdf_bytes("second"), "application/pdf"), "overwrite": (None, "true")},
+        )
+    finally:
+        monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", original_delay)
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+
+    first_paper = db_session.get(Paper, first.json()["paper_id"])
+    second_paper = db_session.get(Paper, second.json()["paper_id"])
+    assert first_paper is not None
+    assert second_paper is not None
+    assert first_paper.deleted_at is not None
+    assert second_paper.deleted_at is None
+
+    list_response = client.get("/api/papers")
+    assert list_response.status_code == 200
+    items = list_response.json()["items"]
+    assert len(items) == 1
+    assert items[0]["id"] == second.json()["paper_id"]
+
+
+def test_patch_paper_title_allows_duplicate_display_name(
+    client,
+    user,
+    monkeypatch: pytest.MonkeyPatch,
+    session_factory: sessionmaker,
+) -> None:
+    login(client)
+
+    original_delay = papers_router.process_uploaded_pdf.delay
+
+    def eager_delay(job_id: int):
+        run_pdf_ingest_job(
+            job_id,
+            session_factory=session_factory,
+            extractor=SuccessfulTextExtractor(),
+        )
+        return None
+
+    monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", eager_delay)
+
+    try:
+        first = client.post(
+            "/api/papers/upload",
+            files={"file": ("rename-a.pdf", make_pdf_bytes("first"), "application/pdf")},
+        )
+        second = client.post(
+            "/api/papers/upload",
+            files={"file": ("rename-b.pdf", make_pdf_bytes("second"), "application/pdf")},
+        )
+    finally:
+        monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", original_delay)
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+
+    first_title = client.patch(f"/api/papers/{first.json()['paper_id']}", json={"title": "统一展示名"})
+    second_title = client.patch(f"/api/papers/{second.json()['paper_id']}", json={"title": "统一展示名"})
+
+    assert first_title.status_code == 200
+    assert second_title.status_code == 200
+    assert first_title.json()["title"] == "统一展示名"
+    assert second_title.json()["title"] == "统一展示名"

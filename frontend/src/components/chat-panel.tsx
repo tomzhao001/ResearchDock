@@ -68,8 +68,8 @@ export function ChatPanel() {
   }
 
   return (
-    <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_320px]">
-      <Card className="border-none bg-white/85 shadow-sm ring-1 ring-slate-200 backdrop-blur">
+    <div className="grid h-full min-h-0 gap-6 xl:grid-cols-[minmax(0,1fr)_320px]">
+      <Card className="min-h-0 border-none bg-white/85 shadow-sm ring-1 ring-slate-200 backdrop-blur">
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-lg">
             <Bot className="size-4" />
@@ -77,8 +77,8 @@ export function ChatPanel() {
           </CardTitle>
           <CardDescription>当前阶段仅验证大模型链路，不接入知识库，也不会返回论文引用。</CardDescription>
         </CardHeader>
-        <CardContent className="grid gap-4">
-          <div className="grid max-h-[560px] gap-4 overflow-y-auto rounded-3xl bg-slate-50 p-4 ring-1 ring-slate-200">
+        <CardContent className="flex min-h-0 flex-1 flex-col gap-4">
+          <div className="grid min-h-0 flex-1 gap-4 overflow-y-auto rounded-3xl bg-slate-50 p-4 ring-1 ring-slate-200">
             {messages.map((message) => (
               <div
                 key={message.id}
@@ -126,7 +126,7 @@ export function ChatPanel() {
         </CardContent>
       </Card>
 
-      <Card className="border-none bg-gradient-to-br from-slate-950 via-slate-900 to-slate-800 text-slate-50 shadow-sm ring-1 ring-slate-800/80">
+      <Card className="min-h-0 border-none bg-gradient-to-br from-slate-950 via-slate-900 to-slate-800 text-slate-50 shadow-sm ring-1 ring-slate-800/80">
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-lg">
             <Sparkles className="size-4" />
@@ -136,7 +136,7 @@ export function ChatPanel() {
             本阶段只做通用问答与接口打通，避免提前引入 RAG 和知识库复杂度。
           </CardDescription>
         </CardHeader>
-        <CardContent className="grid gap-3 text-sm leading-7 text-slate-200">
+        <CardContent className="grid min-h-0 gap-3 overflow-y-auto text-sm leading-7 text-slate-200">
           <p>已支持：</p>
           <p>- 通过环境变量配置 OpenAI 兼容 Base URL、API Key 和模型名。</p>
           <p>- 发送问题并获得真实模型回复。</p>

@@ -26,6 +26,12 @@ class UploadAcceptedResponse(BaseModel):
     status: str
 
 
+class UploadConflictDetail(BaseModel):
+    message: str
+    existing_paper_id: int
+    filename: str
+
+
 class JobPublic(BaseModel):
     id: int
     job_type: str | None
@@ -47,6 +53,7 @@ class JobListResponse(BaseModel):
 class PaperListItem(BaseModel):
     id: int
     title: str | None
+    original_filename: str | None = None
     abstract_raw: str | None
     status: str | None
     created_at: datetime
@@ -76,6 +83,10 @@ class PaperDetailResponse(BaseModel):
     extraction_metadata: dict | None
     structured_summary: dict | None
     latest_job: JobPublic | None
+
+
+class PaperUpdateRequest(BaseModel):
+    title: str
 
 
 class ChatRequest(BaseModel):
