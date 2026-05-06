@@ -4,6 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.models import Job, Paper, PaperAsset
+from app.services import llm
 from app.routers import papers as papers_router
 from app.services.papers import run_pdf_ingest_job
 from app.services.pdf_extraction import DocumentExtractionResult, PDFTextExtractor
@@ -45,6 +46,24 @@ class SuccessfulTextExtractor(PDFTextExtractor):
 def login(client) -> None:
     response = client.post("/api/auth/login", json={"username": "admin", "password": "123456"})
     assert response.status_code == 200
+
+
+@pytest.fixture(autouse=True)
+def mock_summary(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.config.settings.openai_api_key", "")
+
+    def fake_summary(_: str) -> dict:
+        return {
+            "abstract_cn": "这是一段中文摘要。",
+            "key_points": ["要点一", "要点二", "要点三"],
+            "research_question": "研究问题",
+            "method": "研究方法",
+            "findings": "主要发现",
+            "limitations": "局限性",
+        }
+
+    monkeypatch.setattr(llm, "summarize_paper_text", fake_summary)
+    monkeypatch.setattr("app.services.papers.summarize_paper_text", fake_summary)
 
 
 def test_upload_requires_auth(client, user) -> None:
@@ -120,3 +139,58 @@ def test_upload_creates_records_and_completes_job(
     job_response = client.get(f"/api/jobs/{job.id}")
     assert job_response.status_code == 200
     assert job_response.json()["status"] == "completed"
+
+
+def test_paper_list_and_detail_return_preview_data(
+    client,
+    user,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    session_factory: sessionmaker,
+) -> None:
+    login(client)
+
+    original_delay = papers_router.process_uploaded_pdf.delay
+    monkeypatch.setattr("app.config.settings.openai_api_key", "test-key")
+
+    def eager_delay(job_id: int):
+        run_pdf_ingest_job(
+            job_id,
+            session_factory=session_factory,
+            extractor=SuccessfulTextExtractor(),
+        )
+        return None
+
+    monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", eager_delay)
+
+    try:
+        upload_response = client.post(
+            "/api/papers/upload",
+            files={
+                "file": (
+                    "milestone3.pdf",
+                    make_pdf_bytes("Milestone 3 paper body."),
+                    "application/pdf",
+                )
+            },
+        )
+    finally:
+        monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", original_delay)
+
+    assert upload_response.status_code == 202
+    body = upload_response.json()
+
+    list_response = client.get("/api/papers")
+    assert list_response.status_code == 200
+    items = list_response.json()["items"]
+    assert len(items) == 1
+    assert items[0]["id"] == body["paper_id"]
+    assert items[0]["abstract_raw"] == "这是一段中文摘要。"
+
+    detail_response = client.get(f"/api/papers/{body['paper_id']}")
+    assert detail_response.status_code == 200
+    detail = detail_response.json()
+    assert "embedded text layer" in detail["preview_text"]
+    assert detail["original_filename"] == "milestone3.pdf"
+    assert detail["structured_summary"]["method"] == "研究方法"
+    assert detail["latest_job"]["status"] == "completed"

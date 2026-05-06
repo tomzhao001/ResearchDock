@@ -633,6 +633,11 @@ MVP 页面建议如下：
 - 配置 OpenAI 兼容 API
 - 配置默认摘要与检索参数
 
+当前阶段说明：
+
+- Milestone 3 先通过环境变量配置 OpenAI 兼容接口
+- Web UI 设置页顺延到后续产品化阶段
+
 ## 14.2 抓取源管理页
 
 功能：
@@ -674,6 +679,11 @@ MVP 页面建议如下：
 - 查看答案
 - 查看引用片段和来源论文
 
+阶段拆分：
+
+- Milestone 3 先提供通用对话页，用于验证大模型接口已接通
+- Milestone 4 再实现基于论文归档内容的检索式问答与引用展示
+
 ## 14.7 任务页
 
 功能：
@@ -681,6 +691,11 @@ MVP 页面建议如下：
 - 查看抓取任务
 - 查看错误信息
 - 手动重试失败任务
+
+阶段拆分：
+
+- Milestone 3 先在首页右上角提供轻量任务查看入口，聚焦进行中与失败任务追踪
+- 完整任务页与手动重试能力放到后续产品化阶段完善
 
 ## 15. n8n 集成设计
 
@@ -790,12 +805,15 @@ FRONTEND_PORT=3000
 N8N_PORT=5678
 FILE_STORAGE_PATH=/data/files
 APP_SECRET_KEY=change_me
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_API_KEY=change_me
+OPENAI_MODEL=gpt-4o-mini
 ```
 
 说明：
 
-- OpenAI 兼容 API 配置优先通过 Web UI 保存到数据库
-- 环境变量只存放系统级启动配置
+- Milestone 3 先通过环境变量配置 OpenAI 兼容 API
+- Web UI 持久化配置可在后续阶段补充
 
 ## 18.3 首次部署流程
 
@@ -803,7 +821,7 @@ APP_SECRET_KEY=change_me
 2. 配置 `.env`
 3. 执行 `docker compose up -d`
 4. 打开前端页面
-5. 在设置页配置 OpenAI 兼容 API 信息
+5. 在环境变量中配置 OpenAI 兼容 API 信息
 6. 在抓取源页添加公开论文链接
 7. 手动触发首次同步或等待定时任务
 

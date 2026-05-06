@@ -57,6 +57,11 @@ class Settings(BaseSettings):
     celery_broker_url: str = ""
     celery_result_backend: str = ""
     celery_task_always_eager: bool = False
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4o-mini"
+    openai_timeout_seconds: int = 60
+    openai_verify_ssl: bool = True
     ocr_provider: str = "glm_ocr"
     llm_ocr_base_url: str = "https://api.z.ai/api/paas/v4/layout_parsing"
     llm_ocr_api_key: str = ""

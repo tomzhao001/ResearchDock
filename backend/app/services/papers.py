@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import SessionLocal
 from app.models import Job, Paper, PaperAsset
+from app.services.llm import summarize_paper_text
 from app.services.pdf_extraction import PDFTextExtractor
 
 
@@ -20,6 +21,13 @@ class UploadArtifacts:
     paper_id: int
     job_id: int
     filename: str
+
+
+@dataclass
+class PaperDetailData:
+    paper: Paper
+    asset: PaperAsset | None
+    latest_job: Job | None
 
 
 def create_upload_artifacts(
@@ -68,6 +76,28 @@ def create_upload_artifacts(
     return UploadArtifacts(paper_id=paper.id, job_id=job.id, filename=safe_name)
 
 
+def list_papers(db: Session, *, limit: int = 50) -> list[Paper]:
+    statement = select(Paper).order_by(Paper.updated_at.desc(), Paper.id.desc()).limit(limit)
+    return db.scalars(statement).all()
+
+
+def get_paper_detail(db: Session, paper_id: int) -> PaperDetailData | None:
+    paper = db.get(Paper, paper_id)
+    if paper is None:
+        return None
+
+    asset = db.scalar(
+        select(PaperAsset).where(
+            PaperAsset.paper_id == paper_id,
+            PaperAsset.asset_type == "original_pdf",
+        )
+    )
+    latest_job = db.scalar(
+        select(Job).where(Job.paper_id == paper_id).order_by(Job.id.desc()).limit(1)
+    )
+    return PaperDetailData(paper=paper, asset=asset, latest_job=latest_job)
+
+
 def run_pdf_ingest_job(
     job_id: int,
     *,
@@ -94,6 +124,7 @@ def run_pdf_ingest_job(
         job.status = "processing"
         job.started_at = now
         paper.status = "processing"
+        paper.updated_at = now
         db.commit()
 
         document = (extractor or PDFTextExtractor()).extract(Path(asset.storage_path))
@@ -101,7 +132,13 @@ def run_pdf_ingest_job(
         metadata["extraction"] = document.metadata
         asset.metadata_json = metadata
         asset.raw_text = document.raw_text
+        if settings.openai_api_key.strip():
+            summary = summarize_paper_text(document.raw_text)
+            paper.abstract_raw = summary.get("abstract_cn") or paper.abstract_raw
+            metadata["structured_summary"] = summary
+            asset.metadata_json = metadata
         paper.status = "completed"
+        paper.updated_at = datetime.now(timezone.utc)
         job.status = "completed"
         job.error_message = None
         job.finished_at = datetime.now(timezone.utc)
@@ -113,6 +150,7 @@ def run_pdf_ingest_job(
             job.finished_at = datetime.now(timezone.utc)
         if "paper" in locals() and paper is not None:
             paper.status = "failed"
+            paper.updated_at = datetime.now(timezone.utc)
         db.commit()
         raise
     finally:

@@ -1,6 +1,6 @@
 # ResearchDock
 
-论文归档与问答系统（MVP）。当前仓库已完成 **Milestone 1：工程骨架**。
+论文归档与问答系统（MVP）。当前仓库已推进到 **Milestone 3：摘要与结构化 / 首页工作台**。
 
 ## 技术栈
 
@@ -21,7 +21,7 @@
 
 ## 本地开发（命令行启动，推荐调试）
 
-适合在本机改代码、看实时日志。需已安装：**Python 3.12+**、**Node.js 18+**、以及 **PostgreSQL（含 pgvector）** 或通过 Compose **仅启动数据库容器**。若要在本机运行 PDF OCR worker，还需安装 **Redis**，并在 `.env` 中配置可用的 GLM-OCR API key。
+适合在本机改代码、看实时日志。需已安装：**Python 3.12+**、**Node.js 18+**、以及 **PostgreSQL（含 pgvector）** 或通过 Compose **仅启动数据库容器**。若要在本机运行 PDF OCR worker，还需安装 **Redis**，并在 `.env` 中配置可用的 GLM-OCR API key。若要验证 Milestone 3 的摘要生成与首页对话，还需配置 OpenAI 兼容接口信息。
 
 ### 1. 环境与数据库
 
@@ -83,6 +83,8 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 - `OCR_PROVIDER=glm_ocr`
 - `LLM_OCR_API_KEY=your-api-key`
 - `LLM_OCR_MODEL=glm-ocr`
+- `OPENAI_API_KEY=your-api-key`
+- `OPENAI_MODEL=your-model`
 
 **Bash / zsh：**
 
@@ -118,6 +120,7 @@ celery -A app.celery_app.celery_app worker --loglevel=info
 - 当前实现优先读取 PDF 文本层；只有页级文本质量不足时才会触发 OCR fallback。
 - 当前 OCR fallback 通过智谱官方 `GLM-OCR` 接口完成，不再依赖本地 `tesseract`。
 - 本机运行 worker 时，请确认 `redis-server` 已启动，且 `.env` 中已配置 `LLM_OCR_API_KEY`。
+- 若已配置 `OPENAI_*` 环境变量，worker 会在文本提取完成后继续生成中文摘要与结构化信息。
 
 ### 4. 启动前端（Next.js）
 
@@ -143,7 +146,7 @@ $env:NEXT_PUBLIC_N8N_URL = "http://localhost:5678"
 npm run dev
 ```
 
-开发地址通常为 [http://localhost:3000](http://localhost:3000)。
+开发地址通常为 [http://localhost:3000](http://localhost:3000)。登录后首页默认进入论文工作台，可在 `论文` / `对话` tab 间切换。
 
 ### 5. 启动 n8n（命令行）
 
@@ -200,20 +203,22 @@ npx n8n
 
 ---
 
-## Milestone 1 验收清单
+## Milestone 3 验收清单
 
-- `docker compose ps` 中 `frontend`、`backend`、`db`、`n8n` 均为 running
+- `docker compose ps` 中 `frontend`、`backend`、`db`、`n8n`、`celery-worker` 均可正常运行
 - `GET /health` 返回正常
-- 浏览器打开前端，使用 `admin` / `123456` 登录成功并进入首页
-- 可打开 n8n Web 界面
+- 浏览器打开前端，使用 `admin` / `123456` 登录成功并进入论文工作台
+- 上传 PDF 后，首页左侧出现论文记录，右侧可查看摘要与文本 / OCR 预览
+- 首页可切换到 `对话` tab，并通过 `OPENAI_*` 配置得到模型回复
+- 右上角任务入口可查看进行中和失败任务
 
 ---
 
 ## 仓库结构（摘录）
 
 ```
-├── backend/           # FastAPI：健康检查、JWT（HttpOnly Cookie）、/api/auth/*
-├── frontend/          # Next.js：登录页、受保护首页
+├── backend/           # FastAPI：认证、论文上传/列表/详情、任务、对话
+├── frontend/          # Next.js：登录页、论文工作台、通用对话、任务查看
 ├── db/init/           # PostgreSQL 初始化 SQL（表结构 + admin 种子）
 ├── docker-compose.yml
 └── .env.example
@@ -231,6 +236,8 @@ npx n8n
 - `NEXT_PUBLIC_N8N_URL`：前端「打开 n8n」链接（默认 `http://localhost:5678`）。
 - `FRONTEND_ORIGIN`：后端 CORS 允许的前端源（默认 `http://localhost:3000`）。
 - `APP_SECRET_KEY`：JWT 签名密钥，生产环境务必更换。
+- `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL`：首页通用对话与论文摘要生成使用的 OpenAI 兼容接口配置。
+- `OPENAI_TIMEOUT_SECONDS` / `OPENAI_VERIFY_SSL`：控制聊天与摘要请求的超时和证书校验。
 - `OCR_PROVIDER`：当前默认 `glm_ocr`，通过 adapter 统一接入 OCR 服务。
 - `LLM_OCR_API_KEY`：智谱 GLM-OCR 的 API key；worker 触发 OCR fallback 时必填。
 - `LLM_OCR_BASE_URL` / `LLM_OCR_MODEL`：默认分别为智谱官方 `layout_parsing` 接口与 `glm-ocr` 模型。

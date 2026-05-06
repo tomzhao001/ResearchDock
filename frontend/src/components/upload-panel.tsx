@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { fetchJob, uploadPaper, type JobPublic } from "@/lib/papers";
+import { fetchJob, uploadPaper, type JobPublic, type UploadAcceptedResponse } from "@/lib/papers";
 
 const POLLABLE_STATUSES = new Set(["queued", "processing"]);
 
@@ -23,7 +23,13 @@ function formatTime(value: string | null): string {
   return new Date(value).toLocaleString("zh-CN");
 }
 
-export function UploadPanel({ pollDelayMs = 2000 }: { pollDelayMs?: number }) {
+type UploadPanelProps = {
+  pollDelayMs?: number;
+  onUploadAccepted?: (accepted: UploadAcceptedResponse) => void;
+  onJobUpdate?: (job: JobPublic) => void;
+};
+
+export function UploadPanel({ pollDelayMs = 2000, onUploadAccepted, onJobUpdate }: UploadPanelProps) {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [job, setJob] = useState<JobPublic | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -37,12 +43,15 @@ export function UploadPanel({ pollDelayMs = 2000 }: { pollDelayMs?: number }) {
 
     const timer = window.setTimeout(() => {
       void fetchJob(job.id)
-        .then((nextJob) => setJob(nextJob))
+        .then((nextJob) => {
+          setJob(nextJob);
+          onJobUpdate?.(nextJob);
+        })
         .catch((nextError: Error) => setError(nextError.message));
     }, pollDelayMs);
 
     return () => window.clearTimeout(timer);
-  }, [job, pollDelayMs]);
+  }, [job, onJobUpdate, pollDelayMs]);
 
   const jobStatus = useMemo(() => statusLabel(job?.status ?? null), [job?.status]);
 
@@ -60,8 +69,10 @@ export function UploadPanel({ pollDelayMs = 2000 }: { pollDelayMs?: number }) {
 
     try {
       const accepted = await uploadPaper(selectedFile);
+      onUploadAccepted?.(accepted);
       const nextJob = await fetchJob(accepted.job_id);
       setJob(nextJob);
+      onJobUpdate?.(nextJob);
     } catch (submitError) {
       const message = submitError instanceof Error ? submitError.message : "上传失败";
       setError(message);
