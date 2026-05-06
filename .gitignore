@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local file storage (MVP)
+/data/files/
+data/files/
+
+# Cursor IDE
+.specstory/
+.vscode/
