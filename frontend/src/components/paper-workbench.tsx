@@ -33,6 +33,11 @@ function statusLabel(status: string | null): string {
   return "未知";
 }
 
+function phaseStatusLabel(status: string | null): string {
+  if (!status) return "未开始";
+  return statusLabel(status);
+}
+
 function formatTime(value: string | null): string {
   if (!value) return "-";
   return new Date(value).toLocaleString("zh-CN");
@@ -46,10 +51,38 @@ function getStatusClassName(status: string | null): string {
   return "bg-muted text-muted-foreground ring-border";
 }
 
+function getPhaseStatusClassName(status: string | null): string {
+  if (!status) return "bg-slate-200/80 text-slate-600 ring-slate-300";
+  return getStatusClassName(status);
+}
+
 function excerpt(value: string | null, maxLength = 96): string {
   const text = (value || "").trim();
   if (!text) return "尚未生成摘要";
   return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+}
+
+function PhaseBadge({
+  label,
+  status,
+  className,
+}: {
+  label: string;
+  status: string | null;
+  className?: string;
+}) {
+  return (
+    <span
+      className={cn(
+        "inline-flex min-w-[88px] items-center justify-center gap-1 whitespace-nowrap rounded-full px-3 py-1 text-center text-xs font-medium ring-1",
+        getPhaseStatusClassName(status),
+        className
+      )}
+    >
+      <span>{label}</span>
+      <span>{phaseStatusLabel(status)}</span>
+    </span>
+  );
 }
 
 type PaperWorkbenchProps = {
@@ -132,11 +165,11 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
   }, [loadDetail]);
 
   const shouldPoll = useMemo(() => {
-    if (papers.some((paper) => ACTIVE_STATUSES.has(paper.status ?? ""))) {
+    if (papers.some((paper) => ACTIVE_STATUSES.has(paper.ocr_status ?? "") || ACTIVE_STATUSES.has(paper.summary_status ?? ""))) {
       return true;
     }
-    return ACTIVE_STATUSES.has(paperDetail?.latest_job?.status ?? "");
-  }, [paperDetail?.latest_job?.status, papers]);
+    return ACTIVE_STATUSES.has(paperDetail?.ocr_status ?? "") || ACTIVE_STATUSES.has(paperDetail?.summary_status ?? "");
+  }, [paperDetail?.ocr_status, paperDetail?.summary_status, papers]);
 
   useEffect(() => {
     if (!shouldPoll) return;
@@ -168,7 +201,7 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
     if (!paperDetail) {
       return false;
     }
-    return ACTIVE_STATUSES.has(paperDetail.status ?? "") || ACTIVE_STATUSES.has(paperDetail.latest_job?.status ?? "");
+    return ACTIVE_STATUSES.has(paperDetail.ocr_status ?? "") || ACTIVE_STATUSES.has(paperDetail.summary_status ?? "");
   }, [paperDetail]);
 
   const isBusy = loadingList || loadingDetail || actionLoading !== null;
@@ -354,14 +387,18 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                       更新于 {formatTime(paper.updated_at)}
                     </p>
                   </div>
-                  <span
-                    className={cn(
-                      "min-w-[72px] shrink-0 whitespace-nowrap rounded-full px-3 py-1 text-center text-xs font-medium ring-1",
-                      selectedPaperId === paper.id ? "bg-white/80 text-slate-700 ring-slate-300" : getStatusClassName(paper.status)
-                    )}
-                  >
-                    {statusLabel(paper.status)}
-                  </span>
+                  <div className="flex shrink-0 flex-col items-end gap-1.5">
+                    <PhaseBadge
+                      label="OCR"
+                      status={paper.ocr_status}
+                      className={selectedPaperId === paper.id ? "bg-white/80 text-slate-700 ring-slate-300" : undefined}
+                    />
+                    <PhaseBadge
+                      label="摘要"
+                      status={paper.summary_status}
+                      className={selectedPaperId === paper.id ? "bg-white/80 text-slate-700 ring-slate-300" : undefined}
+                    />
+                  </div>
                 </div>
                 <p className={cn("text-sm leading-6", selectedPaperId === paper.id ? "text-slate-700" : "text-slate-600")}>
                   {excerpt(paper.abstract_raw)}
@@ -461,19 +498,8 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                         {actionError ? <p className="text-sm text-destructive">{actionError}</p> : null}
                       </div>
                       <div className="grid gap-2">
-                        <span className={cn("w-fit rounded-full px-3 py-1 text-xs font-medium ring-1", getStatusClassName(paperDetail.status))}>
-                          {statusLabel(paperDetail.status)}
-                        </span>
-                        {paperDetail.latest_job ? (
-                          <span
-                            className={cn(
-                              "w-fit rounded-full px-3 py-1 text-xs font-medium ring-1",
-                              getStatusClassName(paperDetail.latest_job.status)
-                            )}
-                          >
-                            最近任务：{statusLabel(paperDetail.latest_job.status)}
-                          </span>
-                        ) : null}
+                        <PhaseBadge label="OCR" status={paperDetail.ocr_status} />
+                        <PhaseBadge label="摘要" status={paperDetail.summary_status} />
                       </div>
                     </div>
 

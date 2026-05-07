@@ -63,6 +63,8 @@ class PaperListItem(BaseModel):
     original_filename: str | None = None
     abstract_raw: str | None
     status: str | None
+    ocr_status: str | None = None
+    summary_status: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -83,6 +85,8 @@ class PaperDetailResponse(BaseModel):
     doi: str | None
     published_at: datetime | None
     status: str | None
+    ocr_status: str | None
+    summary_status: str | None
     created_at: datetime
     updated_at: datetime
     original_filename: str | None
@@ -90,6 +94,8 @@ class PaperDetailResponse(BaseModel):
     extraction_metadata: dict | None
     structured_summary: dict | None
     latest_job: JobPublic | None
+    latest_ocr_job: JobPublic | None
+    latest_summary_job: JobPublic | None
 
 
 class PaperUpdateRequest(BaseModel):

@@ -60,13 +60,13 @@ class Settings(BaseSettings):
     openai_base_url: str = "https://api.openai.com/v1"
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
-    openai_timeout_seconds: int = 60
+    openai_timeout_seconds: int = 120
     openai_verify_ssl: bool = True
     ocr_provider: str = "glm_ocr"
     llm_ocr_base_url: str = "https://api.z.ai/api/paas/v4/layout_parsing"
     llm_ocr_api_key: str = ""
     llm_ocr_model: str = "glm-ocr"
-    llm_ocr_timeout_seconds: int = 120
+    llm_ocr_timeout_seconds: int = 240
     llm_ocr_max_retries: int = 2
     llm_ocr_retry_backoff_seconds: float = 0.5
     llm_ocr_verify_ssl: bool = True

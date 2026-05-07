@@ -28,6 +28,8 @@ class PaperDetailData:
     paper: Paper
     asset: PaperAsset | None
     latest_job: Job | None
+    latest_ocr_job: Job | None
+    latest_summary_job: Job | None
 
 
 class DuplicateFilenameError(RuntimeError):
@@ -76,6 +78,18 @@ def _get_original_pdf_asset(db: Session, paper_id: int) -> PaperAsset | None:
     )
 
 
+def _get_latest_job_for_paper(db: Session, paper_id: int, job_type: str) -> Job | None:
+    return db.scalar(
+        select(Job)
+        .where(
+            Job.paper_id == paper_id,
+            Job.job_type == job_type,
+        )
+        .order_by(Job.id.desc())
+        .limit(1)
+    )
+
+
 def _get_active_job_for_paper(db: Session, paper_id: int) -> Job | None:
     return db.scalar(
         select(Job)
@@ -86,6 +100,29 @@ def _get_active_job_for_paper(db: Session, paper_id: int) -> Job | None:
         .order_by(Job.id.desc())
         .limit(1)
     )
+
+
+def _queue_summary_job_if_needed(db: Session, paper: Paper, asset: PaperAsset) -> int | None:
+    if not settings.openai_api_key.strip():
+        return None
+    if not (asset.raw_text or "").strip():
+        return None
+
+    latest_summary_job = _get_latest_job_for_paper(db, paper.id, "paper_summary")
+    if latest_summary_job is not None and latest_summary_job.status in ACTIVE_JOB_STATUSES:
+        return latest_summary_job.id
+
+    paper.status = "queued"
+    paper.updated_at = datetime.now(timezone.utc)
+    summary_job = Job(job_type="paper_summary", paper_id=paper.id, status="queued")
+    db.add(summary_job)
+    db.commit()
+    db.refresh(summary_job)
+    return summary_job.id
+
+
+def get_job_phase_status(job: Job | None) -> str | None:
+    return job.status if job else None
 
 
 def create_upload_artifacts(
@@ -161,10 +198,18 @@ def get_paper_detail(db: Session, paper_id: int) -> PaperDetailData | None:
         return None
 
     asset = _get_original_pdf_asset(db, paper_id)
+    latest_ocr_job = _get_latest_job_for_paper(db, paper_id, "pdf_ingest")
+    latest_summary_job = _get_latest_job_for_paper(db, paper_id, "paper_summary")
     latest_job = db.scalar(
         select(Job).where(Job.paper_id == paper_id).order_by(Job.id.desc()).limit(1)
     )
-    return PaperDetailData(paper=paper, asset=asset, latest_job=latest_job)
+    return PaperDetailData(
+        paper=paper,
+        asset=asset,
+        latest_job=latest_job,
+        latest_ocr_job=latest_ocr_job,
+        latest_summary_job=latest_summary_job,
+    )
 
 
 def get_original_filename(asset: PaperAsset | None) -> str | None:
@@ -292,12 +337,12 @@ def run_pdf_ingest_job(
     *,
     session_factory: Callable[[], Session] = SessionLocal,
     extractor: PDFTextExtractor | None = None,
-) -> None:
+) -> int | None:
     db = session_factory()
     try:
         job = db.get(Job, job_id)
         if not job:
-            return
+            return None
 
         paper = db.get(Paper, job.paper_id) if job.paper_id is not None else None
         asset = db.scalar(
@@ -321,17 +366,13 @@ def run_pdf_ingest_job(
         metadata["extraction"] = document.metadata
         asset.metadata_json = metadata
         asset.raw_text = document.raw_text
-        if settings.openai_api_key.strip():
-            summary = summarize_paper_text(document.raw_text)
-            paper.abstract_raw = summary.get("abstract_cn") or paper.abstract_raw
-            metadata["structured_summary"] = summary
-            asset.metadata_json = metadata
         paper.status = "completed"
         paper.updated_at = datetime.now(timezone.utc)
         job.status = "completed"
         job.error_message = None
         job.finished_at = datetime.now(timezone.utc)
         db.commit()
+        return _queue_summary_job_if_needed(db, paper, asset)
     except Exception as exc:
         if "job" in locals() and job is not None:
             job.status = "failed"

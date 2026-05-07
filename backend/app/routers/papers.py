@@ -22,6 +22,7 @@ from app.services.papers import (
     delete_paper,
     enqueue_paper_ocr_rerun,
     enqueue_paper_summary_regeneration,
+    get_job_phase_status,
     get_original_filename,
     get_paper_detail,
     list_papers,
@@ -46,6 +47,8 @@ def build_paper_detail_response(detail) -> PaperDetailResponse:
         structured_summary = metadata.get("structured_summary")
 
     latest_job = JobPublic.model_validate(detail.latest_job) if detail.latest_job else None
+    latest_ocr_job = JobPublic.model_validate(detail.latest_ocr_job) if detail.latest_ocr_job else None
+    latest_summary_job = JobPublic.model_validate(detail.latest_summary_job) if detail.latest_summary_job else None
     return PaperDetailResponse(
         id=detail.paper.id,
         title=detail.paper.title,
@@ -56,6 +59,8 @@ def build_paper_detail_response(detail) -> PaperDetailResponse:
         doi=detail.paper.doi,
         published_at=detail.paper.published_at,
         status=detail.paper.status,
+        ocr_status=get_job_phase_status(detail.latest_ocr_job),
+        summary_status=get_job_phase_status(detail.latest_summary_job),
         created_at=detail.paper.created_at,
         updated_at=detail.paper.updated_at,
         original_filename=get_original_filename(detail.asset),
@@ -63,6 +68,8 @@ def build_paper_detail_response(detail) -> PaperDetailResponse:
         extraction_metadata=extraction_metadata if isinstance(extraction_metadata, dict) else None,
         structured_summary=structured_summary if isinstance(structured_summary, dict) else None,
         latest_job=latest_job,
+        latest_ocr_job=latest_ocr_job,
+        latest_summary_job=latest_summary_job,
     )
 
 
@@ -82,6 +89,8 @@ def get_papers(
                 original_filename=original_filename,
                 abstract_raw=item.abstract_raw,
                 status=item.status,
+                ocr_status=get_job_phase_status(detail.latest_ocr_job) if detail else None,
+                summary_status=get_job_phase_status(detail.latest_summary_job) if detail else None,
                 created_at=item.created_at,
                 updated_at=item.updated_at,
             )

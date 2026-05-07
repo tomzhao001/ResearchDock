@@ -1,4 +1,5 @@
 import fitz
+import httpx
 import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
@@ -46,6 +47,41 @@ class SuccessfulTextExtractor(PDFTextExtractor):
 def login(client) -> None:
     response = client.post("/api/auth/login", json={"username": "admin", "password": "123456"})
     assert response.status_code == 200
+
+
+def make_eager_upload_delay(
+    session_factory: sessionmaker,
+    *,
+    extractor: PDFTextExtractor | None = None,
+    swallow_errors: bool = True,
+):
+    def eager_delay(job_id: int):
+        try:
+            summary_job_id = run_pdf_ingest_job(
+                job_id,
+                session_factory=session_factory,
+                extractor=extractor or SuccessfulTextExtractor(),
+            )
+            if summary_job_id is not None:
+                run_paper_summary_job(summary_job_id, session_factory=session_factory)
+        except Exception:
+            if not swallow_errors:
+                raise
+        return None
+
+    return eager_delay
+
+
+def make_eager_summary_delay(session_factory: sessionmaker, *, swallow_errors: bool = True):
+    def eager_delay(job_id: int):
+        try:
+            run_paper_summary_job(job_id, session_factory=session_factory)
+        except Exception:
+            if not swallow_errors:
+                raise
+        return None
+
+    return eager_delay
 
 
 @pytest.fixture(autouse=True)
@@ -96,16 +132,11 @@ def test_upload_creates_records_and_completes_job(
     login(client)
 
     original_delay = papers_router.process_uploaded_pdf.delay
-
-    def eager_delay(job_id: int):
-        run_pdf_ingest_job(
-            job_id,
-            session_factory=session_factory,
-            extractor=SuccessfulTextExtractor(),
-        )
-        return None
-
-    monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", eager_delay)
+    monkeypatch.setattr(
+        papers_router.process_uploaded_pdf,
+        "delay",
+        make_eager_upload_delay(session_factory, extractor=SuccessfulTextExtractor()),
+    )
 
     try:
         response = client.post(
@@ -152,16 +183,11 @@ def test_paper_list_and_detail_return_preview_data(
 
     original_delay = papers_router.process_uploaded_pdf.delay
     monkeypatch.setattr("app.config.settings.openai_api_key", "test-key")
-
-    def eager_delay(job_id: int):
-        run_pdf_ingest_job(
-            job_id,
-            session_factory=session_factory,
-            extractor=SuccessfulTextExtractor(),
-        )
-        return None
-
-    monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", eager_delay)
+    monkeypatch.setattr(
+        papers_router.process_uploaded_pdf,
+        "delay",
+        make_eager_upload_delay(session_factory, extractor=SuccessfulTextExtractor()),
+    )
 
     try:
         upload_response = client.post(
@@ -186,6 +212,8 @@ def test_paper_list_and_detail_return_preview_data(
     assert len(items) == 1
     assert items[0]["id"] == body["paper_id"]
     assert items[0]["abstract_raw"] == "这是一段中文摘要。"
+    assert items[0]["ocr_status"] == "completed"
+    assert items[0]["summary_status"] == "completed"
 
     detail_response = client.get(f"/api/papers/{body['paper_id']}")
     assert detail_response.status_code == 200
@@ -193,7 +221,54 @@ def test_paper_list_and_detail_return_preview_data(
     assert "embedded text layer" in detail["preview_text"]
     assert detail["original_filename"] == "milestone3.pdf"
     assert detail["structured_summary"]["method"] == "研究方法"
-    assert detail["latest_job"]["status"] == "completed"
+    assert detail["ocr_status"] == "completed"
+    assert detail["summary_status"] == "completed"
+    assert detail["latest_ocr_job"]["job_type"] == "pdf_ingest"
+    assert detail["latest_summary_job"]["job_type"] == "paper_summary"
+
+
+def test_summary_timeout_keeps_ocr_result_and_marks_only_summary_failed(
+    client,
+    user,
+    monkeypatch: pytest.MonkeyPatch,
+    session_factory: sessionmaker,
+) -> None:
+    login(client)
+    monkeypatch.setattr("app.config.settings.openai_api_key", "test-key")
+
+    original_delay = papers_router.process_uploaded_pdf.delay
+
+    def timeout_summary(_: str) -> dict:
+        raise httpx.ReadTimeout("The read operation timed out")
+
+    monkeypatch.setattr(llm, "summarize_paper_text", timeout_summary)
+    monkeypatch.setattr("app.services.papers.summarize_paper_text", timeout_summary)
+    monkeypatch.setattr(
+        papers_router.process_uploaded_pdf,
+        "delay",
+        make_eager_upload_delay(session_factory, extractor=SuccessfulTextExtractor()),
+    )
+
+    try:
+        upload_response = client.post(
+            "/api/papers/upload",
+            files={"file": ("timeout-summary.pdf", make_pdf_bytes("paper body"), "application/pdf")},
+        )
+    finally:
+        monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", original_delay)
+
+    assert upload_response.status_code == 202
+    paper_id = upload_response.json()["paper_id"]
+
+    detail_response = client.get(f"/api/papers/{paper_id}")
+    assert detail_response.status_code == 200
+    detail = detail_response.json()
+    assert "embedded text layer" in detail["preview_text"]
+    assert detail["ocr_status"] == "completed"
+    assert detail["summary_status"] == "failed"
+    assert detail["latest_ocr_job"]["status"] == "completed"
+    assert detail["latest_summary_job"]["status"] == "failed"
+    assert "timed out" in (detail["latest_summary_job"]["error_message"] or "")
 
 
 def test_upload_rejects_duplicate_filename_without_overwrite(
@@ -205,16 +280,11 @@ def test_upload_rejects_duplicate_filename_without_overwrite(
     login(client)
 
     original_delay = papers_router.process_uploaded_pdf.delay
-
-    def eager_delay(job_id: int):
-        run_pdf_ingest_job(
-            job_id,
-            session_factory=session_factory,
-            extractor=SuccessfulTextExtractor(),
-        )
-        return None
-
-    monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", eager_delay)
+    monkeypatch.setattr(
+        papers_router.process_uploaded_pdf,
+        "delay",
+        make_eager_upload_delay(session_factory, extractor=SuccessfulTextExtractor()),
+    )
 
     try:
         first = client.post(
@@ -249,16 +319,11 @@ def test_upload_overwrite_soft_deletes_previous_paper(
     login(client)
 
     original_delay = papers_router.process_uploaded_pdf.delay
-
-    def eager_delay(job_id: int):
-        run_pdf_ingest_job(
-            job_id,
-            session_factory=session_factory,
-            extractor=SuccessfulTextExtractor(),
-        )
-        return None
-
-    monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", eager_delay)
+    monkeypatch.setattr(
+        papers_router.process_uploaded_pdf,
+        "delay",
+        make_eager_upload_delay(session_factory, extractor=SuccessfulTextExtractor()),
+    )
 
     try:
         first = client.post(
@@ -298,16 +363,11 @@ def test_patch_paper_title_allows_duplicate_display_name(
     login(client)
 
     original_delay = papers_router.process_uploaded_pdf.delay
-
-    def eager_delay(job_id: int):
-        run_pdf_ingest_job(
-            job_id,
-            session_factory=session_factory,
-            extractor=SuccessfulTextExtractor(),
-        )
-        return None
-
-    monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", eager_delay)
+    monkeypatch.setattr(
+        papers_router.process_uploaded_pdf,
+        "delay",
+        make_eager_upload_delay(session_factory, extractor=SuccessfulTextExtractor()),
+    )
 
     try:
         first = client.post(
@@ -342,16 +402,11 @@ def test_patch_paper_metadata_updates_basic_fields(
     login(client)
 
     original_delay = papers_router.process_uploaded_pdf.delay
-
-    def eager_delay(job_id: int):
-        run_pdf_ingest_job(
-            job_id,
-            session_factory=session_factory,
-            extractor=SuccessfulTextExtractor(),
-        )
-        return None
-
-    monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", eager_delay)
+    monkeypatch.setattr(
+        papers_router.process_uploaded_pdf,
+        "delay",
+        make_eager_upload_delay(session_factory, extractor=SuccessfulTextExtractor()),
+    )
 
     try:
         upload_response = client.post(
@@ -394,16 +449,11 @@ def test_delete_completed_job(
     login(client)
 
     original_delay = papers_router.process_uploaded_pdf.delay
-
-    def eager_delay(job_id: int):
-        run_pdf_ingest_job(
-            job_id,
-            session_factory=session_factory,
-            extractor=SuccessfulTextExtractor(),
-        )
-        return None
-
-    monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", eager_delay)
+    monkeypatch.setattr(
+        papers_router.process_uploaded_pdf,
+        "delay",
+        make_eager_upload_delay(session_factory, extractor=SuccessfulTextExtractor()),
+    )
 
     try:
         upload_response = client.post(
@@ -462,16 +512,11 @@ def test_delete_paper_soft_deletes_and_removes_jobs(
     login(client)
 
     original_delay = papers_router.process_uploaded_pdf.delay
-
-    def eager_delay(job_id: int):
-        run_pdf_ingest_job(
-            job_id,
-            session_factory=session_factory,
-            extractor=SuccessfulTextExtractor(),
-        )
-        return None
-
-    monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", eager_delay)
+    monkeypatch.setattr(
+        papers_router.process_uploaded_pdf,
+        "delay",
+        make_eager_upload_delay(session_factory, extractor=SuccessfulTextExtractor()),
+    )
 
     try:
         upload_response = client.post(
@@ -570,18 +615,6 @@ def test_regenerate_summary_creates_summary_job_without_clearing_ocr_text(
     original_upload_delay = papers_router.process_uploaded_pdf.delay
     original_summary_delay = papers_router.process_paper_summary.delay
 
-    def eager_ingest_delay(job_id: int):
-        run_pdf_ingest_job(
-            job_id,
-            session_factory=session_factory,
-            extractor=SuccessfulTextExtractor(),
-        )
-        return None
-
-    def eager_summary_delay(job_id: int):
-        run_paper_summary_job(job_id, session_factory=session_factory)
-        return None
-
     def second_summary(_: str) -> dict:
         return {
             "abstract_cn": "重新生成后的摘要。",
@@ -592,7 +625,11 @@ def test_regenerate_summary_creates_summary_job_without_clearing_ocr_text(
             "limitations": "新局限",
         }
 
-    monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", eager_ingest_delay)
+    monkeypatch.setattr(
+        papers_router.process_uploaded_pdf,
+        "delay",
+        make_eager_upload_delay(session_factory, extractor=SuccessfulTextExtractor()),
+    )
 
     try:
         upload_response = client.post(
@@ -610,7 +647,7 @@ def test_regenerate_summary_creates_summary_job_without_clearing_ocr_text(
 
     monkeypatch.setattr(llm, "summarize_paper_text", second_summary)
     monkeypatch.setattr("app.services.papers.summarize_paper_text", second_summary)
-    monkeypatch.setattr(papers_router.process_paper_summary, "delay", eager_summary_delay)
+    monkeypatch.setattr(papers_router.process_paper_summary, "delay", make_eager_summary_delay(session_factory))
 
     try:
         regenerate_response = client.post(f"/api/papers/{paper_id}/regenerate-summary")
@@ -626,3 +663,5 @@ def test_regenerate_summary_creates_summary_job_without_clearing_ocr_text(
     assert body["abstract_raw"] == "重新生成后的摘要。"
     assert body["structured_summary"]["method"] == "新方法"
     assert body["latest_job"]["job_type"] == "paper_summary"
+    assert body["ocr_status"] == "completed"
+    assert body["summary_status"] == "completed"
