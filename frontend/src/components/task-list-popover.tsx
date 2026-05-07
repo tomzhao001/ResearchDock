@@ -1,14 +1,15 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { CheckCircle2, Clock3, LoaderCircle, TriangleAlert } from "lucide-react";
+import { CheckCircle2, Clock3, LoaderCircle, Trash2, TriangleAlert } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
-import { fetchJobs, type JobPublic } from "@/lib/papers";
+import { deleteJob, fetchJobs, type JobPublic } from "@/lib/papers";
 
 const ACTIVE_STATUSES = new Set(["queued", "processing"]);
+const NON_DELETABLE_STATUSES = new Set(["processing"]);
 
 function statusLabel(status: string | null): string {
   if (status === "queued") return "排队中";
@@ -40,6 +41,7 @@ export function TaskListPopover({ onOpenPaper }: TaskListPopoverProps) {
   const [jobs, setJobs] = useState<JobPublic[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [deletingJobId, setDeletingJobId] = useState<number | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
 
   async function loadJobs() {
@@ -83,6 +85,25 @@ export function TaskListPopover({ onOpenPaper }: TaskListPopoverProps) {
   const activeJobs = useMemo(() => jobs.filter((job) => ACTIVE_STATUSES.has(job.status ?? "")), [jobs]);
   const failedJobs = useMemo(() => jobs.filter((job) => job.status === "failed"), [jobs]);
 
+  async function handleDeleteJob(job: JobPublic) {
+    if (NON_DELETABLE_STATUSES.has(job.status ?? "")) {
+      setError("处理中的任务暂不支持删除");
+      return;
+    }
+
+    setDeletingJobId(job.id);
+    setError(null);
+    try {
+      await deleteJob(job.id);
+      setJobs((current) => current.filter((item) => item.id !== job.id));
+    } catch (deleteError) {
+      const message = deleteError instanceof Error ? deleteError.message : "删除任务失败";
+      setError(message);
+    } finally {
+      setDeletingJobId(null);
+    }
+  }
+
   return (
     <div ref={rootRef} className="relative">
       <Button type="button" variant="outline" size="sm" onClick={() => setOpen((value) => !value)} className="gap-2">
@@ -119,37 +140,58 @@ export function TaskListPopover({ onOpenPaper }: TaskListPopoverProps) {
             {!loading && jobs.length === 0 ? (
               <p className="text-sm text-slate-500">还没有任务记录。</p>
             ) : null}
-            {jobs.map((job) => (
-              <button
-                key={job.id}
-                type="button"
-                className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4 text-left transition hover:border-slate-300 hover:bg-white"
-                onClick={() => {
-                  if (job.paper_id) {
-                    onOpenPaper(job.paper_id);
-                    setOpen(false);
-                  }
-                }}
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex items-center gap-2 text-sm font-medium text-slate-900">
-                    <StatusIcon status={job.status} />
-                    <span>任务 #{job.id}</span>
+            {jobs.map((job) => {
+              const isActive = ACTIVE_STATUSES.has(job.status ?? "");
+              const isNonDeletable = NON_DELETABLE_STATUSES.has(job.status ?? "");
+              const isDeleting = deletingJobId === job.id;
+
+              return (
+                <div key={job.id} className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4 transition hover:border-slate-300 hover:bg-white">
+                  <div className="flex items-start justify-between gap-3">
+                    <button
+                      type="button"
+                      className="min-w-0 flex-1 text-left"
+                      onClick={() => {
+                        if (job.paper_id) {
+                          onOpenPaper(job.paper_id);
+                          setOpen(false);
+                        }
+                      }}
+                    >
+                      <div className="flex items-center gap-2 text-sm font-medium text-slate-900">
+                        <StatusIcon status={job.status} />
+                        <span>任务 #{job.id}</span>
+                      </div>
+                    </button>
+                    <div className="flex items-center gap-2">
+                      <span className={cn("rounded-full px-2.5 py-1 text-xs font-medium ring-1", getStatusClassName(job.status))}>
+                        {statusLabel(job.status)}
+                      </span>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label={`删除任务 ${job.id}`}
+                        onClick={() => void handleDeleteJob(job)}
+                        disabled={isNonDeletable || isDeleting}
+                        title={isNonDeletable ? "处理中的任务暂不支持删除" : "删除任务"}
+                      >
+                        {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+                      </Button>
+                    </div>
                   </div>
-                  <span className={cn("rounded-full px-2.5 py-1 text-xs font-medium ring-1", getStatusClassName(job.status))}>
-                    {statusLabel(job.status)}
-                  </span>
+                  <div className="mt-3 grid gap-1 text-xs text-slate-500">
+                    <p>类型：{job.job_type || "-"}</p>
+                    <p>论文：{job.paper_id ? `#${job.paper_id}` : "-"}</p>
+                    <p>创建：{formatTime(job.created_at)}</p>
+                    <p>开始：{formatTime(job.started_at)}</p>
+                    <p>结束：{formatTime(job.finished_at)}</p>
+                    {job.error_message ? <p className="text-rose-600">错误：{job.error_message}</p> : null}
+                    {isActive ? <p>{isNonDeletable ? "处理中任务不可删除。" : "排队中的任务支持直接删除。"}</p> : null}
+                  </div>
                 </div>
-                <div className="mt-3 grid gap-1 text-xs text-slate-500">
-                  <p>类型：{job.job_type || "-"}</p>
-                  <p>论文：{job.paper_id ? `#${job.paper_id}` : "-"}</p>
-                  <p>创建：{formatTime(job.created_at)}</p>
-                  <p>开始：{formatTime(job.started_at)}</p>
-                  <p>结束：{formatTime(job.finished_at)}</p>
-                  {job.error_message ? <p className="text-rose-600">错误：{job.error_message}</p> : null}
-                </div>
-              </button>
-            ))}
+              );
+            })}
           </CardContent>
         </Card>
       ) : null}

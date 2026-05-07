@@ -1,17 +1,21 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { LoaderCircle, PencilLine, Save, ScanText, Upload, X } from "lucide-react";
+import { FilePenLine, LoaderCircle, RefreshCw, ScanText, Trash2, Upload } from "lucide-react";
 
+import { PaperMetadataDialog } from "@/components/paper-metadata-dialog";
 import { PaperUploadDialog } from "@/components/paper-upload-dialog";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Dialog } from "@/components/ui/dialog";
 import { TabPanel, Tabs } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 import {
+  deletePaper,
   fetchPaper,
   fetchPapers,
-  updatePaperTitle,
+  regeneratePaperSummary,
+  rerunPaperOcr,
   type JobPublic,
   type PaperDetail,
   type PaperListItem,
@@ -61,11 +65,11 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
   const [listError, setListError] = useState<string | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [uploadDialogOpen, setUploadDialogOpen] = useState(false);
+  const [metadataDialogOpen, setMetadataDialogOpen] = useState(false);
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [previewTab, setPreviewTab] = useState<"summary" | "ocr">("summary");
-  const [editingTitle, setEditingTitle] = useState(false);
-  const [titleDraft, setTitleDraft] = useState("");
-  const [titleError, setTitleError] = useState<string | null>(null);
-  const [titleSaving, setTitleSaving] = useState(false);
+  const [actionLoading, setActionLoading] = useState<"rerun-ocr" | "regenerate-summary" | "delete" | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const loadPapers = useCallback(
     async (preferredPaperId?: number | null) => {
@@ -160,29 +164,79 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
     await loadDetail(job.paper_id ?? selectedPaperId);
   }
 
-  useEffect(() => {
-    setTitleDraft(paperDetail?.title ?? "");
-    setEditingTitle(false);
-    setTitleError(null);
-  }, [paperDetail?.id, paperDetail?.title]);
+  const hasActiveJob = useMemo(() => {
+    if (!paperDetail) {
+      return false;
+    }
+    return ACTIVE_STATUSES.has(paperDetail.status ?? "") || ACTIVE_STATUSES.has(paperDetail.latest_job?.status ?? "");
+  }, [paperDetail]);
 
-  async function handleSaveTitle() {
+  const isBusy = loadingList || loadingDetail || actionLoading !== null;
+
+  async function handleDeletePaper() {
     if (!paperDetail) {
       return;
     }
 
-    setTitleSaving(true);
-    setTitleError(null);
+    setActionLoading("delete");
+    setActionError(null);
     try {
-      const nextDetail = await updatePaperTitle(paperDetail.id, titleDraft);
-      setPaperDetail(nextDetail);
-      setEditingTitle(false);
-      await loadPapers(nextDetail.id);
+      const deletedPaperId = paperDetail.id;
+      const remaining = papers.filter((paper) => paper.id !== deletedPaperId);
+      const nextPaperId = remaining[0]?.id ?? null;
+
+      await deletePaper(deletedPaperId);
+      setDeleteConfirmOpen(false);
+      setMetadataDialogOpen(false);
+      setPaperDetail(null);
+      onSelectedPaperChange(nextPaperId);
+      await loadPapers(nextPaperId);
+      if (nextPaperId) {
+        await loadDetail(nextPaperId);
+      }
     } catch (error) {
-      const message = error instanceof Error ? error.message : "保存失败";
-      setTitleError(message);
+      const message = error instanceof Error ? error.message : "删除文档失败";
+      setActionError(message);
     } finally {
-      setTitleSaving(false);
+      setActionLoading(null);
+    }
+  }
+
+  async function handleRerunOcr() {
+    if (!paperDetail) {
+      return;
+    }
+
+    setActionLoading("rerun-ocr");
+    setActionError(null);
+    try {
+      await rerunPaperOcr(paperDetail.id);
+      await loadPapers(paperDetail.id);
+      await loadDetail(paperDetail.id);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "重新 OCR 失败";
+      setActionError(message);
+    } finally {
+      setActionLoading(null);
+    }
+  }
+
+  async function handleRegenerateSummary() {
+    if (!paperDetail) {
+      return;
+    }
+
+    setActionLoading("regenerate-summary");
+    setActionError(null);
+    try {
+      await regeneratePaperSummary(paperDetail.id);
+      await loadPapers(paperDetail.id);
+      await loadDetail(paperDetail.id);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "重新生成摘要失败";
+      setActionError(message);
+    } finally {
+      setActionLoading(null);
     }
   }
 
@@ -194,6 +248,58 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
         onUploadAccepted={handleUploadAccepted}
         onJobUpdate={handleJobUpdate}
       />
+      <PaperMetadataDialog
+        open={metadataDialogOpen}
+        paper={paperDetail}
+        onClose={() => setMetadataDialogOpen(false)}
+        onSaved={async (detail) => {
+          setPaperDetail(detail);
+          setActionError(null);
+          await loadPapers(detail.id);
+          await loadDetail(detail.id);
+        }}
+      />
+      <Dialog
+        open={deleteConfirmOpen}
+        onClose={() => {
+          if (actionLoading === "delete") {
+            return;
+          }
+          setDeleteConfirmOpen(false);
+        }}
+        title="确认删除文档"
+        description="删除后文档会从列表中移除，关联的任务记录也会一起删除。该操作不可撤销。"
+        className="max-w-lg"
+      >
+        <div className="grid gap-4 p-6">
+          <div className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-4 text-sm text-rose-800">
+            {paperDetail ? `确定删除“${paperDetail.title || `未命名论文 #${paperDetail.id}`}”吗？` : "确定删除当前文档吗？"}
+          </div>
+          <div className="flex justify-end gap-3">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setDeleteConfirmOpen(false)}
+              disabled={actionLoading === "delete"}
+            >
+              取消
+            </Button>
+            <Button type="button" variant="destructive" onClick={() => void handleDeletePaper()} disabled={actionLoading === "delete"}>
+              {actionLoading === "delete" ? (
+                <>
+                  <LoaderCircle className="size-4 animate-spin" />
+                  删除中...
+                </>
+              ) : (
+                <>
+                  <Trash2 className="size-4" />
+                  确认删除
+                </>
+              )}
+            </Button>
+          </div>
+        </div>
+      </Dialog>
 
       <div className="grid h-full min-h-0 gap-6 xl:grid-cols-[minmax(320px,420px)_minmax(0,1fr)]">
         <Card className="min-h-0 border-none bg-white/80 shadow-sm ring-1 ring-slate-200 backdrop-blur">
@@ -203,7 +309,7 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                 <CardTitle>论文列表</CardTitle>
                 <CardDescription>按更新时间倒序展示，点击左侧条目后在右侧查看摘要、展示名和 OCR 预览。</CardDescription>
               </div>
-              <Button type="button" size="sm" className="gap-2" onClick={() => setUploadDialogOpen(true)}>
+              <Button type="button" size="sm" className="gap-2" onClick={() => setUploadDialogOpen(true)} disabled={isBusy}>
                 <Upload className="size-4" />
                 上传 PDF
               </Button>
@@ -230,33 +336,34 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                 key={paper.id}
                 type="button"
                 onClick={() => onSelectedPaperChange(paper.id)}
+                disabled={isBusy}
                 className={cn(
-                  "grid gap-3 rounded-2xl border px-4 py-4 text-left transition hover:-translate-y-0.5 hover:shadow-sm",
+                  "grid gap-3 rounded-2xl border px-4 py-4 text-left transition disabled:cursor-not-allowed disabled:opacity-70",
                   selectedPaperId === paper.id
-                    ? "border-slate-900 bg-slate-950 text-slate-50 shadow-sm"
-                    : "border-slate-200 bg-white text-slate-900"
+                    ? "border-slate-400 bg-slate-200 text-slate-900 shadow-sm"
+                    : "border-slate-200 bg-slate-100 text-slate-900 hover:border-slate-300 hover:bg-slate-50"
                 )}
               >
                 <div className="flex items-start justify-between gap-3">
                   <div>
                     <p className="font-medium leading-6">{paper.title || `未命名论文 #${paper.id}`}</p>
-                    <p className={cn("mt-1 text-xs", selectedPaperId === paper.id ? "text-slate-300" : "text-slate-500")}>
+                    <p className={cn("mt-1 text-xs", selectedPaperId === paper.id ? "text-slate-600" : "text-slate-500")}>
                       原始文件名：{paper.original_filename || "-"}
                     </p>
-                    <p className={cn("mt-1 text-xs", selectedPaperId === paper.id ? "text-slate-300" : "text-slate-500")}>
+                    <p className={cn("mt-1 text-xs", selectedPaperId === paper.id ? "text-slate-600" : "text-slate-500")}>
                       更新于 {formatTime(paper.updated_at)}
                     </p>
                   </div>
                   <span
                     className={cn(
-                      "rounded-full px-2.5 py-1 text-xs font-medium ring-1",
-                      selectedPaperId === paper.id ? "bg-white/10 text-white ring-white/15" : getStatusClassName(paper.status)
+                      "min-w-[72px] shrink-0 whitespace-nowrap rounded-full px-3 py-1 text-center text-xs font-medium ring-1",
+                      selectedPaperId === paper.id ? "bg-white/80 text-slate-700 ring-slate-300" : getStatusClassName(paper.status)
                     )}
                   >
                     {statusLabel(paper.status)}
                   </span>
                 </div>
-                <p className={cn("text-sm leading-6", selectedPaperId === paper.id ? "text-slate-200" : "text-slate-600")}>
+                <p className={cn("text-sm leading-6", selectedPaperId === paper.id ? "text-slate-700" : "text-slate-600")}>
                   {excerpt(paper.abstract_raw)}
                 </p>
               </button>
@@ -300,60 +407,58 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
             ) : null}
 
             {paperDetail && !loadingDetail ? (
-              <div className="h-full overflow-y-auto pr-1">
+              <div className="relative h-full overflow-y-auto pr-1">
+                {actionLoading ? (
+                  <div className="absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-white/65 backdrop-blur-[1px]">
+                    <div className="flex items-center gap-2 rounded-full bg-white px-4 py-2 text-sm text-slate-600 shadow-sm ring-1 ring-slate-200">
+                      <LoaderCircle className="size-4 animate-spin" />
+                      正在提交请求...
+                    </div>
+                  </div>
+                ) : null}
                 <TabPanel active={previewTab === "summary"} className="grid gap-5">
                   <div className="grid gap-4 rounded-2xl border border-slate-200 bg-slate-50/80 p-5">
                     <div className="flex flex-wrap items-start justify-between gap-3">
                       <div className="grid gap-3">
-                        {!editingTitle ? (
-                          <>
-                            <div>
-                              <h2 className="text-xl font-semibold text-slate-950">{paperDetail.title || `未命名论文 #${paperDetail.id}`}</h2>
-                              <p className="mt-1 text-sm text-slate-500">
-                                原始文件名：{paperDetail.original_filename || "-"} | 更新时间：{formatTime(paperDetail.updated_at)}
-                              </p>
-                            </div>
-                            <div className="flex flex-wrap gap-3">
-                              <Button type="button" variant="outline" size="sm" className="gap-2" onClick={() => setEditingTitle(true)}>
-                                <PencilLine className="size-4" />
-                                编辑展示名
-                              </Button>
-                            </div>
-                          </>
-                        ) : (
-                          <div className="grid gap-3">
-                            <label className="grid gap-2 text-sm font-medium text-slate-700">
-                              展示名
-                              <input
-                                value={titleDraft}
-                                onChange={(event) => setTitleDraft(event.target.value)}
-                                className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-slate-400 focus:ring-4 focus:ring-slate-200"
-                              />
-                            </label>
-                            {titleError ? <p className="text-sm text-destructive">{titleError}</p> : null}
-                            <div className="flex flex-wrap gap-3">
-                              <Button type="button" size="sm" className="gap-2" onClick={() => void handleSaveTitle()} disabled={titleSaving}>
-                                <Save className="size-4" />
-                                {titleSaving ? "保存中..." : "保存"}
-                              </Button>
-                              <Button
-                                type="button"
-                                variant="outline"
-                                size="sm"
-                                className="gap-2"
-                                onClick={() => {
-                                  setEditingTitle(false);
-                                  setTitleDraft(paperDetail.title ?? "");
-                                  setTitleError(null);
-                                }}
-                                disabled={titleSaving}
-                              >
-                                <X className="size-4" />
-                                取消
-                              </Button>
-                            </div>
-                          </div>
-                        )}
+                        <div>
+                          <h2 className="text-xl font-semibold text-slate-950">{paperDetail.title || `未命名论文 #${paperDetail.id}`}</h2>
+                          <p className="mt-1 text-sm text-slate-500">
+                            原始文件名：{paperDetail.original_filename || "-"} | 更新时间：{formatTime(paperDetail.updated_at)}
+                          </p>
+                        </div>
+                        <div className="flex flex-wrap gap-3">
+                          <Button type="button" variant="outline" size="sm" className="gap-2" onClick={() => setMetadataDialogOpen(true)} disabled={isBusy}>
+                            <FilePenLine className="size-4" />
+                            编辑文档信息
+                          </Button>
+                          <Button type="button" variant="outline" size="sm" className="gap-2" onClick={() => void handleRerunOcr()} disabled={hasActiveJob || isBusy}>
+                            <RefreshCw className={cn("size-4", actionLoading === "rerun-ocr" ? "animate-spin" : "")} />
+                            重新 OCR
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="gap-2"
+                            onClick={() => void handleRegenerateSummary()}
+                            disabled={hasActiveJob || isBusy}
+                          >
+                            <RefreshCw className={cn("size-4", actionLoading === "regenerate-summary" ? "animate-spin" : "")} />
+                            重新生成摘要
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="destructive"
+                            size="sm"
+                            className="gap-2"
+                            onClick={() => setDeleteConfirmOpen(true)}
+                            disabled={hasActiveJob || isBusy}
+                          >
+                            <Trash2 className="size-4" />
+                            删除文档
+                          </Button>
+                        </div>
+                        {actionError ? <p className="text-sm text-destructive">{actionError}</p> : null}
                       </div>
                       <div className="grid gap-2">
                         <span className={cn("w-fit rounded-full px-3 py-1 text-xs font-medium ring-1", getStatusClassName(paperDetail.status))}>
@@ -371,6 +476,13 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                         ) : null}
                       </div>
                     </div>
+
+                    <section className="grid gap-3 md:grid-cols-2">
+                      <SummaryBlock label="作者" value={paperDetail.authors || "-"} />
+                      <SummaryBlock label="DOI" value={paperDetail.doi || "-"} />
+                      <SummaryBlock label="来源链接" value={paperDetail.source_url || "-"} />
+                      <SummaryBlock label="发布时间" value={paperDetail.published_at ? formatTime(paperDetail.published_at) : "-"} />
+                    </section>
 
                     <section className="grid gap-2">
                       <h3 className="text-sm font-medium text-slate-700">中文摘要</h3>

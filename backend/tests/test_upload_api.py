@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.models import Job, Paper, PaperAsset
 from app.services import llm
 from app.routers import papers as papers_router
-from app.services.papers import run_pdf_ingest_job
+from app.services.papers import run_paper_summary_job, run_pdf_ingest_job
 from app.services.pdf_extraction import DocumentExtractionResult, PDFTextExtractor
 
 
@@ -331,3 +331,298 @@ def test_patch_paper_title_allows_duplicate_display_name(
     assert second_title.status_code == 200
     assert first_title.json()["title"] == "统一展示名"
     assert second_title.json()["title"] == "统一展示名"
+
+
+def test_patch_paper_metadata_updates_basic_fields(
+    client,
+    user,
+    monkeypatch: pytest.MonkeyPatch,
+    session_factory: sessionmaker,
+) -> None:
+    login(client)
+
+    original_delay = papers_router.process_uploaded_pdf.delay
+
+    def eager_delay(job_id: int):
+        run_pdf_ingest_job(
+            job_id,
+            session_factory=session_factory,
+            extractor=SuccessfulTextExtractor(),
+        )
+        return None
+
+    monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", eager_delay)
+
+    try:
+        upload_response = client.post(
+            "/api/papers/upload",
+            files={"file": ("metadata.pdf", make_pdf_bytes("paper body"), "application/pdf")},
+        )
+    finally:
+        monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", original_delay)
+
+    assert upload_response.status_code == 202
+    paper_id = upload_response.json()["paper_id"]
+
+    update_response = client.patch(
+        f"/api/papers/{paper_id}",
+        json={
+            "title": "更新后的文档名",
+            "authors": "Alice; Bob",
+            "doi": "10.1000/example",
+            "source_url": "https://example.com/paper",
+            "published_at": "2024-05-01T00:00:00Z",
+        },
+    )
+
+    assert update_response.status_code == 200
+    body = update_response.json()
+    assert body["title"] == "更新后的文档名"
+    assert body["authors"] == "Alice; Bob"
+    assert body["doi"] == "10.1000/example"
+    assert body["source_url"] == "https://example.com/paper"
+    assert body["published_at"].startswith("2024-05-01")
+
+
+def test_delete_completed_job(
+    client,
+    user,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    session_factory: sessionmaker,
+) -> None:
+    login(client)
+
+    original_delay = papers_router.process_uploaded_pdf.delay
+
+    def eager_delay(job_id: int):
+        run_pdf_ingest_job(
+            job_id,
+            session_factory=session_factory,
+            extractor=SuccessfulTextExtractor(),
+        )
+        return None
+
+    monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", eager_delay)
+
+    try:
+        upload_response = client.post(
+            "/api/papers/upload",
+            files={"file": ("delete-job.pdf", make_pdf_bytes("paper body"), "application/pdf")},
+        )
+    finally:
+        monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", original_delay)
+
+    assert upload_response.status_code == 202
+    job_id = upload_response.json()["job_id"]
+
+    delete_response = client.delete(f"/api/jobs/{job_id}")
+    assert delete_response.status_code == 200
+    assert delete_response.json() == {"message": "Job deleted"}
+    assert db_session.get(Job, job_id) is None
+
+
+def test_delete_active_job_is_rejected(client, user, db_session: Session) -> None:
+    login(client)
+
+    paper = Paper(title="active paper", status="processing")
+    db_session.add(paper)
+    db_session.flush()
+    job = Job(job_type="pdf_ingest", paper_id=paper.id, status="processing")
+    db_session.add(job)
+    db_session.commit()
+
+    response = client.delete(f"/api/jobs/{job.id}")
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Processing jobs cannot be deleted"
+
+
+def test_delete_queued_job_is_allowed(client, user, db_session: Session) -> None:
+    login(client)
+
+    paper = Paper(title="queued paper", status="queued")
+    db_session.add(paper)
+    db_session.flush()
+    job = Job(job_type="pdf_ingest", paper_id=paper.id, status="queued")
+    db_session.add(job)
+    db_session.commit()
+
+    response = client.delete(f"/api/jobs/{job.id}")
+    assert response.status_code == 200
+    assert response.json() == {"message": "Job deleted"}
+
+
+def test_delete_paper_soft_deletes_and_removes_jobs(
+    client,
+    user,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    session_factory: sessionmaker,
+) -> None:
+    login(client)
+
+    original_delay = papers_router.process_uploaded_pdf.delay
+
+    def eager_delay(job_id: int):
+        run_pdf_ingest_job(
+            job_id,
+            session_factory=session_factory,
+            extractor=SuccessfulTextExtractor(),
+        )
+        return None
+
+    monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", eager_delay)
+
+    try:
+        upload_response = client.post(
+            "/api/papers/upload",
+            files={"file": ("delete-paper.pdf", make_pdf_bytes("paper body"), "application/pdf")},
+        )
+    finally:
+        monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", original_delay)
+
+    assert upload_response.status_code == 202
+    paper_id = upload_response.json()["paper_id"]
+
+    delete_response = client.delete(f"/api/papers/{paper_id}")
+    assert delete_response.status_code == 200
+    assert delete_response.json() == {"message": "Paper deleted"}
+
+    paper = db_session.get(Paper, paper_id)
+    assert paper is not None
+    assert paper.deleted_at is not None
+    assert db_session.scalars(select(Job).where(Job.paper_id == paper_id)).all() == []
+
+    list_response = client.get("/api/papers")
+    jobs_response = client.get("/api/jobs")
+    assert list_response.status_code == 200
+    assert jobs_response.status_code == 200
+    assert list_response.json()["items"] == []
+    assert jobs_response.json()["items"] == []
+
+
+def test_delete_paper_with_active_job_is_rejected(client, user, db_session: Session) -> None:
+    login(client)
+
+    paper = Paper(title="active paper", status="processing")
+    db_session.add(paper)
+    db_session.flush()
+    job = Job(job_type="pdf_ingest", paper_id=paper.id, status="queued")
+    db_session.add(job)
+    db_session.commit()
+
+    response = client.delete(f"/api/papers/{paper.id}")
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Papers with active jobs cannot be deleted"
+
+
+def test_rerun_ocr_creates_new_job(
+    client,
+    user,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    session_factory: sessionmaker,
+) -> None:
+    login(client)
+
+    original_delay = papers_router.process_uploaded_pdf.delay
+
+    def eager_delay(job_id: int):
+        run_pdf_ingest_job(
+            job_id,
+            session_factory=session_factory,
+            extractor=SuccessfulTextExtractor(),
+        )
+        return None
+
+    monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", eager_delay)
+
+    try:
+        upload_response = client.post(
+            "/api/papers/upload",
+            files={"file": ("rerun-ocr.pdf", make_pdf_bytes("paper body"), "application/pdf")},
+        )
+        assert upload_response.status_code == 202
+        paper_id = upload_response.json()["paper_id"]
+
+        rerun_response = client.post(f"/api/papers/{paper_id}/rerun-ocr")
+    finally:
+        monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", original_delay)
+
+    assert rerun_response.status_code == 202
+    rerun_job_id = rerun_response.json()["job_id"]
+    rerun_job = db_session.get(Job, rerun_job_id)
+    assert rerun_job is not None
+    assert rerun_job.job_type == "pdf_ingest"
+    assert rerun_job.status == "completed"
+    assert len(db_session.scalars(select(Job).where(Job.paper_id == paper_id)).all()) == 2
+
+
+def test_regenerate_summary_creates_summary_job_without_clearing_ocr_text(
+    client,
+    user,
+    monkeypatch: pytest.MonkeyPatch,
+    session_factory: sessionmaker,
+) -> None:
+    login(client)
+    monkeypatch.setattr("app.config.settings.openai_api_key", "test-key")
+
+    original_upload_delay = papers_router.process_uploaded_pdf.delay
+    original_summary_delay = papers_router.process_paper_summary.delay
+
+    def eager_ingest_delay(job_id: int):
+        run_pdf_ingest_job(
+            job_id,
+            session_factory=session_factory,
+            extractor=SuccessfulTextExtractor(),
+        )
+        return None
+
+    def eager_summary_delay(job_id: int):
+        run_paper_summary_job(job_id, session_factory=session_factory)
+        return None
+
+    def second_summary(_: str) -> dict:
+        return {
+            "abstract_cn": "重新生成后的摘要。",
+            "key_points": ["新要点"],
+            "research_question": "新研究问题",
+            "method": "新方法",
+            "findings": "新发现",
+            "limitations": "新局限",
+        }
+
+    monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", eager_ingest_delay)
+
+    try:
+        upload_response = client.post(
+            "/api/papers/upload",
+            files={"file": ("summary.pdf", make_pdf_bytes("paper body"), "application/pdf")},
+        )
+        assert upload_response.status_code == 202
+        paper_id = upload_response.json()["paper_id"]
+    finally:
+        monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", original_upload_delay)
+
+    before_detail = client.get(f"/api/papers/{paper_id}")
+    assert before_detail.status_code == 200
+    preview_text = before_detail.json()["preview_text"]
+
+    monkeypatch.setattr(llm, "summarize_paper_text", second_summary)
+    monkeypatch.setattr("app.services.papers.summarize_paper_text", second_summary)
+    monkeypatch.setattr(papers_router.process_paper_summary, "delay", eager_summary_delay)
+
+    try:
+        regenerate_response = client.post(f"/api/papers/{paper_id}/regenerate-summary")
+    finally:
+        monkeypatch.setattr(papers_router.process_paper_summary, "delay", original_summary_delay)
+
+    assert regenerate_response.status_code == 202
+
+    after_detail = client.get(f"/api/papers/{paper_id}")
+    assert after_detail.status_code == 200
+    body = after_detail.json()
+    assert body["preview_text"] == preview_text
+    assert body["abstract_raw"] == "重新生成后的摘要。"
+    assert body["structured_summary"]["method"] == "新方法"
+    assert body["latest_job"]["job_type"] == "paper_summary"

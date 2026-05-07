@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -37,6 +37,10 @@ class DuplicateFilenameError(RuntimeError):
         self.existing_paper_id = existing_paper_id
 
 
+ACTIVE_JOB_STATUSES = {"queued", "processing"}
+NON_DELETABLE_JOB_STATUSES = {"processing"}
+
+
 def normalize_filename(filename: str) -> str:
     return Path(filename or "upload.pdf").name.strip().casefold()
 
@@ -61,6 +65,27 @@ def find_active_paper_by_original_filename(db: Session, filename: str) -> Paper 
         if isinstance(original_filename, str) and normalize_filename(original_filename) == normalized:
             return paper
     return None
+
+
+def _get_original_pdf_asset(db: Session, paper_id: int) -> PaperAsset | None:
+    return db.scalar(
+        select(PaperAsset).where(
+            PaperAsset.paper_id == paper_id,
+            PaperAsset.asset_type == "original_pdf",
+        )
+    )
+
+
+def _get_active_job_for_paper(db: Session, paper_id: int) -> Job | None:
+    return db.scalar(
+        select(Job)
+        .where(
+            Job.paper_id == paper_id,
+            Job.status.in_(ACTIVE_JOB_STATUSES),
+        )
+        .order_by(Job.id.desc())
+        .limit(1)
+    )
 
 
 def create_upload_artifacts(
@@ -135,12 +160,7 @@ def get_paper_detail(db: Session, paper_id: int) -> PaperDetailData | None:
     if paper is None:
         return None
 
-    asset = db.scalar(
-        select(PaperAsset).where(
-            PaperAsset.paper_id == paper_id,
-            PaperAsset.asset_type == "original_pdf",
-        )
-    )
+    asset = _get_original_pdf_asset(db, paper_id)
     latest_job = db.scalar(
         select(Job).where(Job.paper_id == paper_id).order_by(Job.id.desc()).limit(1)
     )
@@ -155,19 +175,116 @@ def get_original_filename(asset: PaperAsset | None) -> str | None:
     return original_filename if isinstance(original_filename, str) else None
 
 
-def update_paper_title(db: Session, paper_id: int, title: str) -> PaperDetailData | None:
+def update_paper_metadata(db: Session, paper_id: int, updates: dict) -> PaperDetailData | None:
     paper = db.scalar(select(Paper).where(Paper.id == paper_id, Paper.deleted_at.is_(None)))
     if paper is None:
         return None
 
-    normalized_title = title.strip()
-    if not normalized_title:
-        raise ValueError("Title is required")
+    payload = {key: value for key, value in updates.items() if key in {"title", "authors", "doi", "source_url", "published_at"}}
+    if not payload:
+        raise ValueError("No fields to update")
 
-    paper.title = normalized_title
+    if "title" in payload:
+        title = payload["title"]
+        if title is None:
+            raise ValueError("Title is required")
+        normalized_title = str(title).strip()
+        if not normalized_title:
+            raise ValueError("Title is required")
+        paper.title = normalized_title
+
+    for field_name in ("authors", "doi", "source_url"):
+        if field_name not in payload:
+            continue
+        value = payload[field_name]
+        if value is None:
+            setattr(paper, field_name, None)
+            continue
+        normalized_value = str(value).strip()
+        setattr(paper, field_name, normalized_value or None)
+
+    if "published_at" in payload:
+        paper.published_at = payload["published_at"]
+
     paper.updated_at = datetime.now(timezone.utc)
     db.commit()
     return get_paper_detail(db, paper_id)
+
+
+def update_paper_title(db: Session, paper_id: int, title: str) -> PaperDetailData | None:
+    return update_paper_metadata(db, paper_id, {"title": title})
+
+
+def delete_job(db: Session, job_id: int) -> bool:
+    job = db.get(Job, job_id)
+    if job is None:
+        return False
+    if job.status in NON_DELETABLE_JOB_STATUSES:
+        raise ValueError("Processing jobs cannot be deleted")
+
+    db.delete(job)
+    db.commit()
+    return True
+
+
+def delete_paper(db: Session, paper_id: int) -> bool:
+    paper = db.scalar(select(Paper).where(Paper.id == paper_id, Paper.deleted_at.is_(None)))
+    if paper is None:
+        return False
+
+    if _get_active_job_for_paper(db, paper_id) is not None:
+        raise ValueError("Papers with active jobs cannot be deleted")
+
+    now = datetime.now(timezone.utc)
+    paper.deleted_at = now
+    paper.updated_at = now
+    paper.status = "deleted"
+    db.execute(delete(Job).where(Job.paper_id == paper_id))
+    db.commit()
+    return True
+
+
+def enqueue_paper_ocr_rerun(db: Session, paper_id: int) -> Job | None:
+    paper = db.scalar(select(Paper).where(Paper.id == paper_id, Paper.deleted_at.is_(None)))
+    if paper is None:
+        return None
+    if _get_original_pdf_asset(db, paper_id) is None:
+        raise ValueError("Original PDF not found")
+    if _get_active_job_for_paper(db, paper_id) is not None:
+        raise ValueError("Paper already has an active job")
+
+    now = datetime.now(timezone.utc)
+    paper.status = "queued"
+    paper.updated_at = now
+    job = Job(job_type="pdf_ingest", paper_id=paper_id, status="queued")
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    return job
+
+
+def enqueue_paper_summary_regeneration(db: Session, paper_id: int) -> Job | None:
+    paper = db.scalar(select(Paper).where(Paper.id == paper_id, Paper.deleted_at.is_(None)))
+    if paper is None:
+        return None
+    asset = _get_original_pdf_asset(db, paper_id)
+    if asset is None:
+        raise ValueError("Original PDF not found")
+    if not (asset.raw_text or "").strip():
+        raise ValueError("No OCR text available")
+    if not settings.openai_api_key.strip():
+        raise ValueError("Summary model is not configured")
+    if _get_active_job_for_paper(db, paper_id) is not None:
+        raise ValueError("Paper already has an active job")
+
+    now = datetime.now(timezone.utc)
+    paper.status = "queued"
+    paper.updated_at = now
+    job = Job(job_type="paper_summary", paper_id=paper_id, status="queued")
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    return job
 
 
 def run_pdf_ingest_job(
@@ -209,6 +326,58 @@ def run_pdf_ingest_job(
             paper.abstract_raw = summary.get("abstract_cn") or paper.abstract_raw
             metadata["structured_summary"] = summary
             asset.metadata_json = metadata
+        paper.status = "completed"
+        paper.updated_at = datetime.now(timezone.utc)
+        job.status = "completed"
+        job.error_message = None
+        job.finished_at = datetime.now(timezone.utc)
+        db.commit()
+    except Exception as exc:
+        if "job" in locals() and job is not None:
+            job.status = "failed"
+            job.error_message = str(exc)
+            job.finished_at = datetime.now(timezone.utc)
+        if "paper" in locals() and paper is not None:
+            paper.status = "failed"
+            paper.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        raise
+    finally:
+        db.close()
+
+
+def run_paper_summary_job(
+    job_id: int,
+    *,
+    session_factory: Callable[[], Session] = SessionLocal,
+) -> None:
+    db = session_factory()
+    try:
+        job = db.get(Job, job_id)
+        if not job:
+            return
+
+        paper = db.get(Paper, job.paper_id) if job.paper_id is not None else None
+        asset = _get_original_pdf_asset(db, job.paper_id) if job.paper_id is not None else None
+        if paper is None or paper.deleted_at is not None or asset is None:
+            raise RuntimeError("Missing paper or upload asset for summary job")
+        if not settings.openai_api_key.strip():
+            raise RuntimeError("Summary model is not configured")
+        if not (asset.raw_text or "").strip():
+            raise RuntimeError("No OCR text available")
+
+        now = datetime.now(timezone.utc)
+        job.status = "processing"
+        job.started_at = now
+        paper.status = "processing"
+        paper.updated_at = now
+        db.commit()
+
+        summary = summarize_paper_text(asset.raw_text)
+        metadata = dict(asset.metadata_json or {})
+        metadata["structured_summary"] = summary
+        asset.metadata_json = metadata
+        paper.abstract_raw = summary.get("abstract_cn") or paper.abstract_raw
         paper.status = "completed"
         paper.updated_at = datetime.now(timezone.utc)
         job.status = "completed"

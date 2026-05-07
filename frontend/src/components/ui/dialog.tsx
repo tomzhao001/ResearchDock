@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, type ReactNode } from "react";
+import { X } from "lucide-react";
 
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
 type DialogProps = {
@@ -56,8 +58,18 @@ export function Dialog({ open, title, description, onClose, children, className 
           className
         )}
       >
+        <Button
+          type="button"
+          variant="outline"
+          size="icon-sm"
+          aria-label="关闭弹窗"
+          className="absolute top-4 right-4 z-20 bg-white text-slate-500 shadow-sm hover:text-slate-900"
+          onClick={onClose}
+        >
+          <X className="size-4" />
+        </Button>
         {(title || description) ? (
-          <div className="border-b border-slate-200 px-6 py-5">
+          <div className="border-b border-slate-200 px-6 py-5 pr-16">
             {title ? <h2 className="text-lg font-semibold text-slate-950">{title}</h2> : null}
             {description ? <p className="mt-1 text-sm text-slate-500">{description}</p> : null}
           </div>

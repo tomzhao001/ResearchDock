@@ -32,6 +32,13 @@ class UploadConflictDetail(BaseModel):
     filename: str
 
 
+class JobAcceptedResponse(BaseModel):
+    paper_id: int
+    job_id: int
+    job_type: str
+    status: str
+
+
 class JobPublic(BaseModel):
     id: int
     job_type: str | None
@@ -86,7 +93,11 @@ class PaperDetailResponse(BaseModel):
 
 
 class PaperUpdateRequest(BaseModel):
-    title: str
+    title: str | None = None
+    authors: str | None = None
+    doi: str | None = None
+    source_url: str | None = None
+    published_at: datetime | None = None
 
 
 class ChatRequest(BaseModel):
