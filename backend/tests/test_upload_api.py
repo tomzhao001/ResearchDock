@@ -4,7 +4,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.models import Job, Paper, PaperAsset
+from app.models import Job, Paper, PaperAsset, PaperChunk
 from app.services import llm
 from app.routers import papers as papers_router
 from app.services.papers import run_paper_summary_job, run_pdf_ingest_job
@@ -101,6 +101,12 @@ def mock_summary(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(llm, "summarize_paper_text", fake_summary)
     monkeypatch.setattr("app.services.papers.summarize_paper_text", fake_summary)
 
+    def fake_embeddings(texts: list[str]) -> list[list[float]]:
+        return [[float(len(text)), float(len(text.split()))] for text in texts]
+
+    monkeypatch.setattr(llm, "embed_texts", fake_embeddings)
+    monkeypatch.setattr("app.services.rag.embed_texts", fake_embeddings)
+
 
 def test_upload_requires_auth(client, user) -> None:
     response = client.post(
@@ -159,6 +165,7 @@ def test_upload_creates_records_and_completes_job(
     job = db_session.get(Job, body["job_id"])
     paper = db_session.get(Paper, body["paper_id"])
     asset = db_session.scalar(select(PaperAsset).where(PaperAsset.paper_id == paper.id))
+    chunks = db_session.scalars(select(PaperChunk).where(PaperChunk.paper_id == paper.id)).all()
 
     assert job is not None
     assert job.status == "completed"
@@ -166,6 +173,8 @@ def test_upload_creates_records_and_completes_job(
     assert paper.status == "completed"
     assert asset is not None
     assert "embedded text layer" in (asset.raw_text or "")
+    assert len(chunks) > 0
+    assert chunks[0].content
 
     job_response = client.get(f"/api/jobs/{job.id}")
     assert job_response.status_code == 200

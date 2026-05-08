@@ -1,4 +1,4 @@
--- ResearchDock MVP schema (Milestone 1)
+-- ResearchDock MVP schema (Milestone 4)
 -- Requires PostgreSQL with pgvector (e.g. pgvector/pgvector image)
 
 -- CREATE EXTENSION IF NOT EXISTS vector;
@@ -86,7 +86,7 @@ CREATE TABLE paper_chunks (
     paper_id BIGINT NOT NULL REFERENCES papers (id) ON DELETE CASCADE,
     chunk_index INTEGER NOT NULL,
     content TEXT NOT NULL,
-    embedding vector(1536),
+    embedding JSONB,
     token_count INTEGER,
     page_from INTEGER,
     page_to INTEGER,
@@ -95,6 +95,32 @@ CREATE TABLE paper_chunks (
 );
 
 CREATE INDEX idx_paper_chunks_paper_id ON paper_chunks (paper_id);
+CREATE INDEX idx_paper_chunks_paper_chunk ON paper_chunks (paper_id, chunk_index);
+
+CREATE TABLE chat_topics (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    title VARCHAR(255) NOT NULL DEFAULT '新话题',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_chat_topics_user_updated_at ON chat_topics (user_id, updated_at DESC);
+
+CREATE TABLE chat_messages (
+    id BIGSERIAL PRIMARY KEY,
+    topic_id BIGINT NOT NULL REFERENCES chat_topics (id) ON DELETE CASCADE,
+    role VARCHAR(32) NOT NULL,
+    content TEXT NOT NULL,
+    model VARCHAR(255),
+    answer_mode VARCHAR(32),
+    used_knowledge_base BOOLEAN NOT NULL DEFAULT FALSE,
+    citations_json JSONB,
+    metadata_json JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_chat_messages_topic_created_at ON chat_messages (topic_id, created_at ASC);
 
 CREATE TABLE jobs (
     id BIGSERIAL PRIMARY KEY,

@@ -82,3 +82,59 @@ class Job(Base):
         nullable=False,
         server_default=func.now(),
     )
+
+
+class PaperChunk(Base):
+    __tablename__ = "paper_chunks"
+
+    id: Mapped[int] = mapped_column(bigint_sqlite, primary_key=True, autoincrement=True)
+    paper_id: Mapped[int] = mapped_column(bigint_sqlite, nullable=False)
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[list[float] | None] = mapped_column(json_field)
+    token_count: Mapped[int | None] = mapped_column(Integer)
+    page_from: Mapped[int | None] = mapped_column(Integer)
+    page_to: Mapped[int | None] = mapped_column(Integer)
+    metadata_json: Mapped[dict | None] = mapped_column(json_field)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class ChatTopic(Base):
+    __tablename__ = "chat_topics"
+
+    id: Mapped[int] = mapped_column(bigint_sqlite, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(bigint_sqlite, nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False, default="新话题")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+
+    id: Mapped[int] = mapped_column(bigint_sqlite, primary_key=True, autoincrement=True)
+    topic_id: Mapped[int] = mapped_column(bigint_sqlite, nullable=False)
+    role: Mapped[str] = mapped_column(String(32), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    model: Mapped[str | None] = mapped_column(String(255))
+    answer_mode: Mapped[str | None] = mapped_column(String(32))
+    used_knowledge_base: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    citations_json: Mapped[list[dict] | None] = mapped_column(json_field)
+    metadata_json: Mapped[dict | None] = mapped_column(json_field)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )

@@ -123,10 +123,59 @@ class PaperUpdateRequest(BaseModel):
     published_at: datetime | None = None
 
 
-class ChatRequest(BaseModel):
+class ChatTopicCreateRequest(BaseModel):
+    title: str | None = None
+
+
+class ChatTopicPublic(BaseModel):
+    id: int
+    title: str
+    message_count: int
+    last_message_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ChatTopicListResponse(BaseModel):
+    items: list[ChatTopicPublic]
+
+
+class ChatCitation(BaseModel):
+    chunk_id: int
+    paper_id: int
+    paper_title: str | None
+    source_url: str | None
+    snippet: str
+    score: float | None = None
+    page_from: int | None = None
+    page_to: int | None = None
+
+
+class ChatMessageCreateRequest(BaseModel):
     message: str
 
 
-class ChatResponse(BaseModel):
-    answer: str
-    model: str | None
+class ChatMessagePublic(BaseModel):
+    id: int
+    topic_id: int
+    role: str
+    content: str
+    model: str | None = None
+    answer_mode: str | None = None
+    used_knowledge_base: bool = False
+    citations: list[ChatCitation] = []
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ChatMessageListResponse(BaseModel):
+    items: list[ChatMessagePublic]
+
+
+class ChatTurnResponse(BaseModel):
+    topic: ChatTopicPublic
+    user_message: ChatMessagePublic
+    assistant_message: ChatMessagePublic

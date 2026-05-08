@@ -3,7 +3,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.models import Job, PaperAsset
+from app.models import Job, PaperAsset, PaperChunk
 from app.services.ocr.base import OcrRecognitionResult
 from app.services.papers import create_upload_artifacts, run_pdf_ingest_job
 from app.services.pdf_extraction import PDFTextExtractor
@@ -53,6 +53,7 @@ def test_worker_persists_ocr_fallback_result(
 
     job = db_session.get(Job, artifacts.job_id)
     asset = db_session.scalar(select(PaperAsset).where(PaperAsset.paper_id == artifacts.paper_id))
+    chunks = db_session.scalars(select(PaperChunk).where(PaperChunk.paper_id == artifacts.paper_id)).all()
 
     assert job is not None
     assert job.status == "completed"
@@ -61,6 +62,8 @@ def test_worker_persists_ocr_fallback_result(
     assert asset.metadata_json is not None
     assert asset.metadata_json["extraction"]["used_ocr_pages"] == [1]
     assert asset.metadata_json["extraction"]["pages"][0]["ocr_metadata"]["provider"] == "glm_ocr"
+    assert len(chunks) == 1
+    assert chunks[0].embedding is None
 
 
 def test_worker_marks_job_failed_when_glm_ocr_errors(

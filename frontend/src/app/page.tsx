@@ -54,12 +54,12 @@ export default function Home() {
         <header className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
           <div className="grid gap-3">
             <div className="inline-flex w-fit items-center rounded-full border border-slate-200 bg-white/80 px-3 py-1 text-xs font-medium text-slate-600 shadow-sm backdrop-blur">
-              Milestone 3 Workspace
+              Milestone 4 Knowledge Base
             </div>
             <div>
               <h1 className="text-3xl font-semibold tracking-tight text-slate-950">ResearchDock</h1>
               <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-600">
-                首页直接进入论文归档工作台，支持查看论文列表、OCR 预览、通用对话，以及右上角任务追踪。
+                首页直接进入论文归档工作台与知识库对话页，支持围绕论文归档进行带引用问答、话题上下文保存，以及右上角任务追踪。
               </p>
             </div>
           </div>

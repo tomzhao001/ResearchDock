@@ -11,9 +11,10 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import SessionLocal
-from app.models import Job, Paper, PaperAsset
+from app.models import Job, Paper, PaperAsset, PaperChunk
 from app.services.llm import summarize_paper_text
 from app.services.pdf_extraction import PDFTextExtractor
+from app.services.rag import rebuild_paper_index
 from app.services.task_events import publish_task_status_event
 
 
@@ -288,6 +289,7 @@ def delete_paper(db: Session, paper_id: int) -> bool:
     paper.updated_at = now
     paper.status = "deleted"
     db.execute(delete(Job).where(Job.paper_id == paper_id))
+    db.execute(delete(PaperChunk).where(PaperChunk.paper_id == paper_id))
     db.commit()
     return True
 
@@ -372,6 +374,7 @@ def run_pdf_ingest_job(
         metadata["extraction"] = document.metadata
         asset.metadata_json = metadata
         asset.raw_text = document.raw_text
+        rebuild_paper_index(db, paper_id=paper.id, raw_text=document.raw_text)
         paper.status = "completed"
         paper.updated_at = datetime.now(timezone.utc)
         job.status = "completed"

@@ -43,6 +43,15 @@ def _build_chat_completions_url(base_url: str) -> str:
     return f"{normalized}/chat/completions"
 
 
+def _build_embeddings_url(base_url: str) -> str:
+    normalized = (base_url or "").strip().rstrip("/")
+    if not normalized:
+        raise RuntimeError("OPENAI_BASE_URL is not configured")
+    if normalized.endswith("/embeddings"):
+        return normalized
+    return f"{normalized}/embeddings"
+
+
 def _extract_json_object(content: str) -> dict:
     text = (content or "").strip()
     if not text:
@@ -63,7 +72,11 @@ def _extract_json_object(content: str) -> dict:
         return json.loads(text[start : end + 1])
 
 
-def _request_chat_completion(messages: Sequence[dict[str, str]]) -> tuple[str, str | None]:
+def _request_chat_completion(
+    messages: Sequence[dict[str, str]],
+    *,
+    temperature: float = 0.3,
+) -> tuple[str, str | None]:
     if not settings.openai_api_key.strip():
         raise RuntimeError("OPENAI_API_KEY is not configured")
 
@@ -76,7 +89,7 @@ def _request_chat_completion(messages: Sequence[dict[str, str]]) -> tuple[str, s
         json={
             "model": settings.openai_model,
             "messages": list(messages),
-            "temperature": 0.3,
+            "temperature": temperature,
         },
         timeout=settings.openai_timeout_seconds,
         verify=settings.openai_verify_ssl,
@@ -92,16 +105,66 @@ def _request_chat_completion(messages: Sequence[dict[str, str]]) -> tuple[str, s
     return content.strip(), model_name if isinstance(model_name, str) else settings.openai_model
 
 
+def _request_embeddings(inputs: Sequence[str]) -> list[list[float]]:
+    cleaned_inputs = [item.strip() for item in inputs if item and item.strip()]
+    if not cleaned_inputs:
+        return []
+    if not settings.openai_api_key.strip():
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+
+    response = httpx.post(
+        _build_embeddings_url(settings.openai_base_url),
+        headers={
+            "Authorization": f"Bearer {settings.openai_api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": settings.openai_embedding_model,
+            "input": cleaned_inputs,
+        },
+        timeout=settings.openai_timeout_seconds,
+        verify=settings.openai_verify_ssl,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    data = payload.get("data") or []
+    embeddings: list[list[float]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            raise RuntimeError("Embedding 响应格式无效")
+        vector = item.get("embedding")
+        if not isinstance(vector, list) or not all(isinstance(value, (int, float)) for value in vector):
+            raise RuntimeError("Embedding 响应缺少向量数据")
+        embeddings.append([float(value) for value in vector])
+    if len(embeddings) != len(cleaned_inputs):
+        raise RuntimeError("Embedding 数量与输入不匹配")
+    return embeddings
+
+
+def chat_with_messages(
+    messages: Sequence[dict[str, str]],
+    *,
+    temperature: float = 0.3,
+) -> tuple[str, str | None]:
+    if not list(messages):
+        raise RuntimeError("messages are required")
+    return _request_chat_completion(messages, temperature=temperature)
+
+
 def chat_with_model(user_message: str) -> tuple[str, str | None]:
     prompt = (user_message or "").strip()
     if not prompt:
         raise RuntimeError("message is required")
-    return _request_chat_completion(
+    return chat_with_messages(
         [
             {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
-        ]
+        ],
     )
+
+
+def embed_texts(texts: Sequence[str]) -> list[list[float]]:
+    return _request_embeddings(texts)
 
 
 def summarize_paper_text(raw_text: str) -> dict:
