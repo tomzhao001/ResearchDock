@@ -2,9 +2,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.routers import auth_routes, chat, health, jobs, papers
+from app.routers import auth_routes, chat, health, jobs, papers, ws
 
 app = FastAPI(title=settings.app_name)
+app.state.redis_url = settings.redis_url
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,3 +20,4 @@ app.include_router(auth_routes.router)
 app.include_router(papers.router)
 app.include_router(jobs.router)
 app.include_router(chat.router)
+app.include_router(ws.router)

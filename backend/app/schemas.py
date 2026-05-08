@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel
 
@@ -96,6 +97,22 @@ class PaperDetailResponse(BaseModel):
     latest_job: JobPublic | None
     latest_ocr_job: JobPublic | None
     latest_summary_job: JobPublic | None
+
+
+class TaskStatusEvent(BaseModel):
+    type: Literal["task-status"] = "task-status"
+    paper_id: int
+    job_id: int | None
+    job_type: str | None
+    job_status: str | None
+    paper_status: str | None
+    ocr_status: str | None
+    summary_status: str | None
+    error_message: str | None
+    updated_at: datetime
+    job: JobPublic | None
+    paper_list_item: PaperListItem
+    paper_detail: PaperDetailResponse
 
 
 class PaperUpdateRequest(BaseModel):

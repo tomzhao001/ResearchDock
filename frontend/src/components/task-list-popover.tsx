@@ -6,7 +6,7 @@ import { CheckCircle2, Clock3, LoaderCircle, Trash2, TriangleAlert } from "lucid
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
-import { deleteJob, fetchJobs, type JobPublic } from "@/lib/papers";
+import { deleteJob, fetchJobs, subscribeTaskStatusEvents, type JobPublic } from "@/lib/papers";
 
 const ACTIVE_STATUSES = new Set(["queued", "processing"]);
 const NON_DELETABLE_STATUSES = new Set(["processing"]);
@@ -36,6 +36,11 @@ type TaskListPopoverProps = {
   onOpenPaper: (paperId: number) => void;
 };
 
+function mergeJobs(currentJobs: JobPublic[], nextJob: JobPublic): JobPublic[] {
+  const remaining = currentJobs.filter((job) => job.id !== nextJob.id);
+  return [nextJob, ...remaining].sort((left, right) => right.id - left.id).slice(0, 20);
+}
+
 export function TaskListPopover({ onOpenPaper }: TaskListPopoverProps) {
   const [open, setOpen] = useState(false);
   const [jobs, setJobs] = useState<JobPublic[]>([]);
@@ -62,6 +67,17 @@ export function TaskListPopover({ onOpenPaper }: TaskListPopoverProps) {
   }, []);
 
   useEffect(() => {
+    return subscribeTaskStatusEvents({
+      onEvent: (event) => {
+        if (!event.job) {
+          return;
+        }
+        setJobs((current) => mergeJobs(current, event.job!));
+      },
+    });
+  }, []);
+
+  useEffect(() => {
     if (!open) return;
 
     function handlePointerDown(event: MouseEvent) {
@@ -75,12 +91,10 @@ export function TaskListPopover({ onOpenPaper }: TaskListPopoverProps) {
   }, [open]);
 
   useEffect(() => {
-    const timer = window.setTimeout(() => {
+    if (open) {
       void loadJobs();
-    }, open ? 3000 : 5000);
-
-    return () => window.clearTimeout(timer);
-  }, [jobs, open]);
+    }
+  }, [open]);
 
   const activeJobs = useMemo(() => jobs.filter((job) => ACTIVE_STATUSES.has(job.status ?? "")), [jobs]);
   const failedJobs = useMemo(() => jobs.filter((job) => job.status === "failed"), [jobs]);

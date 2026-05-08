@@ -8,12 +8,11 @@ import { Label } from "@/components/ui/label";
 import {
   UploadConflictError,
   fetchJob,
+  subscribeTaskStatusEvents,
   uploadPaper,
   type JobPublic,
   type UploadAcceptedResponse,
 } from "@/lib/papers";
-
-const POLLABLE_STATUSES = new Set(["queued", "processing"]);
 
 function statusLabel(status: string | null): string {
   if (status === "queued") return "已入队";
@@ -24,13 +23,12 @@ function statusLabel(status: string | null): string {
 }
 
 export type UploadPanelProps = {
-  pollDelayMs?: number;
   onUploadAccepted?: (accepted: UploadAcceptedResponse) => void;
   onJobUpdate?: (job: JobPublic) => void;
   onCloseAfterUpload?: () => void;
 };
 
-export function UploadPanel({ pollDelayMs = 2000, onUploadAccepted, onJobUpdate, onCloseAfterUpload }: UploadPanelProps) {
+export function UploadPanel({ onUploadAccepted, onJobUpdate, onCloseAfterUpload }: UploadPanelProps) {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [job, setJob] = useState<JobPublic | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -38,21 +36,21 @@ export function UploadPanel({ pollDelayMs = 2000, onUploadAccepted, onJobUpdate,
   const [conflict, setConflict] = useState<{ filename: string; existingPaperId: number } | null>(null);
 
   useEffect(() => {
-    if (!job || !POLLABLE_STATUSES.has(job.status ?? "")) {
+    if (!job?.id) {
       return;
     }
 
-    const timer = window.setTimeout(() => {
-      void fetchJob(job.id)
-        .then((nextJob) => {
-          setJob(nextJob);
-          onJobUpdate?.(nextJob);
-        })
-        .catch((nextError: Error) => setError(nextError.message));
-    }, pollDelayMs);
-
-    return () => window.clearTimeout(timer);
-  }, [job, onJobUpdate, pollDelayMs]);
+    return subscribeTaskStatusEvents({
+      onEvent: (event) => {
+        const nextJob = event.job;
+        if (!nextJob || nextJob.id !== job.id) {
+          return;
+        }
+        setJob(nextJob);
+        onJobUpdate?.(nextJob);
+      },
+    });
+  }, [job?.id, onJobUpdate]);
 
   async function doUpload(overwrite: boolean) {
     if (!selectedFile) {

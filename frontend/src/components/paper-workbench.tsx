@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
 import { TabPanel, Tabs } from "@/components/ui/tabs";
+import { Tooltip } from "./ui/tooltip";
 import { cn } from "@/lib/utils";
 import {
   deletePaper,
@@ -16,6 +17,7 @@ import {
   fetchPapers,
   regeneratePaperSummary,
   rerunPaperOcr,
+  subscribeTaskStatusEvents,
   type JobPublic,
   type PaperDetail,
   type PaperListItem,
@@ -66,10 +68,18 @@ function PhaseBadge({
   label,
   status,
   className,
+  action,
 }: {
   label: string;
   status: string | null;
   className?: string;
+  action?: {
+    tooltip: string;
+    ariaLabel: string;
+    disabled?: boolean;
+    loading?: boolean;
+    onClick: () => void;
+  };
 }) {
   return (
     <span
@@ -81,8 +91,38 @@ function PhaseBadge({
     >
       <span>{label}</span>
       <span>{phaseStatusLabel(status)}</span>
+      {action ? (
+        <Tooltip content={action.tooltip}>
+          <button
+            type="button"
+            aria-label={action.ariaLabel}
+            className="inline-flex size-5 items-center justify-center rounded-full text-current transition hover:bg-black/5 disabled:cursor-not-allowed disabled:opacity-50"
+            onClick={(event) => {
+              event.stopPropagation();
+              action.onClick();
+            }}
+            disabled={action.disabled}
+          >
+            <RefreshCw className={cn("size-3", action.loading ? "animate-spin" : "")} />
+          </button>
+        </Tooltip>
+      ) : null}
     </span>
   );
+}
+
+function sortPapers(items: PaperListItem[]): PaperListItem[] {
+  return [...items].sort((left, right) => {
+    const timeDifference = new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime();
+    if (timeDifference !== 0) {
+      return timeDifference;
+    }
+    return right.id - left.id;
+  });
+}
+
+function upsertPaper(currentPapers: PaperListItem[], nextPaper: PaperListItem): PaperListItem[] {
+  return sortPapers([nextPaper, ...currentPapers.filter((paper) => paper.id !== nextPaper.id)]);
 }
 
 type PaperWorkbenchProps = {
@@ -95,18 +135,22 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
   const [paperDetail, setPaperDetail] = useState<PaperDetail | null>(null);
   const [loadingList, setLoadingList] = useState(true);
   const [loadingDetail, setLoadingDetail] = useState(false);
+  const [manualRefreshing, setManualRefreshing] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [uploadDialogOpen, setUploadDialogOpen] = useState(false);
   const [metadataDialogOpen, setMetadataDialogOpen] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [confirmAction, setConfirmAction] = useState<"rerun-ocr" | "regenerate-summary" | null>(null);
   const [previewTab, setPreviewTab] = useState<"summary" | "ocr">("summary");
   const [actionLoading, setActionLoading] = useState<"rerun-ocr" | "regenerate-summary" | "delete" | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
   const loadPapers = useCallback(
-    async (preferredPaperId?: number | null) => {
-      setLoadingList(true);
+    async (preferredPaperId?: number | null, options?: { silent?: boolean }) => {
+      if (!options?.silent) {
+        setLoadingList(true);
+      }
       try {
         const items = await fetchPapers();
         setPapers(items);
@@ -130,20 +174,24 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
         const message = error instanceof Error ? error.message : "获取论文列表失败";
         setListError(message);
       } finally {
-        setLoadingList(false);
+        if (!options?.silent) {
+          setLoadingList(false);
+        }
       }
     },
     [onSelectedPaperChange, selectedPaperId]
   );
 
-  const loadDetail = useCallback(async (paperId?: number | null) => {
+  const loadDetail = useCallback(async (paperId?: number | null, options?: { silent?: boolean }) => {
     const targetPaperId = paperId ?? selectedPaperId;
     if (!targetPaperId) {
       setPaperDetail(null);
       return;
     }
 
-    setLoadingDetail(true);
+    if (!options?.silent) {
+      setLoadingDetail(true);
+    }
     try {
       const detail = await fetchPaper(targetPaperId);
       setPaperDetail(detail);
@@ -152,7 +200,9 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
       const message = error instanceof Error ? error.message : "获取论文详情失败";
       setDetailError(message);
     } finally {
-      setLoadingDetail(false);
+      if (!options?.silent) {
+        setLoadingDetail(false);
+      }
     }
   }, [selectedPaperId]);
 
@@ -164,23 +214,19 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
     void loadDetail();
   }, [loadDetail]);
 
-  const shouldPoll = useMemo(() => {
-    if (papers.some((paper) => ACTIVE_STATUSES.has(paper.ocr_status ?? "") || ACTIVE_STATUSES.has(paper.summary_status ?? ""))) {
-      return true;
-    }
-    return ACTIVE_STATUSES.has(paperDetail?.ocr_status ?? "") || ACTIVE_STATUSES.has(paperDetail?.summary_status ?? "");
-  }, [paperDetail?.ocr_status, paperDetail?.summary_status, papers]);
-
   useEffect(() => {
-    if (!shouldPoll) return;
-
-    const timer = window.setTimeout(() => {
-      void loadPapers(selectedPaperId);
-      void loadDetail();
-    }, 3000);
-
-    return () => window.clearTimeout(timer);
-  }, [loadDetail, loadPapers, selectedPaperId, shouldPoll]);
+    return subscribeTaskStatusEvents({
+      onEvent: (event) => {
+        setPapers((current) => upsertPaper(current, event.paper_list_item));
+        setPaperDetail((current) => {
+          if (current?.id === event.paper_id || selectedPaperId === event.paper_id) {
+            return event.paper_detail;
+          }
+          return current;
+        });
+      },
+    });
+  }, [selectedPaperId]);
 
   async function handleUploadAccepted(accepted: UploadAcceptedResponse) {
     onSelectedPaperChange(accepted.paper_id);
@@ -240,6 +286,7 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
       return;
     }
 
+    setConfirmAction(null);
     setActionLoading("rerun-ocr");
     setActionError(null);
     try {
@@ -259,6 +306,7 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
       return;
     }
 
+    setConfirmAction(null);
     setActionLoading("regenerate-summary");
     setActionError(null);
     try {
@@ -272,6 +320,31 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
       setActionLoading(null);
     }
   }
+
+  async function handleManualRefresh() {
+    setManualRefreshing(true);
+    try {
+      await loadPapers(selectedPaperId, { silent: true });
+      await loadDetail(selectedPaperId, { silent: true });
+    } finally {
+      setManualRefreshing(false);
+    }
+  }
+
+  const confirmActionText =
+    confirmAction === "rerun-ocr"
+      ? {
+          title: "确认重新执行 OCR",
+          description: "系统会重新提取当前 PDF 的文本，并在完成后继续同步最新 OCR 结果。",
+          buttonLabel: "确认重新 OCR",
+        }
+      : confirmAction === "regenerate-summary"
+        ? {
+            title: "确认重新生成摘要",
+            description: "系统会基于当前 OCR 文本重新生成摘要和结构化信息。",
+            buttonLabel: "确认重新生成摘要",
+          }
+        : null;
 
   return (
     <>
@@ -333,6 +406,61 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
           </div>
         </div>
       </Dialog>
+      <Dialog
+        open={confirmAction !== null}
+        onClose={() => {
+          if (actionLoading === confirmAction && confirmAction !== null) {
+            return;
+          }
+          setConfirmAction(null);
+        }}
+        title={confirmActionText?.title}
+        description={confirmActionText?.description}
+        className="max-w-lg"
+      >
+        <div className="grid gap-4 p-6">
+          <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4 text-sm text-slate-700">
+            {paperDetail
+              ? `即将对“${paperDetail.title || `未命名论文 #${paperDetail.id}`}”发起新的任务。`
+              : "即将发起新的任务。"}
+          </div>
+          <div className="flex justify-end gap-3">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setConfirmAction(null)}
+              disabled={confirmAction !== null && actionLoading === confirmAction}
+            >
+              取消
+            </Button>
+            <Button
+              type="button"
+              onClick={() => {
+                if (confirmAction === "rerun-ocr") {
+                  void handleRerunOcr();
+                  return;
+                }
+                if (confirmAction === "regenerate-summary") {
+                  void handleRegenerateSummary();
+                }
+              }}
+              disabled={confirmAction !== null && actionLoading === confirmAction}
+            >
+              {confirmAction !== null && actionLoading === confirmAction ? (
+                <>
+                  <LoaderCircle className="size-4 animate-spin" />
+                  提交中...
+                </>
+              ) : (
+                <>
+                  <RefreshCw className="size-4" />
+                  {confirmActionText?.buttonLabel}
+                </>
+              )}
+            </Button>
+          </div>
+        </div>
+      </Dialog>
 
       <div className="grid h-full min-h-0 gap-6 xl:grid-cols-[minmax(320px,420px)_minmax(0,1fr)]">
         <Card className="min-h-0 border-none bg-white/80 shadow-sm ring-1 ring-slate-200 backdrop-blur">
@@ -342,10 +470,23 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                 <CardTitle>论文列表</CardTitle>
                 <CardDescription>按更新时间倒序展示，点击左侧条目后在右侧查看摘要、展示名和 OCR 预览。</CardDescription>
               </div>
-              <Button type="button" size="sm" className="gap-2" onClick={() => setUploadDialogOpen(true)} disabled={isBusy}>
-                <Upload className="size-4" />
-                上传 PDF
-              </Button>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="gap-2"
+                  onClick={() => void handleManualRefresh()}
+                  disabled={manualRefreshing || isBusy}
+                >
+                  <RefreshCw className={cn("size-4", manualRefreshing ? "animate-spin" : "")} />
+                  刷新状态
+                </Button>
+                <Button type="button" size="sm" className="gap-2" onClick={() => setUploadDialogOpen(true)} disabled={isBusy}>
+                  <Upload className="size-4" />
+                  上传 PDF
+                </Button>
+              </div>
             </div>
           </CardHeader>
           <CardContent className="grid min-h-0 gap-3 overflow-y-auto">
@@ -455,8 +596,8 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                 ) : null}
                 <TabPanel active={previewTab === "summary"} className="grid gap-5">
                   <div className="grid gap-4 rounded-2xl border border-slate-200 bg-slate-50/80 p-5">
-                    <div className="flex flex-wrap items-start justify-between gap-3">
-                      <div className="grid gap-3">
+                    <div className="flex items-start justify-between gap-4">
+                      <div className="grid min-w-0 flex-1 gap-3">
                         <div>
                           <h2 className="text-xl font-semibold text-slate-950">{paperDetail.title || `未命名论文 #${paperDetail.id}`}</h2>
                           <p className="mt-1 text-sm text-slate-500">
@@ -467,21 +608,6 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                           <Button type="button" variant="outline" size="sm" className="gap-2" onClick={() => setMetadataDialogOpen(true)} disabled={isBusy}>
                             <FilePenLine className="size-4" />
                             编辑文档信息
-                          </Button>
-                          <Button type="button" variant="outline" size="sm" className="gap-2" onClick={() => void handleRerunOcr()} disabled={hasActiveJob || isBusy}>
-                            <RefreshCw className={cn("size-4", actionLoading === "rerun-ocr" ? "animate-spin" : "")} />
-                            重新 OCR
-                          </Button>
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            className="gap-2"
-                            onClick={() => void handleRegenerateSummary()}
-                            disabled={hasActiveJob || isBusy}
-                          >
-                            <RefreshCw className={cn("size-4", actionLoading === "regenerate-summary" ? "animate-spin" : "")} />
-                            重新生成摘要
                           </Button>
                           <Button
                             type="button"
@@ -497,9 +623,29 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                         </div>
                         {actionError ? <p className="text-sm text-destructive">{actionError}</p> : null}
                       </div>
-                      <div className="grid gap-2">
-                        <PhaseBadge label="OCR" status={paperDetail.ocr_status} />
-                        <PhaseBadge label="摘要" status={paperDetail.summary_status} />
+                      <div className="grid shrink-0 gap-2">
+                        <PhaseBadge
+                          label="OCR"
+                          status={paperDetail.ocr_status}
+                          action={{
+                            tooltip: "重新执行 OCR",
+                            ariaLabel: "重新执行 OCR",
+                            disabled: hasActiveJob || isBusy,
+                            loading: actionLoading === "rerun-ocr",
+                            onClick: () => setConfirmAction("rerun-ocr"),
+                          }}
+                        />
+                        <PhaseBadge
+                          label="摘要"
+                          status={paperDetail.summary_status}
+                          action={{
+                            tooltip: "重新生成摘要",
+                            ariaLabel: "重新生成摘要",
+                            disabled: hasActiveJob || isBusy,
+                            loading: actionLoading === "regenerate-summary",
+                            onClick: () => setConfirmAction("regenerate-summary"),
+                          }}
+                        />
                       </div>
                     </div>
 

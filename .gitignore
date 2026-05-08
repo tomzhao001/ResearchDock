@@ -224,3 +224,4 @@ data/files/
 # Cursor IDE
 .specstory/
 .vscode/
+.cursorindexingignore

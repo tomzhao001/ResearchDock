@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { UploadPanel } from "@/components/upload-panel";
-import { UploadConflictError, fetchJob, uploadPaper } from "@/lib/papers";
+import { UploadConflictError, fetchJob, subscribeTaskStatusEvents, uploadPaper } from "@/lib/papers";
 
 vi.mock("@/lib/papers", () => ({
   UploadConflictError: class UploadConflictError extends Error {
@@ -17,6 +17,7 @@ vi.mock("@/lib/papers", () => ({
   },
   uploadPaper: vi.fn(),
   fetchJob: vi.fn(),
+  subscribeTaskStatusEvents: vi.fn(() => vi.fn()),
 }));
 
 describe("UploadPanel", () => {
@@ -28,8 +29,9 @@ describe("UploadPanel", () => {
     vi.useRealTimers();
   });
 
-  it("上传后会轮询任务直至完成", async () => {
+  it("上传后会订阅任务状态并更新界面", async () => {
     const user = userEvent.setup();
+    let handleTaskEvent: (event: { job: Record<string, unknown> | null }) => void = () => {};
 
     vi.mocked(uploadPaper).mockResolvedValue({
       paper_id: 1,
@@ -48,8 +50,25 @@ describe("UploadPanel", () => {
         started_at: "2026-05-06T05:00:00Z",
         finished_at: null,
         created_at: "2026-05-06T05:00:00Z",
-      })
-      .mockResolvedValueOnce({
+      });
+    vi.mocked(subscribeTaskStatusEvents).mockImplementation(({ onEvent }) => {
+      handleTaskEvent = onEvent as (event: { job: Record<string, unknown> | null }) => void;
+      return vi.fn();
+    });
+
+    render(<UploadPanel />);
+
+    const input = screen.getByLabelText("选择 PDF");
+    await user.upload(input, new File(["pdf"], "paper.pdf", { type: "application/pdf" }));
+    await user.click(screen.getByRole("button", { name: "上传 PDF" }));
+
+    await waitFor(() => expect(uploadPaper).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(fetchJob).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByText(/当前上传已创建任务 #9，状态为 处理中/)).toBeInTheDocument());
+    expect(subscribeTaskStatusEvents).toHaveBeenCalledTimes(1);
+
+    handleTaskEvent({
+      job: {
         id: 9,
         job_type: "pdf_ingest",
         paper_id: 1,
@@ -59,24 +78,17 @@ describe("UploadPanel", () => {
         started_at: "2026-05-06T05:00:00Z",
         finished_at: "2026-05-06T05:01:00Z",
         created_at: "2026-05-06T05:00:00Z",
-      });
+      },
+    });
 
-    render(<UploadPanel pollDelayMs={1} />);
-
-    const input = screen.getByLabelText("选择 PDF");
-    await user.upload(input, new File(["pdf"], "paper.pdf", { type: "application/pdf" }));
-    await user.click(screen.getByRole("button", { name: "上传 PDF" }));
-
-    await waitFor(() => expect(uploadPaper).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(fetchJob).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(screen.getByText(/当前上传已创建任务 #9/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/当前上传已创建任务 #9，状态为 已完成/)).toBeInTheDocument());
   });
 
   it("上传失败时显示错误", async () => {
     const user = userEvent.setup();
     vi.mocked(uploadPaper).mockRejectedValue(new Error("Only PDF files are supported"));
 
-    render(<UploadPanel pollDelayMs={1} />);
+    render(<UploadPanel />);
 
     const input = screen.getByLabelText("选择 PDF");
     await user.upload(input, new File(["oops"], "bad.pdf", { type: "application/pdf" }));
@@ -95,7 +107,7 @@ describe("UploadPanel", () => {
       })
     );
 
-    render(<UploadPanel pollDelayMs={1} />);
+    render(<UploadPanel />);
 
     const input = screen.getByLabelText("选择 PDF");
     await user.upload(input, new File(["pdf"], "paper.pdf", { type: "application/pdf" }));

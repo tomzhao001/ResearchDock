@@ -14,6 +14,7 @@ from app.database import SessionLocal
 from app.models import Job, Paper, PaperAsset
 from app.services.llm import summarize_paper_text
 from app.services.pdf_extraction import PDFTextExtractor
+from app.services.task_events import publish_task_status_event
 
 
 @dataclass
@@ -118,6 +119,7 @@ def _queue_summary_job_if_needed(db: Session, paper: Paper, asset: PaperAsset) -
     db.add(summary_job)
     db.commit()
     db.refresh(summary_job)
+    publish_task_status_event(db, paper_id=paper.id, job_id=summary_job.id)
     return summary_job.id
 
 
@@ -179,6 +181,7 @@ def create_upload_artifacts(
     db.add(job)
     db.commit()
     db.refresh(job)
+    publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
     return UploadArtifacts(paper_id=paper.id, job_id=job.id, filename=safe_name)
 
 
@@ -305,6 +308,7 @@ def enqueue_paper_ocr_rerun(db: Session, paper_id: int) -> Job | None:
     db.add(job)
     db.commit()
     db.refresh(job)
+    publish_task_status_event(db, paper_id=paper_id, job_id=job.id)
     return job
 
 
@@ -329,6 +333,7 @@ def enqueue_paper_summary_regeneration(db: Session, paper_id: int) -> Job | None
     db.add(job)
     db.commit()
     db.refresh(job)
+    publish_task_status_event(db, paper_id=paper_id, job_id=job.id)
     return job
 
 
@@ -360,6 +365,7 @@ def run_pdf_ingest_job(
         paper.status = "processing"
         paper.updated_at = now
         db.commit()
+        publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
 
         document = (extractor or PDFTextExtractor()).extract(Path(asset.storage_path))
         metadata = dict(asset.metadata_json or {})
@@ -372,6 +378,7 @@ def run_pdf_ingest_job(
         job.error_message = None
         job.finished_at = datetime.now(timezone.utc)
         db.commit()
+        publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
         return _queue_summary_job_if_needed(db, paper, asset)
     except Exception as exc:
         if "job" in locals() and job is not None:
@@ -382,6 +389,8 @@ def run_pdf_ingest_job(
             paper.status = "failed"
             paper.updated_at = datetime.now(timezone.utc)
         db.commit()
+        if "paper" in locals() and paper is not None:
+            publish_task_status_event(db, paper_id=paper.id, job_id=job.id if "job" in locals() and job is not None else None)
         raise
     finally:
         db.close()
@@ -413,6 +422,7 @@ def run_paper_summary_job(
         paper.status = "processing"
         paper.updated_at = now
         db.commit()
+        publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
 
         summary = summarize_paper_text(asset.raw_text)
         metadata = dict(asset.metadata_json or {})
@@ -425,6 +435,7 @@ def run_paper_summary_job(
         job.error_message = None
         job.finished_at = datetime.now(timezone.utc)
         db.commit()
+        publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
     except Exception as exc:
         if "job" in locals() and job is not None:
             job.status = "failed"
@@ -434,6 +445,8 @@ def run_paper_summary_job(
             paper.status = "failed"
             paper.updated_at = datetime.now(timezone.utc)
         db.commit()
+        if "paper" in locals() and paper is not None:
+            publish_task_status_event(db, paper_id=paper.id, job_id=job.id if "job" in locals() and job is not None else None)
         raise
     finally:
         db.close()
