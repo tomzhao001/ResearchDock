@@ -1,13 +1,17 @@
 from datetime import datetime
 
 from sqlalchemy import JSON, BigInteger, Boolean, DateTime, Integer, String, Text, func
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column
+from pgvector.sqlalchemy import Vector
 
+from app.config import settings
 from app.database import Base
 
 json_field = JSON().with_variant(JSONB, "postgresql")
 bigint_sqlite = BigInteger().with_variant(Integer, "sqlite")
+vector_field = Vector(max(settings.glm_embedding_dimensions, 1)).with_variant(JSON(), "sqlite")
+search_vector_field = Text().with_variant(TSVECTOR(), "postgresql")
 
 
 class User(Base):
@@ -91,7 +95,8 @@ class PaperChunk(Base):
     paper_id: Mapped[int] = mapped_column(bigint_sqlite, nullable=False)
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    embedding: Mapped[list[float] | None] = mapped_column(json_field)
+    embedding: Mapped[list[float] | None] = mapped_column(vector_field)
+    search_vector: Mapped[str | None] = mapped_column(search_vector_field)
     token_count: Mapped[int | None] = mapped_column(Integer)
     page_from: Mapped[int | None] = mapped_column(Integer)
     page_to: Mapped[int | None] = mapped_column(Integer)

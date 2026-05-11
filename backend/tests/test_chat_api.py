@@ -73,9 +73,19 @@ def test_chat_topic_roundtrip_with_knowledge_base_citations(client, user, db_ses
     assert assistant_message.metadata_json is not None
     assert assistant_message.metadata_json["retrieval"]["retrieval_query"] == "What does the transformer method improve?"
     assert assistant_message.metadata_json["retrieval"]["answer_mode"] == "knowledge_base"
+    assert assistant_message.metadata_json["retrieval"]["retrieval_backend"] == "legacy"
+    assert assistant_message.metadata_json["retrieval"]["sparse_candidates"] == []
+    assert assistant_message.metadata_json["retrieval"]["dense_candidates"] == []
+    assert isinstance(assistant_message.metadata_json["retrieval"]["fused_candidates"], list)
+    assert isinstance(assistant_message.metadata_json["retrieval"]["reranked_candidates"], list)
 
 
-def test_chat_falls_back_to_general_answer_when_no_kb_match(client, user, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_chat_falls_back_to_general_answer_when_no_kb_match(
+    client,
+    user,
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     login(client)
 
     def fake_chat(_: list[dict[str, str]], *, temperature: float = 0.3) -> tuple[str, str | None]:
@@ -97,3 +107,12 @@ def test_chat_falls_back_to_general_answer_when_no_kb_match(client, user, monkey
     assert body["assistant_message"]["used_knowledge_base"] is False
     assert body["assistant_message"]["citations"] == []
     assert "知识库中未找到确切依据" in body["assistant_message"]["content"]
+
+    assistant_message = db_session.scalar(
+        select(ChatMessage)
+        .where(ChatMessage.topic_id == topic_id, ChatMessage.role == "assistant")
+        .order_by(ChatMessage.id.desc())
+    )
+    assert assistant_message is not None
+    assert assistant_message.metadata_json is not None
+    assert assistant_message.metadata_json["retrieval"]["retrieval_backend"] == "legacy"

@@ -1,7 +1,7 @@
 -- ResearchDock MVP schema (Milestone 4)
 -- Requires PostgreSQL with pgvector (e.g. pgvector/pgvector image)
 
--- CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE users (
     id BIGSERIAL PRIMARY KEY,
@@ -86,7 +86,8 @@ CREATE TABLE paper_chunks (
     paper_id BIGINT NOT NULL REFERENCES papers (id) ON DELETE CASCADE,
     chunk_index INTEGER NOT NULL,
     content TEXT NOT NULL,
-    embedding JSONB,
+    embedding VECTOR(1024),
+    search_vector TSVECTOR,
     token_count INTEGER,
     page_from INTEGER,
     page_to INTEGER,
@@ -96,6 +97,8 @@ CREATE TABLE paper_chunks (
 
 CREATE INDEX idx_paper_chunks_paper_id ON paper_chunks (paper_id);
 CREATE INDEX idx_paper_chunks_paper_chunk ON paper_chunks (paper_id, chunk_index);
+CREATE INDEX idx_paper_chunks_search_vector ON paper_chunks USING GIN (search_vector);
+CREATE INDEX idx_paper_chunks_embedding_cosine ON paper_chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
 
 CREATE TABLE chat_topics (
     id BIGSERIAL PRIMARY KEY,

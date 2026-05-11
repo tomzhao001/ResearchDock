@@ -85,7 +85,19 @@ def test_sample_data_smoke_eval_runs_and_returns_reports(
             return answer_map.get(question, "知识库中未找到确切依据。"), "sample-data-test-model"
         return answer_map.get(content.strip(), "知识库中未找到确切依据。"), "sample-data-test-model"
 
+    def fake_embeddings(texts: list[str]) -> list[list[float]]:
+        return [[float(len(text)), float(len(text.split()))] for text in texts]
+
+    def fake_rerank(query: str, documents: list[str], *, top_n: int | None = None):
+        limit = min(top_n or len(documents), len(documents))
+        return [
+            type("RerankResult", (), {"index": index, "relevance_score": float(limit - index), "document": None})()
+            for index in range(limit)
+        ]
+
     monkeypatch.setattr("app.services.rag.chat_with_messages", fake_chat)
+    monkeypatch.setattr("app.services.rag.embed_texts", fake_embeddings)
+    monkeypatch.setattr("app.services.rag.rerank_documents", fake_rerank)
 
     report = run_sample_data_evaluation(session_factory, mode="both", subset="smoke", judge_mode="heuristic")
 
@@ -93,3 +105,4 @@ def test_sample_data_smoke_eval_runs_and_returns_reports(
     assert report["retrieval"]["summary"]["skipped_without_gold"] == 1
     assert report["end_to_end"]["summary"]["count"] == 12
     assert "groundedness" in report["end_to_end"]["summary"]
+    assert report["end_to_end"]["questions"][0]["metadata"]["retrieval"]["retrieval_backend"] == "legacy"

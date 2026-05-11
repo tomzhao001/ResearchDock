@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import httpx
 
@@ -34,6 +35,31 @@ SUMMARY_USER_TEMPLATE = """
 """.strip()
 
 
+@dataclass(frozen=True)
+class RerankResult:
+    index: int
+    relevance_score: float
+    document: str | None = None
+
+
+def _get_llm_provider() -> str:
+    provider = (settings.llm_provider or "").strip().lower()
+    if not provider or provider == "auto":
+        return "glm" if settings.glm_api_key.strip() else "openai"
+    if provider in {"openai", "glm"}:
+        return provider
+    raise RuntimeError("LLM_PROVIDER must be one of: auto, openai, glm")
+
+
+def _get_embedding_provider() -> str:
+    provider = (settings.embedding_provider or "").strip().lower()
+    if not provider or provider == "auto":
+        return "glm" if settings.glm_api_key.strip() else "openai"
+    if provider in {"openai", "glm"}:
+        return provider
+    raise RuntimeError("EMBEDDING_PROVIDER must be one of: auto, openai, glm")
+
+
 def _build_chat_completions_url(base_url: str) -> str:
     normalized = (base_url or "").strip().rstrip("/")
     if not normalized:
@@ -50,6 +76,15 @@ def _build_embeddings_url(base_url: str) -> str:
     if normalized.endswith("/embeddings"):
         return normalized
     return f"{normalized}/embeddings"
+
+
+def _build_rerank_url(base_url: str) -> str:
+    normalized = (base_url or "").strip().rstrip("/")
+    if not normalized:
+        raise RuntimeError("GLM_BASE_URL is not configured")
+    if normalized.endswith("/rerank"):
+        return normalized
+    return f"{normalized}/rerank"
 
 
 def _extract_json_object(content: str) -> dict:
@@ -72,61 +107,90 @@ def _extract_json_object(content: str) -> dict:
         return json.loads(text[start : end + 1])
 
 
+def _post_json(
+    url: str,
+    *,
+    api_key: str,
+    payload: dict,
+    timeout: int,
+    verify_ssl: bool,
+) -> dict:
+    response = httpx.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=timeout,
+        verify=verify_ssl,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
 def _request_chat_completion(
     messages: Sequence[dict[str, str]],
     *,
     temperature: float = 0.3,
 ) -> tuple[str, str | None]:
-    if not settings.openai_api_key.strip():
-        raise RuntimeError("OPENAI_API_KEY is not configured")
-
-    response = httpx.post(
-        _build_chat_completions_url(settings.openai_base_url),
-        headers={
-            "Authorization": f"Bearer {settings.openai_api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": settings.openai_model,
-            "messages": list(messages),
-            "temperature": temperature,
-        },
-        timeout=settings.openai_timeout_seconds,
-        verify=settings.openai_verify_ssl,
-    )
-    response.raise_for_status()
-    payload = response.json()
+    provider = _get_llm_provider()
+    if provider == "glm":
+        if not settings.glm_api_key.strip():
+            raise RuntimeError("GLM_API_KEY is not configured")
+        model_name = (settings.glm_model or "").strip() or settings.openai_model
+        payload = _post_json(
+            _build_chat_completions_url(settings.glm_base_url),
+            api_key=settings.glm_api_key,
+            payload={
+                "model": model_name,
+                "messages": list(messages),
+                "temperature": temperature,
+            },
+            timeout=settings.glm_timeout_seconds,
+            verify_ssl=settings.glm_verify_ssl,
+        )
+    else:
+        if not settings.openai_api_key.strip():
+            raise RuntimeError("OPENAI_API_KEY is not configured")
+        model_name = settings.openai_model
+        payload = _post_json(
+            _build_chat_completions_url(settings.openai_base_url),
+            api_key=settings.openai_api_key,
+            payload={
+                "model": model_name,
+                "messages": list(messages),
+                "temperature": temperature,
+            },
+            timeout=settings.openai_timeout_seconds,
+            verify_ssl=settings.openai_verify_ssl,
+        )
     choices = payload.get("choices") or []
     message = choices[0].get("message") if choices else None
     content = message.get("content") if isinstance(message, dict) else None
     if not isinstance(content, str) or not content.strip():
         raise RuntimeError("模型未返回有效内容")
-    model_name = payload.get("model")
-    return content.strip(), model_name if isinstance(model_name, str) else settings.openai_model
+    response_model = payload.get("model")
+    return content.strip(), response_model if isinstance(response_model, str) else model_name
 
 
-def _request_embeddings(inputs: Sequence[str]) -> list[list[float]]:
+def _request_openai_embeddings(inputs: Sequence[str]) -> list[list[float]]:
     cleaned_inputs = [item.strip() for item in inputs if item and item.strip()]
     if not cleaned_inputs:
         return []
     if not settings.openai_api_key.strip():
         raise RuntimeError("OPENAI_API_KEY is not configured")
 
-    response = httpx.post(
+    payload = _post_json(
         _build_embeddings_url(settings.openai_base_url),
-        headers={
-            "Authorization": f"Bearer {settings.openai_api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
+        api_key=settings.openai_api_key,
+        payload={
             "model": settings.openai_embedding_model,
             "input": cleaned_inputs,
         },
         timeout=settings.openai_timeout_seconds,
-        verify=settings.openai_verify_ssl,
+        verify_ssl=settings.openai_verify_ssl,
     )
-    response.raise_for_status()
-    payload = response.json()
     data = payload.get("data") or []
     embeddings: list[list[float]] = []
     for item in data:
@@ -139,6 +203,90 @@ def _request_embeddings(inputs: Sequence[str]) -> list[list[float]]:
     if len(embeddings) != len(cleaned_inputs):
         raise RuntimeError("Embedding 数量与输入不匹配")
     return embeddings
+
+
+def _request_glm_embeddings(inputs: Sequence[str]) -> list[list[float]]:
+    cleaned_inputs = [item.strip() for item in inputs if item and item.strip()]
+    if not cleaned_inputs:
+        return []
+    if not settings.glm_api_key.strip():
+        raise RuntimeError("GLM_API_KEY is not configured")
+
+    payload_data: dict[str, object] = {
+        "model": settings.glm_embedding_model,
+        "input": cleaned_inputs,
+    }
+    if settings.glm_embedding_dimensions > 0:
+        payload_data["dimensions"] = settings.glm_embedding_dimensions
+
+    payload = _post_json(
+        _build_embeddings_url(settings.glm_base_url),
+        api_key=settings.glm_api_key,
+        payload=payload_data,
+        timeout=settings.glm_timeout_seconds,
+        verify_ssl=settings.glm_verify_ssl,
+    )
+    data = payload.get("data") or []
+    embeddings: list[list[float]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            raise RuntimeError("GLM Embedding 响应格式无效")
+        vector = item.get("embedding")
+        if not isinstance(vector, list) or not all(isinstance(value, (int, float)) for value in vector):
+            raise RuntimeError("GLM Embedding 响应缺少向量数据")
+        embeddings.append([float(value) for value in vector])
+    if len(embeddings) != len(cleaned_inputs):
+        raise RuntimeError("GLM Embedding 数量与输入不匹配")
+    return embeddings
+
+
+def _request_glm_rerank(
+    query: str,
+    documents: Sequence[str],
+    *,
+    top_n: int | None = None,
+) -> list[RerankResult]:
+    cleaned_query = (query or "").strip()
+    cleaned_documents = [item.strip() for item in documents if item and item.strip()]
+    if not cleaned_query or not cleaned_documents:
+        return []
+    if not settings.glm_api_key.strip():
+        raise RuntimeError("GLM_API_KEY is not configured")
+
+    payload_data: dict[str, object] = {
+        "model": settings.glm_rerank_model,
+        "query": cleaned_query,
+        "documents": cleaned_documents[:128],
+        "return_documents": False,
+    }
+    if top_n is not None:
+        payload_data["top_n"] = max(min(int(top_n), len(cleaned_documents), 128), 1)
+
+    payload = _post_json(
+        _build_rerank_url(settings.glm_base_url),
+        api_key=settings.glm_api_key,
+        payload=payload_data,
+        timeout=settings.glm_timeout_seconds,
+        verify_ssl=settings.glm_verify_ssl,
+    )
+    results = payload.get("results") or []
+    reranked: list[RerankResult] = []
+    for item in results:
+        if not isinstance(item, dict):
+            raise RuntimeError("GLM Rerank 响应格式无效")
+        index = item.get("index")
+        score = item.get("relevance_score", item.get("score"))
+        if not isinstance(index, int) or not isinstance(score, (int, float)):
+            raise RuntimeError("GLM Rerank 响应缺少排序结果")
+        document = item.get("document")
+        reranked.append(
+            RerankResult(
+                index=index,
+                relevance_score=float(score),
+                document=document if isinstance(document, str) else None,
+            )
+        )
+    return reranked
 
 
 def chat_with_messages(
@@ -164,7 +312,18 @@ def chat_with_model(user_message: str) -> tuple[str, str | None]:
 
 
 def embed_texts(texts: Sequence[str]) -> list[list[float]]:
-    return _request_embeddings(texts)
+    if _get_embedding_provider() == "glm":
+        return _request_glm_embeddings(texts)
+    return _request_openai_embeddings(texts)
+
+
+def rerank_documents(
+    query: str,
+    documents: Sequence[str],
+    *,
+    top_n: int | None = None,
+) -> list[RerankResult]:
+    return _request_glm_rerank(query, documents, top_n=top_n)
 
 
 def summarize_paper_text(raw_text: str) -> dict:

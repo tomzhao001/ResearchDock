@@ -4,15 +4,17 @@ import logging
 import math
 import re
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import ChatMessage, ChatTopic, Paper, PaperChunk, User
-from app.services.llm import chat_with_messages, embed_texts
+from app.services.llm import chat_with_messages, embed_texts, rerank_documents
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +92,271 @@ def _lexical_score(query_tokens: set[str], content: str) -> float:
         return 0.0
     overlap = query_tokens & chunk_tokens
     return len(overlap) / len(query_tokens)
+
+
+def _is_postgres_session(db: Session) -> bool:
+    bind = db.get_bind()
+    return bool(bind and bind.dialect.name == "postgresql")
+
+
+def _normalize_embedding(value: Any) -> list[float] | None:
+    if value is None:
+        return None
+    if isinstance(value, list) and all(isinstance(item, (int, float)) for item in value):
+        return [float(item) for item in value]
+    if isinstance(value, tuple) and all(isinstance(item, (int, float)) for item in value):
+        return [float(item) for item in value]
+    if hasattr(value, "tolist"):
+        items = value.tolist()
+        if isinstance(items, list) and all(isinstance(item, (int, float)) for item in items):
+            return [float(item) for item in items]
+    return None
+
+
+def _search_chunks_legacy(db: Session, *, query: str, top_k: int) -> list[RetrievalResult]:
+    rows = db.execute(
+        select(PaperChunk, Paper)
+        .join(Paper, Paper.id == PaperChunk.paper_id)
+        .where(Paper.deleted_at.is_(None))
+        .order_by(PaperChunk.paper_id.asc(), PaperChunk.chunk_index.asc())
+    ).all()
+    if not rows:
+        return []
+
+    query_tokens = set(_tokenize(query))
+    query_embedding: list[float] | None = None
+    if (settings.glm_api_key.strip() or settings.openai_api_key.strip()) and any(chunk.embedding for chunk, _ in rows):
+        try:
+            query_embedding = embed_texts([query])[0]
+        except Exception:
+            query_embedding = None
+
+    scored: list[RetrievalResult] = []
+    for chunk, paper in rows:
+        lexical_score = _lexical_score(query_tokens, chunk.content)
+        chunk_embedding = _normalize_embedding(chunk.embedding)
+        embedding_score = (
+            _cosine_similarity(query_embedding, chunk_embedding)
+            if query_embedding is not None and chunk_embedding is not None
+            else 0.0
+        )
+        score = embedding_score if embedding_score > 0 else lexical_score
+        if embedding_score > 0 and lexical_score > 0:
+            score = embedding_score * 0.8 + lexical_score * 0.2
+        if score < MIN_RELEVANCE_SCORE:
+            continue
+        scored.append(RetrievalResult(chunk=chunk, paper=paper, score=score))
+
+    scored.sort(key=lambda item: item.score, reverse=True)
+    return scored[:top_k]
+
+
+def _search_sparse_chunks_postgres(db: Session, *, query: str, limit: int) -> list[dict[str, Any]]:
+    if not query.strip():
+        return []
+    search_config = re.sub(r"[^a-zA-Z0-9_]+", "", settings.rag_text_search_config) or "simple"
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                pc.id AS chunk_id,
+                pc.paper_id AS paper_id,
+                ts_rank_cd(pc.search_vector, plainto_tsquery('{search_config}', :query)) AS score
+            FROM paper_chunks AS pc
+            JOIN papers AS p ON p.id = pc.paper_id
+            WHERE p.deleted_at IS NULL
+              AND pc.search_vector @@ plainto_tsquery('{search_config}', :query)
+            ORDER BY score DESC, pc.id ASC
+            LIMIT :limit
+            """
+        ),
+        {
+            "query": query.strip(),
+            "limit": limit,
+        },
+    ).mappings().all()
+    return [
+        {
+            "chunk_id": int(row["chunk_id"]),
+            "paper_id": int(row["paper_id"]),
+            "score": float(row["score"] or 0.0),
+        }
+        for row in rows
+    ]
+
+
+def _search_dense_chunks_postgres(
+    db: Session,
+    *,
+    query_embedding: list[float] | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    if query_embedding is None:
+        return []
+    distance = PaperChunk.embedding.cosine_distance(query_embedding)
+    rows = db.execute(
+        select(
+            PaperChunk.id.label("chunk_id"),
+            PaperChunk.paper_id.label("paper_id"),
+            (1 - distance).label("score"),
+        )
+        .join(Paper, Paper.id == PaperChunk.paper_id)
+        .where(Paper.deleted_at.is_(None), PaperChunk.embedding.is_not(None))
+        .order_by(distance.asc(), PaperChunk.id.asc())
+        .limit(limit)
+    ).all()
+    return [
+        {
+            "chunk_id": int(row.chunk_id),
+            "paper_id": int(row.paper_id),
+            "score": float(row.score or 0.0),
+        }
+        for row in rows
+    ]
+
+
+def _fuse_ranked_candidates(
+    sparse_hits: list[dict[str, Any]],
+    dense_hits: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    merged: dict[int, dict[str, Any]] = {}
+    for source, hits in (("sparse", sparse_hits), ("dense", dense_hits)):
+        for rank, item in enumerate(hits, start=1):
+            candidate = merged.setdefault(
+                int(item["chunk_id"]),
+                {
+                    "chunk_id": int(item["chunk_id"]),
+                    "paper_id": int(item["paper_id"]),
+                    "source_scores": {},
+                    "source_ranks": {},
+                    "score": 0.0,
+                },
+            )
+            candidate["source_scores"][source] = float(item["score"])
+            candidate["source_ranks"][source] = rank
+            candidate["score"] += 1.0 / (settings.rag_rrf_k + rank)
+    fused = list(merged.values())
+    fused.sort(
+        key=lambda item: (
+            float(item["score"]),
+            max((float(score) for score in item["source_scores"].values()), default=0.0),
+        ),
+        reverse=True,
+    )
+    for rank, item in enumerate(fused, start=1):
+        item["rank"] = rank
+    return fused[:limit]
+
+
+def _load_chunk_record_map(
+    db: Session,
+    *,
+    chunk_ids: Iterable[int],
+) -> dict[int, tuple[PaperChunk, Paper]]:
+    ids = [int(chunk_id) for chunk_id in chunk_ids]
+    if not ids:
+        return {}
+    rows = db.execute(
+        select(PaperChunk, Paper)
+        .join(Paper, Paper.id == PaperChunk.paper_id)
+        .where(Paper.deleted_at.is_(None), PaperChunk.id.in_(ids))
+    ).all()
+    return {int(chunk.id): (chunk, paper) for chunk, paper in rows}
+
+
+def _serialize_ranked_trace_candidates(
+    candidates: list[dict[str, Any]],
+    record_map: dict[int, tuple[PaperChunk, Paper]],
+) -> list[dict]:
+    serialized: list[dict] = []
+    for item in candidates:
+        record = record_map.get(int(item["chunk_id"]))
+        if record is None:
+            continue
+        chunk, paper = record
+        snippet = chunk.content
+        if len(snippet) > 180:
+            snippet = f"{snippet[:180].rstrip()}..."
+        row = {
+            "chunk_id": chunk.id,
+            "chunk_index": chunk.chunk_index,
+            "paper_id": paper.id,
+            "paper_title": paper.title,
+            "score": round(float(item.get("score") or 0.0), 4),
+            "page_from": chunk.page_from,
+            "page_to": chunk.page_to,
+            "snippet": snippet,
+        }
+        source_scores = item.get("source_scores")
+        if isinstance(source_scores, dict) and source_scores:
+            row["source_scores"] = {key: round(float(value), 4) for key, value in source_scores.items()}
+        source_ranks = item.get("source_ranks")
+        if isinstance(source_ranks, dict) and source_ranks:
+            row["source_ranks"] = {key: int(value) for key, value in source_ranks.items()}
+        if item.get("rerank_score") is not None:
+            row["rerank_score"] = round(float(item["rerank_score"]), 4)
+        if item.get("rerank_rank") is not None:
+            row["rerank_rank"] = int(item["rerank_rank"])
+        serialized.append(row)
+    return serialized
+
+
+def _build_retrieval_results(
+    candidates: list[dict[str, Any]],
+    *,
+    record_map: dict[int, tuple[PaperChunk, Paper]],
+) -> list[RetrievalResult]:
+    results: list[RetrievalResult] = []
+    for item in candidates:
+        record = record_map.get(int(item["chunk_id"]))
+        if record is None:
+            continue
+        chunk, paper = record
+        results.append(RetrievalResult(chunk=chunk, paper=paper, score=float(item.get("score") or 0.0)))
+    return results
+
+
+def _apply_reranking(
+    query: str,
+    *,
+    fused_candidates: list[dict[str, Any]],
+    record_map: dict[int, tuple[PaperChunk, Paper]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    documents: list[str] = []
+    aligned_candidates: list[dict[str, Any]] = []
+    for candidate in fused_candidates:
+        record = record_map.get(int(candidate["chunk_id"]))
+        if record is None:
+            continue
+        documents.append(record[0].content)
+        aligned_candidates.append(candidate)
+    if not documents:
+        return []
+    rerank_results = rerank_documents(query, documents, top_n=limit)
+    if not rerank_results:
+        return aligned_candidates[:limit]
+
+    reranked: list[dict[str, Any]] = []
+    seen_indexes: set[int] = set()
+    for rank, item in enumerate(rerank_results, start=1):
+        if item.index < 0 or item.index >= len(aligned_candidates):
+            continue
+        candidate = dict(aligned_candidates[item.index])
+        candidate["score"] = float(item.relevance_score)
+        candidate["rerank_score"] = float(item.relevance_score)
+        candidate["rerank_rank"] = rank
+        reranked.append(candidate)
+        seen_indexes.add(item.index)
+
+    for index, candidate in enumerate(aligned_candidates):
+        if index in seen_indexes:
+            continue
+        reranked.append(dict(candidate))
+
+    return reranked[:limit]
 
 
 def _history_messages(records: list[ChatMessage], *, include_last_user: bool = False) -> list[dict[str, str]]:
@@ -235,45 +502,88 @@ def rebuild_paper_index(db: Session, *, paper_id: int, raw_text: str) -> int:
             )
         )
     db.commit()
+    if _is_postgres_session(db):
+        db.execute(
+            update(PaperChunk)
+            .where(PaperChunk.paper_id == paper_id)
+            .values(
+                search_vector=func.to_tsvector(
+                    settings.rag_text_search_config,
+                    PaperChunk.content,
+                )
+            )
+        )
+        db.commit()
     return len(chunks)
 
 
-def _search_chunks(db: Session, *, query: str, top_k: int | None = None) -> list[RetrievalResult]:
-    rows = db.execute(
-        select(PaperChunk, Paper)
-        .join(Paper, Paper.id == PaperChunk.paper_id)
-        .where(Paper.deleted_at.is_(None))
-        .order_by(PaperChunk.paper_id.asc(), PaperChunk.chunk_index.asc())
-    ).all()
-    if not rows:
-        return []
-
+def _search_chunks(
+    db: Session,
+    *,
+    query: str,
+    top_k: int | None = None,
+    trace: dict[str, Any] | None = None,
+) -> list[RetrievalResult]:
     limit = top_k or settings.rag_top_k
-    query_tokens = set(_tokenize(query))
+    if not _is_postgres_session(db):
+        results = _search_chunks_legacy(db, query=query, top_k=limit)
+        if trace is not None:
+            serialized = _serialize_trace_candidates(results)
+            trace.update(
+                {
+                    "sparse_candidates": [],
+                    "dense_candidates": [],
+                    "fused_candidates": serialized,
+                    "reranked_candidates": serialized,
+                    "retrieval_backend": "legacy",
+                }
+            )
+        return results
+
     query_embedding: list[float] | None = None
-    if settings.openai_api_key.strip() and any(chunk.embedding for chunk, _ in rows):
+    if settings.glm_api_key.strip() or settings.openai_api_key.strip():
         try:
             query_embedding = embed_texts([query])[0]
         except Exception:
             query_embedding = None
 
-    scored: list[RetrievalResult] = []
-    for chunk, paper in rows:
-        lexical_score = _lexical_score(query_tokens, chunk.content)
-        embedding_score = (
-            _cosine_similarity(query_embedding, chunk.embedding)
-            if query_embedding is not None and isinstance(chunk.embedding, list)
-            else 0.0
-        )
-        score = embedding_score if embedding_score > 0 else lexical_score
-        if embedding_score > 0 and lexical_score > 0:
-            score = embedding_score * 0.8 + lexical_score * 0.2
-        if score < MIN_RELEVANCE_SCORE:
-            continue
-        scored.append(RetrievalResult(chunk=chunk, paper=paper, score=score))
+    sparse_hits = _search_sparse_chunks_postgres(db, query=query, limit=max(settings.rag_sparse_top_k, limit))
+    dense_hits = _search_dense_chunks_postgres(
+        db,
+        query_embedding=query_embedding,
+        limit=max(settings.rag_dense_top_k, limit),
+    )
+    fusion_limit = max(settings.rag_fusion_window, settings.rag_rerank_top_n, limit)
+    fused_candidates = _fuse_ranked_candidates(sparse_hits, dense_hits, limit=fusion_limit)
+    record_map = _load_chunk_record_map(
+        db,
+        chunk_ids=[item["chunk_id"] for item in [*sparse_hits, *dense_hits, *fused_candidates]],
+    )
 
-    scored.sort(key=lambda item: item.score, reverse=True)
-    return scored[:limit]
+    reranked_candidates = fused_candidates
+    if fused_candidates:
+        try:
+            reranked_candidates = _apply_reranking(
+                query,
+                fused_candidates=fused_candidates,
+                record_map=record_map,
+                limit=max(settings.rag_rerank_top_n, limit),
+            )
+        except Exception:
+            reranked_candidates = fused_candidates[: max(settings.rag_rerank_top_n, limit)]
+
+    results = _build_retrieval_results(reranked_candidates[:limit], record_map=record_map)
+    if trace is not None:
+        trace.update(
+            {
+                "sparse_candidates": _serialize_ranked_trace_candidates(sparse_hits, record_map),
+                "dense_candidates": _serialize_ranked_trace_candidates(dense_hits, record_map),
+                "fused_candidates": _serialize_ranked_trace_candidates(fused_candidates, record_map),
+                "reranked_candidates": _serialize_ranked_trace_candidates(reranked_candidates, record_map),
+                "retrieval_backend": "postgres_hybrid",
+            }
+        )
+    return results
 
 
 def _serialize_citations(results: list[RetrievalResult]) -> list[dict]:
@@ -382,14 +692,20 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
     records = list_topic_messages(db, topic_id=topic.id)
     started_at = time.perf_counter()
     retrieval_query = _build_retrieval_query(records, message)
-    candidate_limit = max(settings.rag_top_k, 10)
-    retrieval_candidates = _search_chunks(db, query=retrieval_query, top_k=candidate_limit)
+    candidate_limit = max(settings.rag_top_k, settings.rag_rerank_top_n, 10)
+    retrieval_debug: dict[str, Any] = {}
+    retrieval_candidates = _search_chunks(db, query=retrieval_query, top_k=candidate_limit, trace=retrieval_debug)
     retrieval_results = retrieval_candidates[: settings.rag_top_k]
     citations = _serialize_citations(retrieval_results)
     retrieval_trace = {
         "original_user_query": message,
         "retrieval_query": retrieval_query,
+        "retrieval_backend": retrieval_debug.get("retrieval_backend", "unknown"),
         "first_pass_candidates": _serialize_trace_candidates(retrieval_candidates),
+        "sparse_candidates": retrieval_debug.get("sparse_candidates", []),
+        "dense_candidates": retrieval_debug.get("dense_candidates", []),
+        "fused_candidates": retrieval_debug.get("fused_candidates", []),
+        "reranked_candidates": retrieval_debug.get("reranked_candidates", []),
         "selected_citations": citations,
         "answer_mode": "knowledge_base" if citations else "fallback_general",
         "search_ms": round((time.perf_counter() - started_at) * 1000, 2),
