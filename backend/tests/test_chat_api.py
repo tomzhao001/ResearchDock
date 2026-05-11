@@ -1,6 +1,7 @@
 import pytest
+from sqlalchemy import select
 
-from app.models import Paper, PaperChunk
+from app.models import ChatMessage, Paper, PaperChunk
 
 
 def login(client) -> None:
@@ -62,6 +63,16 @@ def test_chat_topic_roundtrip_with_knowledge_base_citations(client, user, db_ses
     assert len(items) == 2
     assert items[0]["role"] == "user"
     assert items[1]["role"] == "assistant"
+
+    assistant_message = db_session.scalar(
+        select(ChatMessage)
+        .where(ChatMessage.topic_id == topic_id, ChatMessage.role == "assistant")
+        .order_by(ChatMessage.id.desc())
+    )
+    assert assistant_message is not None
+    assert assistant_message.metadata_json is not None
+    assert assistant_message.metadata_json["retrieval"]["retrieval_query"] == "What does the transformer method improve?"
+    assert assistant_message.metadata_json["retrieval"]["answer_mode"] == "knowledge_base"
 
 
 def test_chat_falls_back_to_general_answer_when_no_kb_match(client, user, monkeypatch: pytest.MonkeyPatch) -> None:

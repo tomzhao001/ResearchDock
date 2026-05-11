@@ -1,0 +1,20 @@
+[
+  {
+    "key": "berger2021_trns_tdcs_adhd",
+    "title": "Scaffolding the attention-deficit/hyperactivity disorder brain using transcranial direct current and random noise stimulation: A randomized controlled trial",
+    "language": "en",
+    "relative_pdf_path": "docs/samples/Scaffolding the attention deficit hy Source Cl.pdf",
+    "upload_filename": "sample-data-berger2021-trns-tdcs-adhd.pdf",
+    "source_url": "https://doi.org/10.1016/j.clinph.2021.01.005",
+    "doi": "10.1016/j.clinph.2021.01.005"
+  },
+  {
+    "key": "huo2022_eeg_biofeedback_adhd_tics",
+    "title": "探讨脑电生物反馈在注意缺陷多动障碍并短暂性抽动障碍患儿中的应用效果及其对注意力水平的影响",
+    "language": "zh",
+    "relative_pdf_path": "docs/samples/探讨脑电生物反馈在注意缺陷...效果及其对注意力水平的影响_霍煜.pdf",
+    "upload_filename": "sample-data-huo2022-eeg-biofeedback-adhd-tics.pdf",
+    "source_url": "https://doi.org/10.12104/j.issn.1674-4748.2022.28.015",
+    "doi": "10.12104/j.issn.1674-4748.2022.28.015"
+  }
+]

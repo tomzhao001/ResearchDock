@@ -221,6 +221,9 @@ __marimo__/
 /data/files/
 data/files/
 
+# Benchmark / eval generated reports (regenerate: backend/ → python -m scripts.sample_data_eval --output reports/...)
+backend/reports/
+
 # Cursor IDE
 .specstory/
 .vscode/

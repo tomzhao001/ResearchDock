@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 import math
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -11,6 +13,8 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models import ChatMessage, ChatTopic, Paper, PaperChunk, User
 from app.services.llm import chat_with_messages, embed_texts
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_TOPIC_TITLE = "新话题"
 MAX_HISTORY_MESSAGES = 8
@@ -293,6 +297,27 @@ def _serialize_citations(results: list[RetrievalResult]) -> list[dict]:
     return citations
 
 
+def _serialize_trace_candidates(results: list[RetrievalResult]) -> list[dict]:
+    candidates: list[dict] = []
+    for result in results:
+        snippet = result.chunk.content
+        if len(snippet) > 180:
+            snippet = f"{snippet[:180].rstrip()}..."
+        candidates.append(
+            {
+                "chunk_id": result.chunk.id,
+                "chunk_index": result.chunk.chunk_index,
+                "paper_id": result.paper.id,
+                "paper_title": result.paper.title,
+                "score": round(result.score, 4),
+                "page_from": result.chunk.page_from,
+                "page_to": result.chunk.page_to,
+                "snippet": snippet,
+            }
+        )
+    return candidates
+
+
 def _create_message(
     db: Session,
     *,
@@ -303,6 +328,7 @@ def _create_message(
     answer_mode: str | None = None,
     used_knowledge_base: bool = False,
     citations_json: list[dict] | None = None,
+    metadata_json: dict | None = None,
 ) -> ChatMessage:
     now = datetime.now(timezone.utc)
     topic.updated_at = now
@@ -314,6 +340,7 @@ def _create_message(
         answer_mode=answer_mode,
         used_knowledge_base=used_knowledge_base,
         citations_json=citations_json,
+        metadata_json=metadata_json,
         created_at=now,
     )
     db.add(message)
@@ -353,9 +380,20 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
     _rename_topic_from_first_message(db, topic=topic, prompt=message)
 
     records = list_topic_messages(db, topic_id=topic.id)
+    started_at = time.perf_counter()
     retrieval_query = _build_retrieval_query(records, message)
-    retrieval_results = _search_chunks(db, query=retrieval_query)
+    candidate_limit = max(settings.rag_top_k, 10)
+    retrieval_candidates = _search_chunks(db, query=retrieval_query, top_k=candidate_limit)
+    retrieval_results = retrieval_candidates[: settings.rag_top_k]
     citations = _serialize_citations(retrieval_results)
+    retrieval_trace = {
+        "original_user_query": message,
+        "retrieval_query": retrieval_query,
+        "first_pass_candidates": _serialize_trace_candidates(retrieval_candidates),
+        "selected_citations": citations,
+        "answer_mode": "knowledge_base" if citations else "fallback_general",
+        "search_ms": round((time.perf_counter() - started_at) * 1000, 2),
+    }
 
     if citations:
         evidence_text = "\n\n".join(
@@ -384,6 +422,8 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
             ],
             temperature=0.2,
         )
+        retrieval_trace["generation_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
+        logger.info("rag_trace %s", retrieval_trace)
         assistant_message = _create_message(
             db,
             topic=topic,
@@ -393,6 +433,7 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
             answer_mode="knowledge_base",
             used_knowledge_base=True,
             citations_json=citations,
+            metadata_json={"retrieval": retrieval_trace},
         )
     else:
         answer, model = chat_with_messages(
@@ -403,6 +444,8 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
             ],
             temperature=0.3,
         )
+        retrieval_trace["generation_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
+        logger.info("rag_trace %s", retrieval_trace)
         assistant_message = _create_message(
             db,
             topic=topic,
@@ -412,6 +455,7 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
             answer_mode="fallback_general",
             used_knowledge_base=False,
             citations_json=[],
+            metadata_json={"retrieval": retrieval_trace},
         )
 
     return ChatTurnResult(
