@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
+import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -23,6 +25,7 @@ from app.services.rag import _search_chunks, create_topic, send_topic_message
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _SAMPLE_DATA_DIR = _REPO_ROOT / "benchmarks" / "sample-data"
 _ABSTAIN_PHRASE = "知识库中未找到确切依据"
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -98,6 +101,13 @@ def _normalize_text(text: str) -> str:
 
 def _mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
+
+
+def _preview_text(text: str, *, limit: int = 80) -> str:
+    compact = re.sub(r"\s+", " ", (text or "").strip())
+    if len(compact) <= limit:
+        return compact
+    return f"{compact[: limit - 3]}..."
 
 
 def _ndcg_at(relevant_ids: set[int], retrieved_ids: list[int], k: int) -> float:
@@ -392,7 +402,17 @@ def ingest_sample_data_papers(
     data_dir: Path | None = None,
 ) -> dict[str, Paper]:
     papers_by_key: dict[str, Paper] = {}
-    for spec in load_sample_data_paper_specs(data_dir):
+    specs = load_sample_data_paper_specs(data_dir)
+    logger.info("Sample paper ingest started: total=%s", len(specs))
+    for index, spec in enumerate(specs, start=1):
+        paper_started_at = time.perf_counter()
+        logger.info(
+            "Ingesting sample paper %s/%s: key=%s filename=%s",
+            index,
+            len(specs),
+            spec.key,
+            spec.upload_filename,
+        )
         payload = spec.pdf_path.read_bytes()
         upload = create_upload_artifacts(
             db,
@@ -412,6 +432,14 @@ def ingest_sample_data_papers(
         db.commit()
         db.refresh(paper)
         papers_by_key[spec.key] = paper
+        logger.info(
+            "Ingested sample paper %s/%s: key=%s paper_id=%s elapsed=%.2fs",
+            index,
+            len(specs),
+            spec.key,
+            paper.id,
+            time.perf_counter() - paper_started_at,
+        )
     return papers_by_key
 
 
@@ -497,9 +525,18 @@ def evaluate_retrieval(
 ) -> dict[str, Any]:
     max_k = max(k_values)
     rows: list[dict[str, Any]] = []
-    for resolved in questions:
+    logger.info("Retrieval evaluation started: total_questions=%s k_values=%s", len(questions), k_values)
+    for index, resolved in enumerate(questions, start=1):
         if not resolved.gold_evidence_refs:
             continue
+        question_started_at = time.perf_counter()
+        logger.info(
+            "Retrieval question %s/%s started: q_id=%s question=%s",
+            index,
+            len(questions),
+            resolved.question.q_id,
+            _preview_text(resolved.question.question),
+        )
         retrieval_trace: dict[str, Any] = {}
         results = _search_chunks(db, query=resolved.question.question, top_k=max_k, trace=retrieval_trace)
         retrieved_match_sets = [_result_match_indexes(item, resolved.gold_evidence_refs) for item in results]
@@ -594,6 +631,15 @@ def evaluate_retrieval(
                 4,
             )
         rows.append(row)
+        logger.info(
+            "Retrieval question %s/%s finished: q_id=%s first_hit=%s failure_stage=%s elapsed=%.2fs",
+            index,
+            len(questions),
+            resolved.question.q_id,
+            first_hit_rank or "-",
+            likely_failure_stage,
+            time.perf_counter() - question_started_at,
+        )
 
     summary = {
         "count": len(rows),
@@ -621,6 +667,13 @@ def evaluate_retrieval(
             }.items()
         },
     }
+    logger.info(
+        "Retrieval evaluation finished: completed=%s skipped=%s hit@10=%.4f mrr=%.4f",
+        summary["count"],
+        summary["skipped_without_gold"],
+        summary["hit@10"],
+        summary["mrr"],
+    )
     return {"summary": summary, "breakdown": breakdown, "questions": rows}
 
 
@@ -667,6 +720,12 @@ def _grade_with_llm(resolved: ResolvedQuestion, answer: str, citations: list[dic
         f"Gold evidence:\n{evidence_lines}\n\n"
         f"Returned citations:\n{citation_lines or '- none'}\n"
     )
+    judge_started_at = time.perf_counter()
+    logger.info(
+        "LLM judge started: q_id=%s citations=%s",
+        resolved.question.q_id,
+        len(citations),
+    )
     try:
         content, _ = chat_with_messages(
             [
@@ -676,12 +735,23 @@ def _grade_with_llm(resolved: ResolvedQuestion, answer: str, citations: list[dic
             temperature=0.0,
         )
         parsed = _extract_json(content)
+        logger.info(
+            "LLM judge finished: q_id=%s elapsed=%.2fs",
+            resolved.question.q_id,
+            time.perf_counter() - judge_started_at,
+        )
         return {
             "grounded": bool(parsed.get("grounded")),
             "citation_precision": float(parsed.get("citation_precision", heuristic["citation_precision"])),
             "notes": str(parsed.get("notes", "")),
         }
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "LLM judge failed, using heuristic fallback: q_id=%s elapsed=%.2fs error=%s",
+            resolved.question.q_id,
+            time.perf_counter() - judge_started_at,
+            exc,
+        )
         return {"grounded": heuristic["grounded"], "citation_precision": heuristic["citation_precision"], "notes": "heuristic-fallback"}
 
 
@@ -696,9 +766,31 @@ def evaluate_end_to_end(
     question_by_id = {item.question.q_id: item for item in resolved_questions}
     rows: list[dict[str, Any]] = []
     session_qids = {q_id for session in sessions or [] for q_id in session.question_ids}
+    logger.info(
+        "End-to-end evaluation started: total_questions=%s sessions=%s judge_mode=%s",
+        len(resolved_questions),
+        len(sessions or []),
+        judge_mode,
+    )
 
     def run_question(resolved: ResolvedQuestion, *, topic_id: int) -> None:
+        question_started_at = time.perf_counter()
+        logger.info(
+            "E2E question started: q_id=%s topic_id=%s judge_mode=%s question=%s",
+            resolved.question.q_id,
+            topic_id,
+            judge_mode,
+            _preview_text(resolved.question.question),
+        )
+        send_started_at = time.perf_counter()
+        logger.info("Calling send_topic_message: q_id=%s topic_id=%s", resolved.question.q_id, topic_id)
         result = send_topic_message(db, user=user, topic_id=topic_id, prompt=resolved.question.question)
+        logger.info(
+            "send_topic_message finished: q_id=%s topic_id=%s elapsed=%.2fs",
+            resolved.question.q_id,
+            topic_id,
+            time.perf_counter() - send_started_at,
+        )
         assistant = result.assistant_message
         citations = assistant.citations_json if isinstance(assistant.citations_json, list) else []
         heuristic = _grade_heuristic(resolved, assistant.content, citations, assistant.answer_mode)
@@ -725,8 +817,18 @@ def evaluate_end_to_end(
                 "judge_notes": llm_grade["notes"] if llm_grade else "heuristic",
             }
         )
+        logger.info(
+            "E2E question finished: q_id=%s topic_id=%s answer_mode=%s citations=%s grounded=%s elapsed=%.2fs",
+            resolved.question.q_id,
+            topic_id,
+            assistant.answer_mode,
+            len(citations),
+            grounded,
+            time.perf_counter() - question_started_at,
+        )
 
     for session in sessions or []:
+        logger.info("Session evaluation started: session_id=%s turns=%s", session.session_id, len(session.question_ids))
         topic = create_topic(db, user=user, title=f"SampleData {session.session_id}")
         for q_id in session.question_ids:
             run_question(question_by_id[q_id], topic_id=topic.topic.id)
@@ -761,6 +863,13 @@ def evaluate_end_to_end(
             },
         ),
     }
+    logger.info(
+        "End-to-end evaluation finished: completed=%s groundedness=%.4f citation_precision=%.4f abstention_accuracy=%.4f",
+        summary["count"],
+        summary["groundedness"],
+        summary["citation_precision"],
+        summary["abstention_accuracy"],
+    )
     return {"summary": summary, "breakdown": breakdown, "questions": rows}
 
 
@@ -775,9 +884,24 @@ def run_sample_data_evaluation(
 ) -> dict[str, Any]:
     db = session_factory()
     try:
+        started_at = time.perf_counter()
+        logger.info(
+            "Sample-data evaluation workflow started: mode=%s subset=%s judge_mode=%s data_dir=%s",
+            mode,
+            subset,
+            judge_mode,
+            data_dir or _SAMPLE_DATA_DIR,
+        )
+        ingest_started_at = time.perf_counter()
         papers_by_key = ingest_sample_data_papers(db, session_factory=session_factory, extractor=extractor, data_dir=data_dir)
+        logger.info(
+            "Sample-data paper ingest finished: papers=%s elapsed=%.2fs",
+            len(papers_by_key),
+            time.perf_counter() - ingest_started_at,
+        )
         questions = load_sample_data_questions(data_dir)
         sessions = load_sample_data_sessions(data_dir)
+        logger.info("Loaded sample-data definitions: questions=%s sessions=%s", len(questions), len(sessions))
         if subset == "smoke":
             smoke_ids = load_sample_data_smoke_question_ids(data_dir)
             questions = [item for item in questions if item.q_id in smoke_ids]
@@ -787,8 +911,16 @@ def run_sample_data_evaluation(
                 if any(q_id in smoke_ids for q_id in item.question_ids)
             ]
             sessions = [item for item in sessions if item.question_ids]
+            logger.info("Applied smoke subset: questions=%s sessions=%s", len(questions), len(sessions))
         chunk_cache = _load_chunk_cache(db, papers_by_key)
+        logger.info("Loaded chunk cache: papers=%s", len(chunk_cache))
+        resolve_started_at = time.perf_counter()
         resolved = resolve_question_gold(questions, papers_by_key=papers_by_key, chunk_cache=chunk_cache)
+        logger.info(
+            "Resolved gold evidence: questions=%s elapsed=%.2fs",
+            len(resolved),
+            time.perf_counter() - resolve_started_at,
+        )
 
         report: dict[str, Any] = {
             "mode": mode,
@@ -800,6 +932,7 @@ def run_sample_data_evaluation(
             report["retrieval"] = evaluate_retrieval(db, resolved)
         if mode in {"e2e", "both"}:
             report["end_to_end"] = evaluate_end_to_end(db, resolved, judge_mode=judge_mode, sessions=sessions)
+        logger.info("Sample-data evaluation workflow finished in %.2fs", time.perf_counter() - started_at)
         return report
     finally:
         db.close()

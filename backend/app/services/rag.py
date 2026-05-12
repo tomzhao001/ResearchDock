@@ -1695,9 +1695,23 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
     retrieval_query = _build_retrieval_query(records, message)
     candidate_limit = max(settings.rag_top_k, settings.rag_rerank_top_n, 10)
     retrieval_debug: dict[str, Any] = {}
+    logger.info(
+        "RAG retrieval started: topic_id=%s candidate_limit=%s query=%s",
+        topic.id,
+        candidate_limit,
+        retrieval_query,
+    )
     retrieval_candidates = _search_chunks(db, query=retrieval_query, top_k=candidate_limit, trace=retrieval_debug)
     retrieval_results = retrieval_candidates[: settings.rag_top_k]
     citations = _serialize_citations(retrieval_results)
+    logger.info(
+        "RAG retrieval finished: topic_id=%s backend=%s candidates=%s citations=%s elapsed=%.2fs",
+        topic.id,
+        retrieval_debug.get("retrieval_backend", "unknown"),
+        len(retrieval_candidates),
+        len(citations),
+        time.perf_counter() - started_at,
+    )
     retrieval_trace = {
         "original_user_query": message,
         "retrieval_query": retrieval_query,
@@ -1717,6 +1731,7 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
     }
 
     if citations:
+        generation_started_at = time.perf_counter()
         evidence_text = "\n\n".join(
             [
                 (
@@ -1726,6 +1741,11 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
                 )
                 for index, citation in enumerate(citations, start=1)
             ]
+        )
+        logger.info(
+            "RAG generation started: topic_id=%s mode=knowledge_base citations=%s",
+            topic.id,
+            len(citations),
         )
         answer, model = chat_with_messages(
             [
@@ -1744,6 +1764,12 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
             ],
             temperature=0.2,
         )
+        logger.info(
+            "RAG generation finished: topic_id=%s mode=knowledge_base model=%s elapsed=%.2fs",
+            topic.id,
+            model,
+            time.perf_counter() - generation_started_at,
+        )
         retrieval_trace["generation_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
         logger.info("rag_trace %s", retrieval_trace)
         assistant_message = _create_message(
@@ -1758,6 +1784,8 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
             metadata_json={"retrieval": retrieval_trace},
         )
     else:
+        generation_started_at = time.perf_counter()
+        logger.info("RAG generation started: topic_id=%s mode=fallback_general citations=0", topic.id)
         answer, model = chat_with_messages(
             [
                 {"role": "system", "content": FALLBACK_SYSTEM_PROMPT},
@@ -1765,6 +1793,12 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
                 {"role": "user", "content": message},
             ],
             temperature=0.3,
+        )
+        logger.info(
+            "RAG generation finished: topic_id=%s mode=fallback_general model=%s elapsed=%.2fs",
+            topic.id,
+            model,
+            time.perf_counter() - generation_started_at,
         )
         retrieval_trace["generation_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
         logger.info("rag_trace %s", retrieval_trace)
