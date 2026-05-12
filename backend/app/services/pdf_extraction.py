@@ -20,6 +20,7 @@ class PageExtractionResult:
     used_ocr: bool
     reasons: list[str]
     ocr_metadata: dict | None
+    blocks: list[dict] | None
     text: str
 
 
@@ -27,6 +28,7 @@ class PageExtractionResult:
 class DocumentExtractionResult:
     raw_text: str
     metadata: dict
+    pages: list[PageExtractionResult] | None = None
 
 
 class PDFTextExtractor:
@@ -58,12 +60,23 @@ class PDFTextExtractor:
                 for page in pages
             ],
         }
-        return DocumentExtractionResult(raw_text=combined_text, metadata=metadata)
+        return DocumentExtractionResult(raw_text=combined_text, metadata=metadata, pages=pages)
 
     def _extract_page(self, page: fitz.Page, page_number: int) -> PageExtractionResult:
         blocks = page.get_text("blocks")
         text_blocks = [block for block in blocks if len(block) >= 5 and str(block[4]).strip()]
         ordered_text = self._join_blocks(text_blocks, page.rect.width)
+        serialized_blocks = [
+            {
+                "x0": float(block[0]),
+                "y0": float(block[1]),
+                "x1": float(block[2]),
+                "y1": float(block[3]),
+                "text": str(block[4]).strip(),
+            }
+            for block in text_blocks
+            if str(block[4]).strip()
+        ]
         page_text = ordered_text.strip()
         char_count = len(page_text)
         alpha_chars = sum(char.isalpha() for char in page_text)
@@ -98,6 +111,7 @@ class PDFTextExtractor:
             used_ocr=False,
             reasons=reasons,
             ocr_metadata=None,
+            blocks=serialized_blocks,
             text=page_text,
         )
 
@@ -124,6 +138,7 @@ class PDFTextExtractor:
             used_ocr=True,
             reasons=result.reasons,
             ocr_metadata=recognition.metadata,
+            blocks=[{"x0": 0.0, "y0": 0.0, "x1": 0.0, "y1": 0.0, "text": ocr_text}] if ocr_text else [],
             text=ocr_text,
         )
 

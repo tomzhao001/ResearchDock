@@ -173,8 +173,15 @@ def test_upload_creates_records_and_completes_job(
     assert paper.status == "completed"
     assert asset is not None
     assert "embedded text layer" in (asset.raw_text or "")
+    assert isinstance(asset.metadata_json, dict)
+    assert asset.metadata_json["preanalysis"]["schema_version"] == 1
+    assert asset.metadata_json["preanalysis"]["chunking_hints"]["block_count"] >= 1
     assert len(chunks) > 0
     assert chunks[0].content
+    assert chunks[0].page_from == 1
+    assert isinstance(chunks[0].metadata_json, dict)
+    assert chunks[0].metadata_json["section_title"] in {"Front Matter", "Document"}
+    assert chunks[0].metadata_json["context_header"]
 
     job_response = client.get(f"/api/jobs/{job.id}")
     assert job_response.status_code == 200

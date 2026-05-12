@@ -445,45 +445,226 @@ def list_topic_messages(db: Session, *, topic_id: int) -> list[ChatMessage]:
     ).all()
 
 
-def _split_text(raw_text: str) -> list[dict]:
-    text = re.sub(r"\s+", " ", (raw_text or "").strip())
+def _build_context_header(
+    *,
+    paper_title: str | None,
+    section_path: str | None,
+    page_from: int | None,
+    page_to: int | None,
+) -> str:
+    lines: list[str] = []
+    if (paper_title or "").strip():
+        lines.append(f"论文标题: {(paper_title or '').strip()}")
+    if (section_path or "").strip():
+        lines.append(f"章节: {(section_path or '').strip()}")
+    if page_from is not None:
+        if page_to is not None and page_to != page_from:
+            lines.append(f"页码: {page_from}-{page_to}")
+        else:
+            lines.append(f"页码: {page_from}")
+    return "\n".join(lines)
+
+
+def _window_text(text: str, *, chunk_size: int, overlap: int) -> list[dict[str, int | str]]:
+    text = re.sub(r"\s+", " ", (text or "").strip())
     if not text:
         return []
 
-    chunk_size = max(settings.rag_chunk_size, 200)
-    overlap = max(min(settings.rag_chunk_overlap, chunk_size - 1), 0)
     step = max(chunk_size - overlap, 1)
-    chunks: list[dict] = []
+    windows: list[dict[str, int | str]] = []
     cursor = 0
-    index = 0
     while cursor < len(text):
         window = text[cursor : cursor + chunk_size]
         content = window.strip()
         if content:
-            chunks.append(
+            trimmed_offset = window.find(content)
+            windows.append(
                 {
-                    "chunk_index": index,
                     "content": content,
-                    "token_count": len(_tokenize(content)),
-                    "metadata_json": {
-                        "char_start": cursor,
-                        "char_end": min(cursor + chunk_size, len(text)),
-                    },
+                    "char_start": cursor + max(trimmed_offset, 0),
+                    "char_end": cursor + max(trimmed_offset, 0) + len(content),
                 }
             )
-            index += 1
         if cursor + chunk_size >= len(text):
             break
         cursor += step
+    return windows
+
+
+def _make_chunk_record(
+    *,
+    chunk_index: int,
+    body_text: str,
+    block_rows: list[dict[str, Any]],
+    paper_title: str | None,
+) -> dict[str, Any]:
+    page_numbers = sorted(
+        {
+            int(block.get("page_number"))
+            for block in block_rows
+            if isinstance(block.get("page_number"), int) or str(block.get("page_number") or "").isdigit()
+        }
+    )
+    page_from = page_numbers[0] if page_numbers else None
+    page_to = page_numbers[-1] if page_numbers else None
+    section_path = next((str(block.get("section_path") or "").strip() for block in block_rows if str(block.get("section_path") or "").strip()), "")
+    section_title = next((str(block.get("section_title") or "").strip() for block in block_rows if str(block.get("section_title") or "").strip()), "")
+    heading_level = next(
+        (
+            int(block.get("heading_level"))
+            for block in block_rows
+            if isinstance(block.get("heading_level"), int) or str(block.get("heading_level") or "").isdigit()
+        ),
+        None,
+    )
+    context_header = _build_context_header(
+        paper_title=paper_title,
+        section_path=section_path or section_title,
+        page_from=page_from,
+        page_to=page_to,
+    )
+    content = body_text
+    if context_header and not body_text.startswith(context_header):
+        content = f"{context_header}\n\n{body_text}"
+    return {
+        "chunk_index": chunk_index,
+        "content": content,
+        "embedding_input": content,
+        "token_count": len(_tokenize(body_text)),
+        "page_from": page_from,
+        "page_to": page_to,
+        "metadata_json": {
+            "char_start": min((int(block.get("char_start") or 0) for block in block_rows), default=0),
+            "char_end": max((int(block.get("char_end") or 0) for block in block_rows), default=0),
+            "context_header": context_header or None,
+            "section_id": next((block.get("section_id") for block in block_rows if block.get("section_id")), None),
+            "section_title": section_title or None,
+            "section_path": section_path or None,
+            "heading_level": heading_level,
+            "block_types": sorted({str(block.get("block_type") or "paragraph") for block in block_rows}),
+            "block_count": len(block_rows),
+            "body_text": body_text,
+        },
+    }
+
+
+def _split_text_legacy(raw_text: str, *, paper_title: str | None = None) -> list[dict[str, Any]]:
+    chunk_size = max(settings.rag_chunk_size, 200)
+    overlap = max(min(settings.rag_chunk_overlap, chunk_size - 1), 0)
+    chunks: list[dict[str, Any]] = []
+    for index, window in enumerate(_window_text(raw_text, chunk_size=chunk_size, overlap=overlap)):
+        body_text = str(window["content"])
+        chunks.append(
+            _make_chunk_record(
+                chunk_index=index,
+                body_text=body_text,
+                block_rows=[
+                    {
+                        "char_start": int(window["char_start"]),
+                        "char_end": int(window["char_end"]),
+                        "page_number": 1,
+                        "block_type": "window",
+                        "section_title": "Document",
+                        "section_path": "Document",
+                        "heading_level": 1,
+                    }
+                ],
+                paper_title=paper_title,
+            )
+        )
     return chunks
 
 
-def rebuild_paper_index(db: Session, *, paper_id: int, raw_text: str) -> int:
-    chunks = _split_text(raw_text)
+def _split_text(
+    raw_text: str,
+    *,
+    preanalysis: dict[str, Any] | None = None,
+    paper_title: str | None = None,
+) -> list[dict[str, Any]]:
+    chunk_size = max(settings.rag_chunk_size, 200)
+    overlap = max(min(settings.rag_chunk_overlap, chunk_size - 1), 0)
+    blocks = preanalysis.get("blocks") if isinstance(preanalysis, dict) else None
+    if not isinstance(blocks, list) or not blocks:
+        return _split_text_legacy(raw_text, paper_title=paper_title)
+
+    chunks: list[dict[str, Any]] = []
+    pending_blocks: list[dict[str, Any]] = []
+    pending_length = 0
+
+    def flush_pending() -> None:
+        nonlocal pending_blocks, pending_length
+        if not pending_blocks:
+            return
+        body_text = "\n\n".join(str(block.get("text") or "").strip() for block in pending_blocks if str(block.get("text") or "").strip())
+        if body_text:
+            chunks.append(
+                _make_chunk_record(
+                    chunk_index=len(chunks),
+                    body_text=body_text,
+                    block_rows=list(pending_blocks),
+                    paper_title=paper_title,
+                )
+            )
+        pending_blocks = []
+        pending_length = 0
+
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        block_text = re.sub(r"\s+", " ", str(block.get("text") or "").strip())
+        if not block_text:
+            continue
+        block_length = len(block_text)
+        section_id = str(block.get("section_id") or "")
+        pending_section_id = str(pending_blocks[0].get("section_id") or "") if pending_blocks else ""
+
+        if pending_blocks and section_id != pending_section_id and pending_length >= max(chunk_size // 3, 200):
+            flush_pending()
+
+        if block_length > chunk_size:
+            flush_pending()
+            char_start = int(block.get("char_start") or 0)
+            for piece in _window_text(block_text, chunk_size=chunk_size, overlap=overlap):
+                piece_block = dict(block)
+                piece_block["text"] = str(piece["content"])
+                piece_block["char_start"] = char_start + int(piece["char_start"])
+                piece_block["char_end"] = char_start + int(piece["char_end"])
+                chunks.append(
+                    _make_chunk_record(
+                        chunk_index=len(chunks),
+                        body_text=str(piece["content"]),
+                        block_rows=[piece_block],
+                        paper_title=paper_title,
+                    )
+                )
+            continue
+
+        projected_length = pending_length + block_length + (2 if pending_blocks else 0)
+        if pending_blocks and projected_length > chunk_size:
+            flush_pending()
+
+        pending_blocks.append({**block, "text": block_text})
+        pending_length += block_length + (2 if len(pending_blocks) > 1 else 0)
+
+    flush_pending()
+    if not chunks:
+        return _split_text_legacy(raw_text, paper_title=paper_title)
+    return chunks
+
+
+def rebuild_paper_index(
+    db: Session,
+    *,
+    paper_id: int,
+    raw_text: str,
+    preanalysis: dict[str, Any] | None = None,
+    paper_title: str | None = None,
+) -> int:
+    chunks = _split_text(raw_text, preanalysis=preanalysis, paper_title=paper_title)
     embeddings: list[list[float]] = []
     if chunks and settings.openai_api_key.strip():
         try:
-            embeddings = embed_texts([chunk["content"] for chunk in chunks])
+            embeddings = embed_texts([str(chunk.get("embedding_input") or chunk["content"]) for chunk in chunks])
         except Exception:
             embeddings = []
 
@@ -496,8 +677,8 @@ def rebuild_paper_index(db: Session, *, paper_id: int, raw_text: str) -> int:
                 content=chunk["content"],
                 embedding=embeddings[index] if index < len(embeddings) else None,
                 token_count=chunk["token_count"],
-                page_from=None,
-                page_to=None,
+                page_from=chunk["page_from"],
+                page_to=chunk["page_to"],
                 metadata_json=chunk["metadata_json"],
             )
         )

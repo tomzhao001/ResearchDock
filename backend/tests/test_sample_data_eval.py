@@ -50,9 +50,14 @@ def test_sample_data_gold_evidence_resolves_against_ingested_sample_papers(
 
     resolved = resolve_question_gold(questions, papers_by_key=papers_by_key, chunk_cache=chunk_cache)
     eligible = [item for item in resolved if item.question.gold_evidence]
+    all_chunks = [chunk for chunks in chunk_cache.values() for chunk in chunks]
 
     assert len(eligible) == 92
     assert all(item.gold_chunk_ids for item in eligible)
+    assert all_chunks
+    assert all(chunk.page_from is not None for chunk in all_chunks)
+    assert all(isinstance(chunk.metadata_json, dict) for chunk in all_chunks)
+    assert any(chunk.metadata_json.get("section_title") for chunk in all_chunks if isinstance(chunk.metadata_json, dict))
 
 
 def test_sample_data_smoke_eval_runs_and_returns_reports(

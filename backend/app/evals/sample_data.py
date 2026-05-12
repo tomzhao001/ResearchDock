@@ -125,6 +125,31 @@ def _snippet_matches_chunk(normalized_snippet: str, normalized_chunk: str) -> bo
     return False
 
 
+def _token_sequence_matches(snippet: str, chunk_text: str) -> bool:
+    snippet_tokens = re.findall(r"[A-Za-z]+|[-+]?\d+(?:\.\d+)?", snippet or "")
+    chunk_tokens = re.findall(r"[A-Za-z]+|[-+]?\d+(?:\.\d+)?", chunk_text or "")
+    if len(snippet_tokens) < 3 or len(chunk_tokens) < len(snippet_tokens):
+        return False
+    target = [token.lower() for token in snippet_tokens]
+    source = [token.lower() for token in chunk_tokens]
+    for start in range(0, len(source) - len(target) + 1):
+        if source[start : start + len(target)] == target:
+            return True
+    return False
+
+
+def _evidence_matches_chunk(snippet: str, chunk_text: str) -> bool:
+    normalized_snippet = _normalize_text(snippet)
+    normalized_chunk = _normalize_text(chunk_text)
+    return _snippet_matches_chunk(normalized_snippet, normalized_chunk) or _token_sequence_matches(snippet, chunk_text)
+
+
+def _chunk_match_text(chunk: PaperChunk) -> str:
+    metadata = chunk.metadata_json if isinstance(chunk.metadata_json, dict) else {}
+    body_text = metadata.get("body_text") if isinstance(metadata, dict) else None
+    return str(body_text or chunk.content or "")
+
+
 def _summarize_groups(
     items: list[dict[str, Any]],
     key_fn: Callable[[dict[str, Any]], Any],
@@ -277,22 +302,34 @@ def resolve_question_gold(
             chunks = chunk_cache.get(evidence.paper_key)
             if chunks is None:
                 raise ValueError(f"Unknown paper key in evidence: {evidence.paper_key}")
-            normalized_snippet = _normalize_text(evidence.snippet)
             match = next(
                 (
                     chunk
                     for chunk in chunks
-                    if _snippet_matches_chunk(normalized_snippet, _normalize_text(chunk.content))
+                    if _evidence_matches_chunk(evidence.snippet, _chunk_match_text(chunk))
                 ),
                 None,
             )
+            matched_chunks: list[PaperChunk] = [match] if match is not None else []
             if match is None:
+                for window_size in (2, 3, 4, 5, 6, 8):
+                    for start in range(0, max(len(chunks) - window_size + 1, 0)):
+                        window = chunks[start : start + window_size]
+                        combined_text = " ".join(_chunk_match_text(chunk) for chunk in window)
+                        if _evidence_matches_chunk(evidence.snippet, combined_text):
+                            matched_chunks = window
+                            break
+                    if matched_chunks:
+                        break
+            if not matched_chunks:
                 raise ValueError(f"Unable to resolve gold evidence for {question.q_id}: {evidence.snippet}")
-            if match.id not in gold_chunk_ids:
-                gold_chunk_ids.append(match.id)
-                gold_chunk_indices.append(match.chunk_index)
-                gold_paper_ids.append(match.paper_id)
-                gold_evidence_texts.append(evidence.snippet)
+            for matched_chunk in matched_chunks:
+                if matched_chunk.id in gold_chunk_ids:
+                    continue
+                gold_chunk_ids.append(matched_chunk.id)
+                gold_chunk_indices.append(matched_chunk.chunk_index)
+                gold_paper_ids.append(matched_chunk.paper_id)
+            gold_evidence_texts.append(evidence.snippet)
         resolved.append(
             ResolvedQuestion(
                 question=question,

@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import SessionLocal
 from app.models import Job, Paper, PaperAsset, PaperChunk
+from app.services.document_preprocess import preprocess_document
 from app.services.llm import summarize_paper_text
 from app.services.pdf_extraction import PDFTextExtractor
 from app.services.rag import rebuild_paper_index
@@ -370,11 +371,19 @@ def run_pdf_ingest_job(
         publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
 
         document = (extractor or PDFTextExtractor()).extract(Path(asset.storage_path))
+        preanalysis = preprocess_document(document)
         metadata = dict(asset.metadata_json or {})
         metadata["extraction"] = document.metadata
+        metadata["preanalysis"] = preanalysis
         asset.metadata_json = metadata
         asset.raw_text = document.raw_text
-        rebuild_paper_index(db, paper_id=paper.id, raw_text=document.raw_text)
+        rebuild_paper_index(
+            db,
+            paper_id=paper.id,
+            raw_text=document.raw_text,
+            preanalysis=preanalysis,
+            paper_title=paper.title,
+        )
         paper.status = "completed"
         paper.updated_at = datetime.now(timezone.utc)
         job.status = "completed"
