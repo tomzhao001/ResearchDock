@@ -1,10 +1,14 @@
-# Sample-data Smoke 评测参照（Phase 0 / 1 / 2）
+# Sample-data Smoke 评测参照（Phase 0 / 1 / 2 / Latest）
 
 本文档从各阶段完整报告中抽取关键数字，便于后续在**同一评测配置**下持续对比。完整逐题明细仍在 JSON 中，本页更适合作为“先看什么、怎么解读”的速查表。
 
 - **Phase 0 完整报告：** `backend/reports/sample-data-report.json`
 - **Phase 1 完整报告：** `backend/reports/sample-data-report-phase1-hybrid.json`
 - **Phase 2 完整报告：** `backend/reports/sample-data-report-phase2.json`
+- **Latest retrieval 检查点：** `backend/reports/sample-data-report-phase2-eval-content-tablefix-retrieval.json`
+
+> 说明：本页前半部分的 `Phase 0 / 1 / 2` 仍保留**旧口径历史结果**，其中 retrieval 命中基于 `gold_chunk_ids`。  
+> 从最新检查点开始，retrieval 命中改为基于**同论文下的 gold snippet 内容命中**，用于消除 Phase 2 之后 chunk 编号与 chunk 边界漂移对评测稳定性的影响。新旧口径的 retrieval 数字**不建议直接并排当作严格同比**，更适合分别作为“旧历史参考”和“新口径起点”。
 
 ---
 
@@ -37,6 +41,78 @@
 | e2e `groundedness` | 越高越好，表示回答是否真正被证据支撑。这个值不只受检索影响，也受 citation 选择和生成影响。 |
 | e2e `citation_precision` | 越高越好，但不能孤立看。系统如果引用更多 chunk，可能在检索变强时反而把这个值拉低。 |
 | e2e `abstention_accuracy` | 越高越好，但要结合题型看。它既受拒答题影响，也会受“本该回答却误拒答”影响。 |
+
+## 最新检查点（内容命中口径 + Table Fix）
+
+这次检查点只覆盖 **retrieval smoke**，目的不是更新端到端分数，而是把 retrieval 口径从不稳定的 `gold_chunk_ids` 切换到 **gold snippet 内容命中**，同时验证表格题的 `table body localization` 修复是否生效。
+
+- **完整报告路径：** `backend/reports/sample-data-report-phase2-eval-content-tablefix-retrieval.json`
+- **实现范围：** `content-hit retrieval eval + table caption/body pairing + table row detection + rerank payload alignment`
+
+### 配置
+
+| 字段 | 值 |
+|------|-----|
+| `mode` | `retrieval` |
+| `subset` | `smoke` |
+| `judge_mode` | `heuristic` |
+| retrieval gold 口径 | 同论文下 `gold snippet` 内容命中 |
+
+### 检索汇总（`retrieval.summary`）
+
+| 指标 | 值 |
+|------|-----|
+| 参与统计题数 `count` | 11 |
+| 无 gold 跳过 `skipped_without_gold` | 1 |
+| `hit@1` | 0.1818 |
+| `hit@5` | 0.2727 |
+| `hit@10` | 0.3636 |
+| `ndcg@1` | 0.1818 |
+| `ndcg@5` | 0.2376 |
+| `ndcg@10` | 0.2679 |
+| `mrr` | 0.2403 |
+
+### 检索分桶（`retrieval.breakdown`）
+
+#### 按题型 `by_category`
+
+| category | `hit@10` | `mrr` | `count` |
+|----------|----------|-------|---------|
+| `single_fact` | 0.3333 | 0.3333 | 3 |
+| `term_lookup` | 0.0 | 0.0 | 2 |
+| `table_result` | 1.0 | 0.5715 | 2 |
+| `multi_span` | 1.0 | 0.5 | 1 |
+| `summary` | 0.0 | 0.0 | 1 |
+| `multi_turn` | 0.0 | 0.0 | 2 |
+
+#### 按语种 `by_language`
+
+| language | `hit@10` | `mrr` | `count` |
+|----------|----------|-------|---------|
+| `en` | 0.25 | 0.1875 | 8 |
+| `zh` | 0.6667 | 0.381 | 3 |
+
+#### 按失败阶段 `by_failure_stage`
+
+| stage | `count` |
+|-------|---------|
+| `retrieved` | 4 |
+| `rerank` | 1 |
+| `chunking` | 1 |
+| `recall` | 5 |
+
+### 这次检查点重点信号
+
+- `zh_061` 已从上一轮 callback fix 报告里的 miss 恢复为 hit，`mrr` 从 `0.0` 提升到 `1.0`，说明**内容命中评测 + 更稳定的人群/表格行预处理**已经消除了“chunk 重排导致的假性 miss”。
+- `zh_079` 保持 `hit@10=true`，并且 `dense/fused` 首次命中位置从 `16` 提前到 `3`，`mrr` 从 `0.1` 提升到 `0.1429`，说明**table body 定位**确实比之前更稳，但 rerank 还没有把它推到特别靠前。
+- `en_021` 没被这轮表格修复误伤，反而提升到 `mrr=1.0`；`en_033` 也从 miss 恢复为 hit，说明这轮改动没有只对中文表格生效，而是顺带改善了部分英文 exact-term / multi-span 检索。
+- 新口径下最该继续盯的是 `term_lookup`、`multi_turn`、`summary` 这几个桶，它们仍然是主要空洞区。
+
+### 如何使用这份最新结果
+
+1. 如果你要看 **Phase 0 / 1 / 2 的旧历史趋势**，继续看本文后面的旧区块。
+2. 如果你要看 **现在代码状态下的 retrieval 真正回归结果**，请优先以本节为准。
+3. 从这次开始，后续 retrieval smoke 回归建议继续沿用“内容命中”口径，否则又会回到被 chunk 编号和 chunk 边界扰动的问题。
 
 ## 三阶段快速对比
 

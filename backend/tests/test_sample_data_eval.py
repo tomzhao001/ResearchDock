@@ -4,7 +4,12 @@ from pathlib import Path
 
 import pytest
 
+from app.models import Paper, PaperChunk
 from app.evals.sample_data import (
+    GoldEvidence,
+    SampleQuestion,
+    ResolvedQuestion,
+    evaluate_retrieval,
     ingest_sample_data_papers,
     load_sample_data_paper_specs,
     load_sample_data_questions,
@@ -13,6 +18,7 @@ from app.evals.sample_data import (
     resolve_question_gold,
     run_sample_data_evaluation,
 )
+from app.services.rag import RetrievalResult
 
 
 def test_sample_data_benchmark_files_have_expected_shape() -> None:
@@ -111,3 +117,119 @@ def test_sample_data_smoke_eval_runs_and_returns_reports(
     assert report["end_to_end"]["summary"]["count"] == 12
     assert "groundedness" in report["end_to_end"]["summary"]
     assert report["end_to_end"]["questions"][0]["metadata"]["retrieval"]["retrieval_backend"] == "legacy"
+
+
+def test_evaluate_retrieval_reports_stage_hit_ranks(monkeypatch: pytest.MonkeyPatch) -> None:
+    question = SampleQuestion(
+        q_id="en_trace",
+        question="What is the Table 1 p-value?",
+        category="table_result",
+        difficulty="easy",
+        language="en",
+        requires_multi_span=False,
+        needs_table_or_figure=True,
+        allow_fallback_general=False,
+        expected_abstention=False,
+        gold_evidence=(GoldEvidence(paper_key="paper", snippet="p-value"),),
+        expected_keywords=("0.028",),
+        keyword_hit_threshold=1,
+    )
+    resolved = ResolvedQuestion(
+        question=question,
+        gold_chunk_ids=(101,),
+        gold_chunk_indices=(2,),
+        gold_paper_ids=(7,),
+        gold_evidence_texts=("p-value",),
+        gold_evidence_refs=((7, "p-value"),),
+    )
+
+    def fake_search(_db, *, query: str, top_k: int | None = None, trace: dict | None = None):
+        assert query == question.question
+        assert top_k == 10
+        if trace is not None:
+            trace.update(
+                {
+                    "retrieval_backend": "postgres_hybrid",
+                    "sparse_candidates": [{"chunk_id": 101, "paper_id": 7, "score": 1.2, "snippet": "Table 1 reports p-value 0.028"}],
+                    "dense_candidates": [],
+                    "fused_candidates": [],
+                    "reranked_candidates": [],
+                }
+            )
+        return []
+
+    monkeypatch.setattr("app.evals.sample_data._search_chunks", fake_search)
+
+    report = evaluate_retrieval(None, [resolved])
+
+    assert report["summary"]["count"] == 1
+    assert report["breakdown"]["by_failure_stage"]["fusion"]["count"] == 1
+    assert report["questions"][0]["stage_hit_ranks"] == {
+        "sparse": 1,
+        "dense": None,
+        "fused": None,
+        "reranked": None,
+    }
+    assert report["questions"][0]["likely_failure_stage"] == "fusion"
+    assert report["questions"][0]["retrieval_trace"]["retrieval_backend"] == "postgres_hybrid"
+
+
+def test_evaluate_retrieval_uses_content_hit_instead_of_gold_chunk_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    question = SampleQuestion(
+        q_id="zh_content",
+        question="本文纳入研究对象总共多少例？",
+        category="single_fact",
+        difficulty="easy",
+        language="zh",
+        requires_multi_span=False,
+        needs_table_or_figure=False,
+        allow_fallback_general=False,
+        expected_abstention=False,
+        gold_evidence=(GoldEvidence(paper_key="paper", snippet="纳入109例患儿"),),
+        expected_keywords=("109例",),
+        keyword_hit_threshold=1,
+    )
+    resolved = ResolvedQuestion(
+        question=question,
+        gold_chunk_ids=(999,),
+        gold_chunk_indices=(0,),
+        gold_paper_ids=(7,),
+        gold_evidence_texts=("纳入109例患儿",),
+        gold_evidence_refs=((7, "纳入109例患儿"),),
+    )
+    paper = Paper(id=7, title="Demo Paper", status="completed")
+    chunk = PaperChunk(
+        id=101,
+        paper_id=7,
+        chunk_index=3,
+        content="论文标题: Demo Paper\n\n本文共纳入109例患儿，随机分组。",
+        embedding=None,
+        token_count=10,
+        page_from=1,
+        page_to=1,
+        metadata_json={"body_text": "本文共纳入109例患儿，随机分组。"},
+    )
+
+    def fake_search(_db, *, query: str, top_k: int | None = None, trace: dict | None = None):
+        assert query == question.question
+        if trace is not None:
+            trace.update(
+                {
+                    "retrieval_backend": "postgres_hybrid",
+                    "sparse_candidates": [{"chunk_id": 101, "paper_id": 7, "score": 0.9, "snippet": "本文共纳入109例患儿，随机分组。"}],
+                    "dense_candidates": [],
+                    "fused_candidates": [{"chunk_id": 101, "paper_id": 7, "score": 0.9, "snippet": "本文共纳入109例患儿，随机分组。"}],
+                    "reranked_candidates": [{"chunk_id": 101, "paper_id": 7, "score": 0.9, "snippet": "本文共纳入109例患儿，随机分组。"}],
+                }
+            )
+        return [RetrievalResult(chunk=chunk, paper=paper, score=0.9)]
+
+    monkeypatch.setattr("app.evals.sample_data._search_chunks", fake_search)
+
+    report = evaluate_retrieval(None, [resolved])
+
+    assert report["summary"]["count"] == 1
+    assert report["summary"]["hit@1"] == 1.0
+    assert report["questions"][0]["mrr"] == 1.0
+    assert report["questions"][0]["retrieved"][0]["chunk_id"] == 101
+    assert report["questions"][0]["retrieved"][0]["matched_evidence_indexes"] == [0]

@@ -6,6 +6,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
 
@@ -76,6 +77,7 @@ class ResolvedQuestion:
     gold_chunk_indices: tuple[int, ...]
     gold_paper_ids: tuple[int, ...]
     gold_evidence_texts: tuple[str, ...]
+    gold_evidence_refs: tuple[tuple[int, str], ...]
 
 
 def _read_json(path: Path) -> Any:
@@ -107,6 +109,21 @@ def _ndcg_at(relevant_ids: set[int], retrieved_ids: list[int], k: int) -> float:
         if chunk_id in relevant_ids:
             dcg += 1.0 / math.log2(index + 1)
     ideal_hits = min(len(relevant_ids), k)
+    idcg = sum(1.0 / math.log2(index + 1) for index in range(1, ideal_hits + 1))
+    return dcg / idcg if idcg else 0.0
+
+
+def _ndcg_at_match_sets(match_sets: list[set[int]], *, relevant_count: int, k: int) -> float:
+    if relevant_count <= 0:
+        return 0.0
+    dcg = 0.0
+    covered: set[int] = set()
+    for index, match_set in enumerate(match_sets[:k], start=1):
+        gain = len(match_set - covered)
+        if gain:
+            dcg += gain / math.log2(index + 1)
+            covered.update(match_set)
+    ideal_hits = min(relevant_count, k)
     idcg = sum(1.0 / math.log2(index + 1) for index in range(1, ideal_hits + 1))
     return dcg / idcg if idcg else 0.0
 
@@ -144,6 +161,42 @@ def _evidence_matches_chunk(snippet: str, chunk_text: str) -> bool:
     return _snippet_matches_chunk(normalized_snippet, normalized_chunk) or _token_sequence_matches(snippet, chunk_text)
 
 
+def _best_effort_chunk_window_match(
+    snippet: str,
+    chunks: list[PaperChunk],
+) -> list[PaperChunk]:
+    normalized_snippet = _normalize_text(snippet)
+    if not normalized_snippet or not chunks:
+        return []
+
+    snippet_numbers = {token.lower() for token in re.findall(r"[-+]?\d+(?:\.\d+)?", snippet or "")}
+    best_window: list[PaperChunk] = []
+    best_score = 0.0
+    for window_size in (1, 2, 3, 4, 5, 6, 8, 10, 12, 16):
+        for start in range(0, max(len(chunks) - window_size + 1, 0)):
+            window = chunks[start : start + window_size]
+            combined_text = " ".join(_chunk_match_text(chunk) for chunk in window)
+            normalized_chunk = _normalize_text(combined_text)
+            if not normalized_chunk:
+                continue
+            matcher = SequenceMatcher(None, normalized_snippet, normalized_chunk)
+            ratio = matcher.ratio()
+            longest_span = max((block.size for block in matcher.get_matching_blocks()), default=0)
+            span_score = longest_span / len(normalized_snippet)
+            chunk_numbers = {token.lower() for token in re.findall(r"[-+]?\d+(?:\.\d+)?", combined_text)}
+            numeric_overlap = (
+                len(snippet_numbers & chunk_numbers) / len(snippet_numbers)
+                if snippet_numbers
+                else 0.0
+            )
+            score = numeric_overlap * 0.45 + span_score * 0.35 + ratio * 0.2
+            if score > best_score:
+                best_score = score
+                best_window = window
+
+    return best_window
+
+
 def _chunk_match_text(chunk: PaperChunk) -> str:
     metadata = chunk.metadata_json if isinstance(chunk.metadata_json, dict) else {}
     body_text = metadata.get("body_text") if isinstance(metadata, dict) else None
@@ -164,6 +217,94 @@ def _summarize_groups(
         summary[key] = {score_name: round(_mean([score_fn(value) for value in values]), 4) for score_name, score_fn in score_fns.items()}
         summary[key]["count"] = len(values)
     return summary
+
+
+def _first_hit_rank(candidates: list[dict[str, Any]], gold_set: set[int]) -> int | None:
+    return next(
+        (
+            index
+            for index, candidate in enumerate(candidates, start=1)
+            if int(candidate.get("chunk_id") or -1) in gold_set
+        ),
+        None,
+    )
+
+
+def _first_hit_rank_from_match_sets(match_sets: list[set[int]]) -> int | None:
+    return next((index for index, match_set in enumerate(match_sets, start=1) if match_set), None)
+
+
+def _match_evidence_indexes(
+    *,
+    paper_id: int | None,
+    chunk_text: str,
+    gold_evidence_refs: tuple[tuple[int, str], ...],
+) -> set[int]:
+    if paper_id is None or not chunk_text:
+        return set()
+    return {
+        index
+        for index, (gold_paper_id, snippet) in enumerate(gold_evidence_refs)
+        if gold_paper_id == paper_id and _evidence_matches_chunk(snippet, chunk_text)
+    }
+
+
+def _result_match_indexes(result: Any, gold_evidence_refs: tuple[tuple[int, str], ...]) -> set[int]:
+    chunk = getattr(result, "chunk", None)
+    return _match_evidence_indexes(
+        paper_id=int(getattr(getattr(result, "paper", None), "id", 0) or 0),
+        chunk_text=_chunk_match_text(chunk) if chunk is not None else "",
+        gold_evidence_refs=gold_evidence_refs,
+    )
+
+
+def _trace_candidate_match_indexes(
+    candidate: dict[str, Any],
+    gold_evidence_refs: tuple[tuple[int, str], ...],
+    *,
+    chunk_lookup: dict[int, PaperChunk] | None = None,
+) -> set[int]:
+    chunk_id = int(candidate.get("chunk_id") or -1)
+    if chunk_lookup and chunk_id in chunk_lookup:
+        return _match_evidence_indexes(
+            paper_id=int(getattr(chunk_lookup[chunk_id], "paper_id", 0) or 0),
+            chunk_text=_chunk_match_text(chunk_lookup[chunk_id]),
+            gold_evidence_refs=gold_evidence_refs,
+        )
+    return _match_evidence_indexes(
+        paper_id=int(candidate.get("paper_id") or 0),
+        chunk_text=str(candidate.get("snippet") or ""),
+        gold_evidence_refs=gold_evidence_refs,
+    )
+
+
+def _classify_retrieval_failure(
+    stage_hit_ranks: dict[str, int | None],
+    *,
+    max_k: int,
+    gold_chunk_count: int,
+) -> str:
+    reranked_rank = stage_hit_ranks.get("reranked")
+    fused_rank = stage_hit_ranks.get("fused")
+    sparse_rank = stage_hit_ranks.get("sparse")
+    dense_rank = stage_hit_ranks.get("dense")
+
+    if reranked_rank is not None and reranked_rank <= max_k:
+        return "retrieved"
+    if fused_rank is not None and fused_rank <= max_k and (reranked_rank is None or reranked_rank > max_k):
+        return "rerank"
+    if (
+        ((sparse_rank is not None and sparse_rank <= max_k) or (dense_rank is not None and dense_rank <= max_k))
+        and (fused_rank is None or fused_rank > max_k)
+    ):
+        return "fusion"
+    if gold_chunk_count > 1:
+        return "chunking"
+    if sparse_rank is None and dense_rank is not None:
+        return "sparse"
+    if dense_rank is None and sparse_rank is not None:
+        return "dense"
+    return "recall"
 
 
 def load_sample_data_paper_specs(data_dir: Path | None = None) -> list[SamplePaperSpec]:
@@ -298,10 +439,12 @@ def resolve_question_gold(
         gold_chunk_indices: list[int] = []
         gold_paper_ids: list[int] = []
         gold_evidence_texts: list[str] = []
+        gold_evidence_refs: list[tuple[int, str]] = []
         for evidence in question.gold_evidence:
             chunks = chunk_cache.get(evidence.paper_key)
             if chunks is None:
                 raise ValueError(f"Unknown paper key in evidence: {evidence.paper_key}")
+            paper = papers_by_key[evidence.paper_key]
             match = next(
                 (
                     chunk
@@ -312,7 +455,7 @@ def resolve_question_gold(
             )
             matched_chunks: list[PaperChunk] = [match] if match is not None else []
             if match is None:
-                for window_size in (2, 3, 4, 5, 6, 8):
+                for window_size in (2, 3, 4, 5, 6, 8, 10, 12, 16):
                     for start in range(0, max(len(chunks) - window_size + 1, 0)):
                         window = chunks[start : start + window_size]
                         combined_text = " ".join(_chunk_match_text(chunk) for chunk in window)
@@ -321,6 +464,8 @@ def resolve_question_gold(
                             break
                     if matched_chunks:
                         break
+                if not matched_chunks:
+                    matched_chunks = _best_effort_chunk_window_match(evidence.snippet, chunks)
             if not matched_chunks:
                 raise ValueError(f"Unable to resolve gold evidence for {question.q_id}: {evidence.snippet}")
             for matched_chunk in matched_chunks:
@@ -330,6 +475,7 @@ def resolve_question_gold(
                 gold_chunk_indices.append(matched_chunk.chunk_index)
                 gold_paper_ids.append(matched_chunk.paper_id)
             gold_evidence_texts.append(evidence.snippet)
+            gold_evidence_refs.append((paper.id, evidence.snippet))
         resolved.append(
             ResolvedQuestion(
                 question=question,
@@ -337,6 +483,7 @@ def resolve_question_gold(
                 gold_chunk_indices=tuple(gold_chunk_indices),
                 gold_paper_ids=tuple(gold_paper_ids),
                 gold_evidence_texts=tuple(gold_evidence_texts),
+                gold_evidence_refs=tuple(gold_evidence_refs),
             )
         )
     return resolved
@@ -351,12 +498,55 @@ def evaluate_retrieval(
     max_k = max(k_values)
     rows: list[dict[str, Any]] = []
     for resolved in questions:
-        if not resolved.gold_chunk_ids:
+        if not resolved.gold_evidence_refs:
             continue
-        results = _search_chunks(db, query=resolved.question.question, top_k=max_k)
-        retrieved_ids = [item.chunk.id for item in results]
-        gold_set = set(resolved.gold_chunk_ids)
-        first_hit_rank = next((index for index, chunk_id in enumerate(retrieved_ids, start=1) if chunk_id in gold_set), None)
+        retrieval_trace: dict[str, Any] = {}
+        results = _search_chunks(db, query=resolved.question.question, top_k=max_k, trace=retrieval_trace)
+        retrieved_match_sets = [_result_match_indexes(item, resolved.gold_evidence_refs) for item in results]
+        first_hit_rank = _first_hit_rank_from_match_sets(retrieved_match_sets)
+        trace_chunk_ids = {
+            int(candidate.get("chunk_id") or -1)
+            for stage_name in ("sparse_candidates", "dense_candidates", "fused_candidates", "reranked_candidates")
+            for candidate in retrieval_trace.get(stage_name, [])
+            if int(candidate.get("chunk_id") or -1) > 0
+        }
+        trace_chunks = (
+            db.scalars(select(PaperChunk).where(PaperChunk.id.in_(trace_chunk_ids))).all()
+            if db is not None and trace_chunk_ids
+            else []
+        )
+        trace_chunk_lookup = {int(chunk.id): chunk for chunk in trace_chunks}
+        stage_hit_ranks = {
+            "sparse": _first_hit_rank_from_match_sets(
+                [
+                    _trace_candidate_match_indexes(candidate, resolved.gold_evidence_refs, chunk_lookup=trace_chunk_lookup)
+                    for candidate in retrieval_trace.get("sparse_candidates", [])
+                ]
+            ),
+            "dense": _first_hit_rank_from_match_sets(
+                [
+                    _trace_candidate_match_indexes(candidate, resolved.gold_evidence_refs, chunk_lookup=trace_chunk_lookup)
+                    for candidate in retrieval_trace.get("dense_candidates", [])
+                ]
+            ),
+            "fused": _first_hit_rank_from_match_sets(
+                [
+                    _trace_candidate_match_indexes(candidate, resolved.gold_evidence_refs, chunk_lookup=trace_chunk_lookup)
+                    for candidate in retrieval_trace.get("fused_candidates", [])
+                ]
+            ),
+            "reranked": _first_hit_rank_from_match_sets(
+                [
+                    _trace_candidate_match_indexes(candidate, resolved.gold_evidence_refs, chunk_lookup=trace_chunk_lookup)
+                    for candidate in retrieval_trace.get("reranked_candidates", [])
+                ]
+            ),
+        }
+        likely_failure_stage = _classify_retrieval_failure(
+            stage_hit_ranks,
+            max_k=max_k,
+            gold_chunk_count=len(resolved.gold_chunk_ids),
+        )
         row = {
             "q_id": resolved.question.q_id,
             "question": resolved.question.question,
@@ -365,6 +555,10 @@ def evaluate_retrieval(
             "difficulty": resolved.question.difficulty,
             "expected_abstention": resolved.question.expected_abstention,
             "gold_chunk_ids": list(resolved.gold_chunk_ids),
+            "gold_evidence_refs": [
+                {"paper_id": paper_id, "snippet": snippet}
+                for paper_id, snippet in resolved.gold_evidence_refs
+            ],
             "retrieved": [
                 {
                     "chunk_id": item.chunk.id,
@@ -372,14 +566,22 @@ def evaluate_retrieval(
                     "paper_id": item.paper.id,
                     "paper_title": item.paper.title,
                     "score": round(item.score, 4),
+                    "matched_evidence_indexes": sorted(retrieved_match_sets[index]),
                 }
-                for item in results
+                for index, item in enumerate(results)
             ],
             "mrr": round(1.0 / first_hit_rank, 4) if first_hit_rank else 0.0,
+            "stage_hit_ranks": stage_hit_ranks,
+            "likely_failure_stage": likely_failure_stage,
+            "chunking_risk": len(resolved.gold_chunk_ids) > 1,
+            "retrieval_trace": retrieval_trace,
         }
         for k in k_values:
-            row[f"hit@{k}"] = any(chunk_id in gold_set for chunk_id in retrieved_ids[:k])
-            row[f"ndcg@{k}"] = round(_ndcg_at(gold_set, retrieved_ids, k), 4)
+            row[f"hit@{k}"] = any(match_set for match_set in retrieved_match_sets[:k])
+            row[f"ndcg@{k}"] = round(
+                _ndcg_at_match_sets(retrieved_match_sets, relevant_count=len(resolved.gold_evidence_refs), k=k),
+                4,
+            )
         rows.append(row)
 
     summary = {
@@ -400,6 +602,13 @@ def evaluate_retrieval(
             key_fn=lambda row: row["language"],
             score_fns={"hit@10": lambda row: 1.0 if row.get("hit@10") else 0.0, "mrr": lambda row: float(row["mrr"])},
         ),
+        "by_failure_stage": {
+            key: {"count": len(values)}
+            for key, values in {
+                stage: [row for row in rows if row.get("likely_failure_stage") == stage]
+                for stage in sorted({str(row.get("likely_failure_stage") or "unknown") for row in rows})
+            }.items()
+        },
     }
     return {"summary": summary, "breakdown": breakdown, "questions": rows}
 
