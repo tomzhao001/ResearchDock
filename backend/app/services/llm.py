@@ -60,6 +60,17 @@ def _get_embedding_provider() -> str:
     raise RuntimeError("EMBEDDING_PROVIDER must be one of: auto, openai, glm")
 
 
+def is_chat_llm_configured() -> bool:
+    """True when :func:`_request_chat_completion` can run for the resolved ``LLM_PROVIDER``."""
+    try:
+        provider = _get_llm_provider()
+    except RuntimeError:
+        return False
+    if provider == "glm":
+        return bool(settings.glm_api_key.strip() and (settings.glm_base_url or "").strip())
+    return bool(settings.openai_api_key.strip() and (settings.openai_base_url or "").strip())
+
+
 def _build_chat_completions_url(base_url: str) -> str:
     normalized = (base_url or "").strip().rstrip("/")
     if not normalized:

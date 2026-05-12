@@ -13,7 +13,7 @@ from app.config import settings
 from app.database import SessionLocal
 from app.models import Job, Paper, PaperAsset, PaperChunk
 from app.services.document_preprocess import preprocess_document
-from app.services.llm import summarize_paper_text
+from app.services.llm import is_chat_llm_configured, summarize_paper_text
 from app.services.pdf_extraction import PDFTextExtractor
 from app.services.rag import rebuild_paper_index
 from app.services.task_events import publish_task_status_event
@@ -106,7 +106,7 @@ def _get_active_job_for_paper(db: Session, paper_id: int) -> Job | None:
 
 
 def _queue_summary_job_if_needed(db: Session, paper: Paper, asset: PaperAsset) -> int | None:
-    if not settings.openai_api_key.strip():
+    if not is_chat_llm_configured():
         return None
     if not (asset.raw_text or "").strip():
         return None
@@ -324,8 +324,8 @@ def enqueue_paper_summary_regeneration(db: Session, paper_id: int) -> Job | None
         raise ValueError("Original PDF not found")
     if not (asset.raw_text or "").strip():
         raise ValueError("No OCR text available")
-    if not settings.openai_api_key.strip():
-        raise ValueError("Summary model is not configured")
+    if not is_chat_llm_configured():
+        raise ValueError("LLM is not configured for summarization")
     if _get_active_job_for_paper(db, paper_id) is not None:
         raise ValueError("Paper already has an active job")
 
@@ -423,8 +423,8 @@ def run_paper_summary_job(
         asset = _get_original_pdf_asset(db, job.paper_id) if job.paper_id is not None else None
         if paper is None or paper.deleted_at is not None or asset is None:
             raise RuntimeError("Missing paper or upload asset for summary job")
-        if not settings.openai_api_key.strip():
-            raise RuntimeError("Summary model is not configured")
+        if not is_chat_llm_configured():
+            raise RuntimeError("LLM is not configured for summarization")
         if not (asset.raw_text or "").strip():
             raise RuntimeError("No OCR text available")
 

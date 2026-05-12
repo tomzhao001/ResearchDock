@@ -87,6 +87,8 @@ def make_eager_summary_delay(session_factory: sessionmaker, *, swallow_errors: b
 @pytest.fixture(autouse=True)
 def mock_summary(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("app.config.settings.openai_api_key", "")
+    monkeypatch.setattr("app.config.settings.glm_api_key", "")
+    monkeypatch.setattr("app.config.settings.llm_provider", "openai")
 
     def fake_summary(_: str) -> dict:
         return {
