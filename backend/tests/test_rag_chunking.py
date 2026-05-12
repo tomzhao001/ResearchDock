@@ -5,7 +5,13 @@ import pytest
 from app.models import Paper, PaperChunk
 from app.services.document_preprocess import preprocess_document
 from app.services.pdf_extraction import DocumentExtractionResult, PageExtractionResult
-from app.services.rag import _boost_exact_match_candidates, _extract_exact_match_terms, _is_exact_match_heavy_query, _split_text
+from app.services.rag import (
+    _boost_exact_match_candidates,
+    _build_crosslingual_query_plan,
+    _extract_exact_match_terms,
+    _is_exact_match_heavy_query,
+    _split_text,
+)
 
 
 def test_preprocess_document_keeps_page_level_blocks() -> None:
@@ -191,6 +197,36 @@ def test_extract_exact_match_terms_prefers_table_and_hyphenated_terms() -> None:
     assert "Table 1" in terms
     assert "Stimulation" in terms
     assert "p-value" in terms
+
+
+def test_build_crosslingual_query_plan_creates_bilingual_variants(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.config.settings.rag_crosslingual_query_rewrite_enabled", True)
+    monkeypatch.setattr("app.config.settings.glm_api_key", "test-key")
+
+    def fake_chat(messages: list[dict[str, str]], *, temperature: float = 0.3) -> tuple[str, str | None]:
+        return (
+            """
+            {
+              "detected_language": "zh",
+              "retrieval_query_en": "What does tES stand for in the paper?",
+              "exact_terms": ["tES", "transcranial electrical stimulation"],
+              "subqueries_en": [],
+              "generation_instruction": "请用中文回答，保留关键英文术语原文，并引用英文证据。"
+            }
+            """.strip(),
+            "test-model",
+        )
+
+    monkeypatch.setattr("app.services.rag.chat_with_messages", fake_chat)
+
+    plan = _build_crosslingual_query_plan("文中的 tES 指什么？")
+
+    assert plan.detected_language == "zh"
+    assert plan.retrieval_query_en == "What does tES stand for in the paper?"
+    assert "tES" in plan.exact_terms
+    assert "transcranial electrical stimulation" in plan.exact_terms
+    assert [variant.name for variant in plan.variants] == ["zh_original", "en_rewrite"]
+    assert plan.rerank_query == "What does tES stand for in the paper?"
 
 
 def test_exact_match_heavy_query_stays_conservative_for_cjk_single_fact() -> None:

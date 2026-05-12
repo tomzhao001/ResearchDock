@@ -82,6 +82,9 @@ class Settings(BaseSettings):
     rag_rrf_k: int = 60
     rag_rerank_top_n: int = 10
     rag_text_search_config: str = "simple"
+    rag_crosslingual_query_rewrite_enabled: bool = True
+    rag_crosslingual_max_subqueries: int = 2
+    rag_hyde_enabled: bool = False
     ocr_provider: str = "glm_ocr"
     llm_ocr_base_url: str = "https://api.z.ai/api/paas/v4/layout_parsing"
     llm_ocr_api_key: str = ""

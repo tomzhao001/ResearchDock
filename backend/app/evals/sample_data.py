@@ -542,6 +542,16 @@ def evaluate_retrieval(
                 ]
             ),
         }
+        variant_hit_ranks = {
+            variant_name: _first_hit_rank_from_match_sets(
+                [
+                    _trace_candidate_match_indexes(candidate, resolved.gold_evidence_refs, chunk_lookup=trace_chunk_lookup)
+                    for candidate in variant_payload.get("fused_candidates", [])
+                ]
+            )
+            for variant_name, variant_payload in (retrieval_trace.get("variant_candidates") or {}).items()
+            if isinstance(variant_payload, dict)
+        }
         likely_failure_stage = _classify_retrieval_failure(
             stage_hit_ranks,
             max_k=max_k,
@@ -572,6 +582,7 @@ def evaluate_retrieval(
             ],
             "mrr": round(1.0 / first_hit_rank, 4) if first_hit_rank else 0.0,
             "stage_hit_ranks": stage_hit_ranks,
+            "variant_hit_ranks": variant_hit_ranks,
             "likely_failure_stage": likely_failure_stage,
             "chunking_risk": len(resolved.gold_chunk_ids) > 1,
             "retrieval_trace": retrieval_trace,

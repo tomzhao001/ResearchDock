@@ -28,9 +28,9 @@ def test_sample_data_benchmark_files_have_expected_shape() -> None:
     smoke_ids = load_sample_data_smoke_question_ids()
 
     assert len(papers) == 2
-    assert len(questions) == 96
+    assert len(questions) == 102
     assert len(sessions) == 4
-    assert len(smoke_ids) == 12
+    assert len(smoke_ids) == 14
     assert papers[0].pdf_path.exists()
     assert papers[1].pdf_path.exists()
 
@@ -58,7 +58,7 @@ def test_sample_data_gold_evidence_resolves_against_ingested_sample_papers(
     eligible = [item for item in resolved if item.question.gold_evidence]
     all_chunks = [chunk for chunks in chunk_cache.values() for chunk in chunks]
 
-    assert len(eligible) == 92
+    assert len(eligible) == 98
     assert all(item.gold_chunk_ids for item in eligible)
     assert all_chunks
     assert all(chunk.page_from is not None for chunk in all_chunks)
@@ -79,6 +79,8 @@ def test_sample_data_smoke_eval_runs_and_returns_reports(
         "这项研究的主要结局指标是什么？": "The primary outcome was the ADHD-RS diagnostic questionnaire completed by the parents.",
         "文中的 tES 指什么？": "tES means transcranial electrical stimulation.",
         "Table 1 中 Stimulation 这一项的 p-value 是多少？": "Table 1 reports a p-value of 0.028 for Stimulation.",
+        "如果用户直接用中文追问：这篇英文论文到底是什么研究设计？": "It was a randomized double-blind active-controlled crossover study.",
+        "如果只用中文搜英文表格：Table 2 里 backward digit span 那一行的 Stimulation p-value 是多少？": "Table 2 reports a p-value of 0.038 for Stimulation on backward digit span.",
         "作者为什么选择 within-subject design，并给出了怎样的样本量对比？": "They used a within-subject design to control individual differences; a between-subject design would need 72 participants, more than 3.5 times more.",
         "请概括论文摘要中的核心结果：tRNS 相对 tDCS 带来了哪些临床和认知变化？": "tRNS produced clinical improvement on the ADHD rating-scale and improved working memory compared with tDCS.",
         "这里的主要终点具体是哪份量表？": "The primary outcome was the ADHD-RS diagnostic questionnaire completed by the parents.",
@@ -112,11 +114,12 @@ def test_sample_data_smoke_eval_runs_and_returns_reports(
 
     report = run_sample_data_evaluation(session_factory, mode="both", subset="smoke", judge_mode="heuristic")
 
-    assert report["retrieval"]["summary"]["count"] == 11
+    assert report["retrieval"]["summary"]["count"] == 13
     assert report["retrieval"]["summary"]["skipped_without_gold"] == 1
-    assert report["end_to_end"]["summary"]["count"] == 12
+    assert report["end_to_end"]["summary"]["count"] == 14
     assert "groundedness" in report["end_to_end"]["summary"]
     assert report["end_to_end"]["questions"][0]["metadata"]["retrieval"]["retrieval_backend"] == "legacy"
+    assert "query_plan" in report["end_to_end"]["questions"][0]["metadata"]["retrieval"]
 
 
 def test_evaluate_retrieval_reports_stage_hit_ranks(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -150,6 +153,16 @@ def test_evaluate_retrieval_reports_stage_hit_ranks(monkeypatch: pytest.MonkeyPa
             trace.update(
                 {
                     "retrieval_backend": "postgres_hybrid",
+                    "variant_candidates": {
+                        "en_rewrite": {
+                            "query": "What is the Table 1 p-value?",
+                            "language": "en",
+                            "role": "rewrite",
+                            "sparse_candidates": [{"chunk_id": 101, "paper_id": 7, "score": 1.2, "snippet": "Table 1 reports p-value 0.028"}],
+                            "dense_candidates": [],
+                            "fused_candidates": [{"chunk_id": 101, "paper_id": 7, "score": 1.2, "snippet": "Table 1 reports p-value 0.028"}],
+                        }
+                    },
                     "sparse_candidates": [{"chunk_id": 101, "paper_id": 7, "score": 1.2, "snippet": "Table 1 reports p-value 0.028"}],
                     "dense_candidates": [],
                     "fused_candidates": [],
@@ -170,6 +183,7 @@ def test_evaluate_retrieval_reports_stage_hit_ranks(monkeypatch: pytest.MonkeyPa
         "fused": None,
         "reranked": None,
     }
+    assert report["questions"][0]["variant_hit_ranks"] == {"en_rewrite": 1}
     assert report["questions"][0]["likely_failure_stage"] == "fusion"
     assert report["questions"][0]["retrieval_trace"]["retrieval_backend"] == "postgres_hybrid"
 

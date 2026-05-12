@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
@@ -34,6 +35,30 @@ FALLBACK_SYSTEM_PROMPT = (
     "随后你可以基于通用知识给出简短补充，但必须避免伪造论文引用。"
 )
 
+QUERY_PLAN_SYSTEM_PROMPT = (
+    "你是跨语言学术检索规划器。"
+    "请把用户问题转成适合英文论文检索的 JSON 计划。"
+    "必须返回 JSON 对象，不要输出额外解释。"
+)
+
+QUERY_PLAN_USER_TEMPLATE = """
+请根据下面的问题，输出一个 JSON 对象，字段必须严格包含：
+- detected_language: 字符串，只能是 zh、en 或 mixed
+- retrieval_query_en: 用于检索英文论文的英文 query；如果不需要可返回空字符串
+- exact_terms: 字符串数组，保留应被精确匹配的术语、缩写、表号、图号、指标名
+- subqueries_en: 字符串数组，只有在复杂问题确实需要拆分时才返回，最多 {max_subqueries} 条
+- generation_instruction: 面向回答阶段的中文指令，要求中文作答、保留关键英文术语原文并引用英文证据
+
+规则：
+1. 用户原问题如果是中文，retrieval_query_en 必须是适合英文论文检索的英文表达，而不是逐字翻译。
+2. 保留论文中的关键英文术语，例如 tES、ADHD-RS、Table 3、theta wave、within-subject design。
+3. 只有在问题明显包含两个独立信息点时，才拆成 subqueries_en。
+4. 不要编造论文中不存在的新术语。
+
+用户问题：
+{query}
+""".strip()
+
 
 @dataclass
 class TopicSummary:
@@ -54,6 +79,30 @@ class RetrievalResult:
     chunk: PaperChunk
     paper: Paper
     score: float
+
+
+@dataclass(frozen=True)
+class RetrievalQueryVariant:
+    name: str
+    query: str
+    language: str
+    use_sparse: bool
+    use_dense: bool
+    role: str
+
+
+@dataclass(frozen=True)
+class RetrievalQueryPlan:
+    original_query: str
+    detected_language: str
+    generation_instruction: str
+    rerank_query: str
+    exact_terms: tuple[str, ...]
+    retrieval_query_en: str | None
+    subqueries_en: tuple[str, ...]
+    variants: tuple[RetrievalQueryVariant, ...]
+    rewrite_status: str
+    used_llm: bool
 
 
 def _normalize_title(title: str | None) -> str:
@@ -180,6 +229,223 @@ def _extract_table_focus_terms(query: str) -> list[str]:
         terms.append(term)
         seen.add(lowered)
     return sorted(terms, key=len, reverse=True)
+
+
+def _normalize_query_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _unique_strings(values: Iterable[str]) -> list[str]:
+    items: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = _normalize_query_text(str(value))
+        if not normalized:
+            continue
+        lowered = normalized.lower()
+        if lowered in seen:
+            continue
+        items.append(normalized)
+        seen.add(lowered)
+    return items
+
+
+def _detect_query_language(text: str) -> str:
+    compact = _normalize_query_text(text)
+    if not compact:
+        return "unknown"
+    cjk_count, latin_count = _script_counts(compact)
+    if cjk_count > latin_count:
+        return "zh"
+    if cjk_count and latin_count:
+        return "mixed"
+    if cjk_count:
+        return "zh"
+    return "en"
+
+
+def _llm_available_for_query_rewrite() -> bool:
+    if not settings.rag_crosslingual_query_rewrite_enabled:
+        return False
+    return bool(settings.glm_api_key.strip() or settings.openai_api_key.strip())
+
+
+def _parse_json_object(text: str) -> dict[str, Any]:
+    payload = (text or "").strip()
+    if not payload:
+        raise RuntimeError("query rewrite 返回为空")
+    if payload.startswith("```"):
+        lines = payload.splitlines()
+        if len(lines) >= 3:
+            payload = "\n".join(lines[1:-1]).strip()
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        start = payload.find("{")
+        end = payload.rfind("}")
+        if start == -1 or end == -1 or start >= end:
+            raise RuntimeError("query rewrite 未返回合法 JSON") from None
+        data = json.loads(payload[start : end + 1])
+    if not isinstance(data, dict):
+        raise RuntimeError("query rewrite JSON 必须是对象")
+    return data
+
+
+def _default_generation_instruction(language: str) -> str:
+    if language in {"zh", "mixed"}:
+        return "请用中文回答，保留关键英文术语原文，并引用英文证据。"
+    return "请使用与用户提问一致的语言回答，并在必要时保留英文术语原文。"
+
+
+def _query_variants_for_plan(
+    *,
+    original_query: str,
+    detected_language: str,
+    retrieval_query_en: str,
+    subqueries_en: list[str],
+) -> list[RetrievalQueryVariant]:
+    variants: list[RetrievalQueryVariant] = []
+    if detected_language in {"zh", "mixed"}:
+        variants.append(
+            RetrievalQueryVariant(
+                name="zh_original",
+                query=original_query,
+                language="zh",
+                use_sparse=False,
+                use_dense=True,
+                role="original",
+            )
+        )
+        if retrieval_query_en:
+            variants.append(
+                RetrievalQueryVariant(
+                    name="en_rewrite",
+                    query=retrieval_query_en,
+                    language="en",
+                    use_sparse=True,
+                    use_dense=True,
+                    role="rewrite",
+                )
+            )
+        for index, subquery in enumerate(subqueries_en, start=1):
+            variants.append(
+                RetrievalQueryVariant(
+                    name=f"en_subquery_{index}",
+                    query=subquery,
+                    language="en",
+                    use_sparse=True,
+                    use_dense=True,
+                    role="subquery",
+                )
+            )
+        return variants
+    variants.append(
+        RetrievalQueryVariant(
+            name="default",
+            query=original_query,
+            language="en",
+            use_sparse=True,
+            use_dense=True,
+            role="original",
+        )
+    )
+    return variants
+
+
+def _serialize_query_plan(plan: RetrievalQueryPlan) -> dict[str, Any]:
+    return {
+        "original_query": plan.original_query,
+        "detected_language": plan.detected_language,
+        "generation_instruction": plan.generation_instruction,
+        "rerank_query": plan.rerank_query,
+        "exact_terms": list(plan.exact_terms),
+        "retrieval_query_en": plan.retrieval_query_en,
+        "subqueries_en": list(plan.subqueries_en),
+        "rewrite_status": plan.rewrite_status,
+        "used_llm": plan.used_llm,
+        "variants": [
+            {
+                "name": variant.name,
+                "query": variant.query,
+                "language": variant.language,
+                "use_sparse": variant.use_sparse,
+                "use_dense": variant.use_dense,
+                "role": variant.role,
+            }
+            for variant in plan.variants
+        ],
+    }
+
+
+def _build_crosslingual_query_plan(query: str) -> RetrievalQueryPlan:
+    original_query = _normalize_query_text(query)
+    detected_language = _detect_query_language(original_query)
+    retrieval_query_en = ""
+    subqueries_en: list[str] = []
+    exact_terms = _unique_strings(_extract_exact_match_terms(original_query))
+    generation_instruction = _default_generation_instruction(detected_language)
+    rewrite_status = "not_needed"
+    used_llm = False
+
+    if detected_language in {"zh", "mixed"}:
+        rewrite_status = "fallback_only"
+        if _llm_available_for_query_rewrite():
+            try:
+                content, _ = chat_with_messages(
+                    [
+                        {"role": "system", "content": QUERY_PLAN_SYSTEM_PROMPT},
+                        {
+                            "role": "user",
+                            "content": QUERY_PLAN_USER_TEMPLATE.format(
+                                query=original_query,
+                                max_subqueries=settings.rag_crosslingual_max_subqueries,
+                            ),
+                        },
+                    ],
+                    temperature=0.0,
+                )
+                payload = _parse_json_object(content)
+                retrieval_query_en = _normalize_query_text(str(payload.get("retrieval_query_en") or ""))
+                subqueries_en = _unique_strings(payload.get("subqueries_en") or [])[: settings.rag_crosslingual_max_subqueries]
+                exact_terms = _unique_strings(
+                    [
+                        *exact_terms,
+                        *(payload.get("exact_terms") or []),
+                        *_extract_exact_match_terms(retrieval_query_en),
+                    ]
+                )
+                generation_instruction = _normalize_query_text(
+                    str(payload.get("generation_instruction") or generation_instruction)
+                ) or generation_instruction
+                rewrite_status = "llm_rewritten"
+                used_llm = True
+            except Exception:
+                rewrite_status = "llm_failed_fallback"
+        if not retrieval_query_en:
+            english_terms = [term for term in exact_terms if re.search(r"[A-Za-z]", term)]
+            retrieval_query_en = _normalize_query_text(" ".join(english_terms))
+            if retrieval_query_en:
+                rewrite_status = "heuristic_terms"
+
+    rerank_query = retrieval_query_en or original_query
+    variants = _query_variants_for_plan(
+        original_query=original_query,
+        detected_language=detected_language,
+        retrieval_query_en=retrieval_query_en,
+        subqueries_en=subqueries_en,
+    )
+    return RetrievalQueryPlan(
+        original_query=original_query,
+        detected_language=detected_language,
+        generation_instruction=generation_instruction,
+        rerank_query=rerank_query,
+        exact_terms=tuple(exact_terms),
+        retrieval_query_en=retrieval_query_en or None,
+        subqueries_en=tuple(subqueries_en),
+        variants=tuple(variants),
+        rewrite_status=rewrite_status,
+        used_llm=used_llm,
+    )
 
 
 def _looks_like_table_body_text(text: str) -> bool:
@@ -385,14 +651,13 @@ def _search_dense_chunks_postgres(
     ]
 
 
-def _fuse_ranked_candidates(
-    sparse_hits: list[dict[str, Any]],
-    dense_hits: list[dict[str, Any]],
+def _fuse_ranked_candidate_sources(
+    source_hits: dict[str, list[dict[str, Any]]],
     *,
     limit: int,
 ) -> list[dict[str, Any]]:
     merged: dict[int, dict[str, Any]] = {}
-    for source, hits in (("sparse", sparse_hits), ("dense", dense_hits)):
+    for source_name, hits in source_hits.items():
         for rank, item in enumerate(hits, start=1):
             candidate = merged.setdefault(
                 int(item["chunk_id"]),
@@ -404,8 +669,8 @@ def _fuse_ranked_candidates(
                     "score": 0.0,
                 },
             )
-            candidate["source_scores"][source] = float(item["score"])
-            candidate["source_ranks"][source] = rank
+            candidate["source_scores"][source_name] = float(item["score"])
+            candidate["source_ranks"][source_name] = rank
             candidate["score"] += 1.0 / (settings.rag_rrf_k + rank)
     fused = list(merged.values())
     fused.sort(
@@ -418,6 +683,15 @@ def _fuse_ranked_candidates(
     for rank, item in enumerate(fused, start=1):
         item["rank"] = rank
     return fused[:limit]
+
+
+def _fuse_ranked_candidates(
+    sparse_hits: list[dict[str, Any]],
+    dense_hits: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    return _fuse_ranked_candidate_sources({"sparse": sparse_hits, "dense": dense_hits}, limit=limit)
 
 
 def _boost_exact_match_candidates(
@@ -534,6 +808,26 @@ def _serialize_ranked_trace_candidates(
     return serialized
 
 
+def _serialize_variant_traces(
+    variant_traces: dict[str, dict[str, Any]],
+    *,
+    record_map: dict[int, tuple[PaperChunk, Paper]],
+) -> dict[str, dict[str, Any]]:
+    serialized: dict[str, dict[str, Any]] = {}
+    for name, variant in variant_traces.items():
+        serialized[name] = {
+            "query": variant.get("query"),
+            "language": variant.get("language"),
+            "role": variant.get("role"),
+            "use_sparse": bool(variant.get("use_sparse")),
+            "use_dense": bool(variant.get("use_dense")),
+            "sparse_candidates": _serialize_ranked_trace_candidates(variant.get("sparse_hits", []), record_map),
+            "dense_candidates": _serialize_ranked_trace_candidates(variant.get("dense_hits", []), record_map),
+            "fused_candidates": _serialize_ranked_trace_candidates(variant.get("fused_hits", []), record_map),
+        }
+    return serialized
+
+
 def _build_retrieval_results(
     candidates: list[dict[str, Any]],
     *,
@@ -547,6 +841,17 @@ def _build_retrieval_results(
         chunk, paper = record
         results.append(RetrievalResult(chunk=chunk, paper=paper, score=float(item.get("score") or 0.0)))
     return results
+
+
+def _results_to_ranked_hits(results: list[RetrievalResult]) -> list[dict[str, Any]]:
+    return [
+        {
+            "chunk_id": int(result.chunk.id),
+            "paper_id": int(result.paper.id),
+            "score": float(result.score),
+        }
+        for result in results
+    ]
 
 
 def _apply_reranking(
@@ -1083,51 +1388,162 @@ def _search_chunks(
     trace: dict[str, Any] | None = None,
 ) -> list[RetrievalResult]:
     limit = top_k or settings.rag_top_k
-    exact_terms = _extract_exact_match_terms(query)
-    exact_match_heavy = _is_exact_match_heavy_query(query, exact_terms)
+    query_plan = _build_crosslingual_query_plan(query)
+    exact_terms = list(query_plan.exact_terms)
+    exact_match_heavy = _is_exact_match_heavy_query(query_plan.rerank_query, exact_terms)
     exact_terms_for_boost = exact_terms if exact_match_heavy or _is_table_or_figure_query(query) else []
     if not _is_postgres_session(db):
-        results = _search_chunks_legacy(db, query=query, top_k=limit)
+        variant_results: dict[str, list[RetrievalResult]] = {}
+        for variant in query_plan.variants:
+            variant_results[variant.name] = _search_chunks_legacy(db, query=variant.query, top_k=max(settings.rag_rerank_top_n, limit))
+        source_hits: dict[str, list[dict[str, Any]]] = {}
+        variant_traces: dict[str, dict[str, Any]] = {}
+        for variant in query_plan.variants:
+            hits = _results_to_ranked_hits(variant_results.get(variant.name, []))
+            local_sources: dict[str, list[dict[str, Any]]] = {}
+            if variant.use_sparse:
+                local_sources[f"{variant.name}_sparse"] = hits
+                source_hits[f"{variant.name}_sparse"] = hits
+            if variant.use_dense:
+                local_sources[f"{variant.name}_dense"] = hits
+                source_hits[f"{variant.name}_dense"] = hits
+            variant_traces[variant.name] = {
+                "query": variant.query,
+                "language": variant.language,
+                "role": variant.role,
+                "use_sparse": variant.use_sparse,
+                "use_dense": variant.use_dense,
+                "sparse_hits": hits if variant.use_sparse else [],
+                "dense_hits": hits if variant.use_dense else [],
+                "fused_hits": _fuse_ranked_candidate_sources(local_sources, limit=max(settings.rag_rerank_top_n, limit))
+                if local_sources
+                else [],
+            }
+        fused_hits = _fuse_ranked_candidate_sources(source_hits, limit=max(settings.rag_rerank_top_n, limit)) if source_hits else []
+        record_map = {
+            int(result.chunk.id): (result.chunk, result.paper)
+            for results in variant_results.values()
+            for result in results
+        }
+        results = _build_retrieval_results(fused_hits[:limit], record_map=record_map)
         if trace is not None:
-            serialized = _serialize_trace_candidates(results)
+            serialized = _serialize_ranked_trace_candidates(fused_hits, record_map)
+            sparse_sources = {
+                name: hits
+                for name, hits in source_hits.items()
+                if name.endswith("_sparse")
+            }
+            dense_sources = {
+                name: hits
+                for name, hits in source_hits.items()
+                if name.endswith("_dense")
+            }
             trace.update(
                 {
-                    "sparse_candidates": [],
-                    "dense_candidates": [],
+                    "query_plan": _serialize_query_plan(query_plan),
+                    "variant_candidates": _serialize_variant_traces(variant_traces, record_map=record_map),
+                    "sparse_candidates": _serialize_ranked_trace_candidates(
+                        _fuse_ranked_candidate_sources(sparse_sources, limit=max(settings.rag_rerank_top_n, limit))
+                        if sparse_sources
+                        else [],
+                        record_map,
+                    ),
+                    "dense_candidates": _serialize_ranked_trace_candidates(
+                        _fuse_ranked_candidate_sources(dense_sources, limit=max(settings.rag_rerank_top_n, limit))
+                        if dense_sources
+                        else [],
+                        record_map,
+                    ),
                     "fused_candidates": serialized,
                     "reranked_candidates": serialized,
                     "retrieval_backend": "legacy",
                     "exact_match_terms": exact_terms,
                     "exact_match_terms_applied": exact_terms_for_boost,
                     "exact_match_heavy": exact_match_heavy,
+                    "generation_instruction": query_plan.generation_instruction,
+                    "rerank_query": query_plan.rerank_query,
                     "rerank_status": "not_applicable",
                 }
             )
         return results
-
-    query_embedding: list[float] | None = None
-    if settings.glm_api_key.strip() or settings.openai_api_key.strip():
-        try:
-            query_embedding = embed_texts([query])[0]
-        except Exception:
-            query_embedding = None
 
     sparse_limit = max(settings.rag_sparse_top_k, limit)
     dense_limit = max(settings.rag_dense_top_k, limit)
     if exact_match_heavy:
         sparse_limit = max(sparse_limit, limit * 8, settings.rag_sparse_top_k * 2)
         dense_limit = max(dense_limit, limit * 4, settings.rag_dense_top_k)
-    sparse_hits = _search_sparse_chunks_postgres(db, query=query, limit=sparse_limit, exact_terms=exact_terms_for_boost)
-    dense_hits = _search_dense_chunks_postgres(
-        db,
-        query_embedding=query_embedding,
-        limit=dense_limit,
-    )
+
+    dense_query_texts = _unique_strings([variant.query for variant in query_plan.variants if variant.use_dense])
+    dense_embeddings: dict[str, list[float] | None] = {}
+    if dense_query_texts and (settings.glm_api_key.strip() or settings.openai_api_key.strip()):
+        try:
+            embedding_rows = embed_texts(dense_query_texts)
+            dense_embeddings = {
+                dense_query_texts[index]: embedding_rows[index]
+                for index in range(min(len(dense_query_texts), len(embedding_rows)))
+            }
+        except Exception:
+            dense_embeddings = {}
+
+    sparse_source_hits: dict[str, list[dict[str, Any]]] = {}
+    dense_source_hits: dict[str, list[dict[str, Any]]] = {}
+    all_source_hits: dict[str, list[dict[str, Any]]] = {}
+    variant_traces: dict[str, dict[str, Any]] = {}
     fusion_limit = max(settings.rag_fusion_window, settings.rag_rerank_top_n, limit, sparse_limit if exact_match_heavy else 0)
-    fused_candidates = _fuse_ranked_candidates(sparse_hits, dense_hits, limit=fusion_limit)
+
+    for variant in query_plan.variants:
+        variant_sparse_hits: list[dict[str, Any]] = []
+        variant_dense_hits: list[dict[str, Any]] = []
+        if variant.use_sparse:
+            variant_sparse_hits = _search_sparse_chunks_postgres(
+                db,
+                query=variant.query,
+                limit=sparse_limit,
+                exact_terms=exact_terms_for_boost if variant.language == "en" else [],
+            )
+            if variant_sparse_hits:
+                source_name = f"{variant.name}_sparse"
+                sparse_source_hits[source_name] = variant_sparse_hits
+                all_source_hits[source_name] = variant_sparse_hits
+        if variant.use_dense:
+            variant_dense_hits = _search_dense_chunks_postgres(
+                db,
+                query_embedding=dense_embeddings.get(variant.query),
+                limit=dense_limit,
+            )
+            if variant_dense_hits:
+                source_name = f"{variant.name}_dense"
+                dense_source_hits[source_name] = variant_dense_hits
+                all_source_hits[source_name] = variant_dense_hits
+        local_sources = {
+            **({f"{variant.name}_sparse": variant_sparse_hits} if variant_sparse_hits else {}),
+            **({f"{variant.name}_dense": variant_dense_hits} if variant_dense_hits else {}),
+        }
+        variant_traces[variant.name] = {
+            "query": variant.query,
+            "language": variant.language,
+            "role": variant.role,
+            "use_sparse": variant.use_sparse,
+            "use_dense": variant.use_dense,
+            "sparse_hits": variant_sparse_hits,
+            "dense_hits": variant_dense_hits,
+            "fused_hits": _fuse_ranked_candidate_sources(local_sources, limit=fusion_limit) if local_sources else [],
+        }
+
+    sparse_hits = _fuse_ranked_candidate_sources(sparse_source_hits, limit=fusion_limit) if sparse_source_hits else []
+    dense_hits = _fuse_ranked_candidate_sources(dense_source_hits, limit=fusion_limit) if dense_source_hits else []
+    fused_candidates = _fuse_ranked_candidate_sources(all_source_hits, limit=fusion_limit) if all_source_hits else []
     record_map = _load_chunk_record_map(
         db,
-        chunk_ids=[item["chunk_id"] for item in [*sparse_hits, *dense_hits, *fused_candidates]],
+        chunk_ids=[
+            item["chunk_id"]
+            for item in [
+                *sparse_hits,
+                *dense_hits,
+                *fused_candidates,
+                *[candidate for hits in all_source_hits.values() for candidate in hits],
+            ]
+        ],
     )
     if exact_terms_for_boost:
         fused_candidates = _boost_exact_match_candidates(query, candidates=fused_candidates, record_map=record_map)[:fusion_limit]
@@ -1138,7 +1554,7 @@ def _search_chunks(
     if fused_candidates:
         try:
             reranked_candidates = _apply_reranking(
-                query,
+                query_plan.rerank_query,
                 fused_candidates=fused_candidates,
                 record_map=record_map,
                 limit=max(settings.rag_rerank_top_n, limit),
@@ -1153,6 +1569,8 @@ def _search_chunks(
     if trace is not None:
         trace.update(
             {
+                "query_plan": _serialize_query_plan(query_plan),
+                "variant_candidates": _serialize_variant_traces(variant_traces, record_map=record_map),
                 "sparse_candidates": _serialize_ranked_trace_candidates(sparse_hits, record_map),
                 "dense_candidates": _serialize_ranked_trace_candidates(dense_hits, record_map),
                 "fused_candidates": _serialize_ranked_trace_candidates(fused_candidates, record_map),
@@ -1161,6 +1579,8 @@ def _search_chunks(
                 "exact_match_terms": exact_terms,
                 "exact_match_terms_applied": exact_terms_for_boost,
                 "exact_match_heavy": exact_match_heavy,
+                "generation_instruction": query_plan.generation_instruction,
+                "rerank_query": query_plan.rerank_query,
                 "sparse_limit": sparse_limit,
                 "dense_limit": dense_limit,
                 "fusion_limit": fusion_limit,
@@ -1281,14 +1701,18 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
     retrieval_trace = {
         "original_user_query": message,
         "retrieval_query": retrieval_query,
+        "query_plan": retrieval_debug.get("query_plan"),
         "retrieval_backend": retrieval_debug.get("retrieval_backend", "unknown"),
         "first_pass_candidates": _serialize_trace_candidates(retrieval_candidates),
+        "variant_candidates": retrieval_debug.get("variant_candidates", {}),
         "sparse_candidates": retrieval_debug.get("sparse_candidates", []),
         "dense_candidates": retrieval_debug.get("dense_candidates", []),
         "fused_candidates": retrieval_debug.get("fused_candidates", []),
         "reranked_candidates": retrieval_debug.get("reranked_candidates", []),
         "selected_citations": citations,
         "answer_mode": "knowledge_base" if citations else "fallback_general",
+        "generation_instruction": retrieval_debug.get("generation_instruction"),
+        "rerank_query": retrieval_debug.get("rerank_query"),
         "search_ms": round((time.perf_counter() - started_at) * 1000, 2),
     }
 
@@ -1311,6 +1735,7 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
                     "role": "user",
                     "content": (
                         f"用户问题：{message}\n\n"
+                        f"回答要求：{retrieval_debug.get('generation_instruction') or '请用中文回答，保留关键英文术语原文，并引用英文证据。'}\n"
                         "请尽量只依据下面的知识库证据回答，并保持简洁。\n"
                         "如果证据仍然不足，请直接说明“知识库中未找到确切依据”。\n\n"
                         f"{evidence_text}"
