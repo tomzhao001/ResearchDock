@@ -192,6 +192,115 @@ npx n8n
 
 ---
 
+## 使用 ACR 构建、推送与部署
+
+适合将 `frontend` 与 `backend` 镜像推送到 Azure Container Registry（ACR），再在服务器上拉取并部署。相关脚本已放在 `scripts/` 目录中：
+
+- `scripts/build-and-push-acr.sh`
+- `scripts/build-and-push-acr.ps1`
+- `scripts/deploy-from-acr.sh`
+
+### 1. 配置 ACR 环境变量
+
+先复制环境变量模板：
+
+```bash
+cp .env.example .env
+```
+
+在 `.env` 中至少补齐以下配置：
+
+```env
+ACR_REGISTRY=your-registry.azurecr.io
+IMAGE_NAMESPACE=researchdock
+IMAGE_TAG=latest
+```
+
+可选但常用的前端构建参数：
+
+```env
+NEXT_PUBLIC_API_URL=http://your-api-domain-or-ip:8000
+NEXT_PUBLIC_N8N_URL=http://your-n8n-domain-or-ip:5678
+```
+
+### 2. 构建并推送到 ACR
+
+请先自行完成 ACR 登录，例如：
+
+```bash
+docker login your-registry.azurecr.io
+```
+
+**Bash / zsh：**
+
+```bash
+bash scripts/build-and-push-acr.sh
+```
+
+**PowerShell（Windows）：**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-and-push-acr.ps1
+```
+
+如需指定其他环境文件或镜像 tag，也可以在执行前覆盖环境变量：
+
+```bash
+ENV_FILE=.env.prod IMAGE_TAG=v1.0.0 bash scripts/build-and-push-acr.sh
+```
+
+```powershell
+$env:ENV_FILE = ".env.prod"
+$env:IMAGE_TAG = "v1.0.0"
+powershell -ExecutionPolicy Bypass -File .\scripts\build-and-push-acr.ps1
+```
+
+### 3. 服务器上从 ACR 拉取并部署
+
+部署脚本会复用当前仓库中的 `docker-compose.yml`，但将 `backend`、`celery-worker`、`frontend` 切换为 ACR 镜像，其余服务仍按 compose 配置启动。
+
+同样请先在服务器上自行完成：
+
+```bash
+docker login your-registry.azurecr.io
+```
+
+服务器上执行：
+
+```bash
+cp .env.example .env
+```
+
+填写好服务器自己的 `.env` 后运行：
+
+```bash
+bash scripts/deploy-from-acr.sh
+```
+
+如需指定其他环境文件、compose 文件或镜像 tag：
+
+```bash
+ENV_FILE=.env.prod COMPOSE_FILE=docker-compose.yml IMAGE_TAG=v1.0.0 bash scripts/deploy-from-acr.sh
+```
+
+部署完成后可用以下命令检查：
+
+```bash
+docker compose ps
+docker compose logs -f backend
+docker compose logs -f frontend
+```
+
+说明：
+
+- 构建脚本会分别构建并推送 `backend`、`frontend` 两个镜像。
+- 镜像命名规则为 `ACR_REGISTRY/IMAGE_NAMESPACE/backend:IMAGE_TAG` 和 `ACR_REGISTRY/IMAGE_NAMESPACE/frontend:IMAGE_TAG`。
+- 部署脚本会自动执行 `docker compose pull`、`docker compose up -d`。
+- `celery-worker` 会复用 `backend` 的同一镜像。
+- 如果服务器上的仓库路径不是默认位置，可通过 `ENV_FILE` 与 `COMPOSE_FILE` 指向对应文件。
+
+---
+
 ## 初始账号（仅数据库种子，不可注册）
 
 - **用户名**：`admin`
