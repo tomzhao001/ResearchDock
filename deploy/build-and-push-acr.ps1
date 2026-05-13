@@ -69,8 +69,6 @@ $acrRegistry = Require-Env "ACR_REGISTRY"
 $imageNamespace = Require-Env "IMAGE_NAMESPACE"
 
 $imageTag = if ($env:IMAGE_TAG) { $env:IMAGE_TAG } else { "latest" }
-$nextPublicApiUrl = if ($env:NEXT_PUBLIC_API_URL) { $env:NEXT_PUBLIC_API_URL } else { "http://localhost:8000" }
-$nextPublicN8nUrl = if ($env:NEXT_PUBLIC_N8N_URL) { $env:NEXT_PUBLIC_N8N_URL } else { "http://localhost:5678" }
 
 $backendImage = "$acrRegistry/$imageNamespace/backend`:$imageTag"
 $frontendImage = "$acrRegistry/$imageNamespace/frontend`:$imageTag"
@@ -79,11 +77,7 @@ Write-Host "Building $backendImage"
 docker build -t $backendImage (Join-Path $RepoRoot "backend")
 
 Write-Host "Building $frontendImage"
-docker build `
-    --build-arg "NEXT_PUBLIC_API_URL=$nextPublicApiUrl" `
-    --build-arg "NEXT_PUBLIC_N8N_URL=$nextPublicN8nUrl" `
-    -t $frontendImage `
-    (Join-Path $RepoRoot "frontend")
+docker build -t $frontendImage (Join-Path $RepoRoot "frontend")
 
 Write-Host "Pushing $backendImage"
 docker push $backendImage

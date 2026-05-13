@@ -50,8 +50,6 @@ require_env "ACR_REGISTRY"
 require_env "IMAGE_NAMESPACE"
 
 IMAGE_TAG="${IMAGE_TAG:-latest}"
-NEXT_PUBLIC_API_URL="${NEXT_PUBLIC_API_URL:-http://localhost:8000}"
-NEXT_PUBLIC_N8N_URL="${NEXT_PUBLIC_N8N_URL:-http://localhost:5678}"
 
 BACKEND_IMAGE="${ACR_REGISTRY}/${IMAGE_NAMESPACE}/backend:${IMAGE_TAG}"
 FRONTEND_IMAGE="${ACR_REGISTRY}/${IMAGE_NAMESPACE}/frontend:${IMAGE_TAG}"
@@ -60,11 +58,7 @@ echo "Building ${BACKEND_IMAGE}"
 docker build -t "$BACKEND_IMAGE" "$REPO_ROOT/backend"
 
 echo "Building ${FRONTEND_IMAGE}"
-docker build \
-  --build-arg "NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}" \
-  --build-arg "NEXT_PUBLIC_N8N_URL=${NEXT_PUBLIC_N8N_URL}" \
-  -t "$FRONTEND_IMAGE" \
-  "$REPO_ROOT/frontend"
+docker build -t "$FRONTEND_IMAGE" "$REPO_ROOT/frontend"
 
 echo "Pushing ${BACKEND_IMAGE}"
 docker push "$BACKEND_IMAGE"

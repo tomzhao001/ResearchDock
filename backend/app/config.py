@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Self
 
-from pydantic import model_validator
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine.url import URL
 
@@ -49,7 +49,10 @@ class Settings(BaseSettings):
     app_secret_key: str = "change_me"
     jwt_algorithm: str = "HS256"
     jwt_expire_hours: int = 24
-    frontend_origin: str = "http://localhost:3000"
+    public_origin: str = Field(
+        default="http://localhost:3000",
+        validation_alias=AliasChoices("PUBLIC_ORIGIN", "FRONTEND_ORIGIN"),
+    )
     cookie_name: str = "rd_access_token"
     cookie_secure: bool = False  # set COOKIE_SECURE=true behind HTTPS in production
     file_storage_path: Path = _REPO_ROOT / "data" / "files"

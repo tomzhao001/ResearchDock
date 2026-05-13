@@ -35,7 +35,6 @@
   - **本机已安装 PostgreSQL + pgvector**：自行创建库 `paper_archive` 与用户，并手动执行：
     ```bash
     psql -h 127.0.0.1 -p 5432 -U paper_user -d paper_archive -f db/init/01_schema.sql
-    psql -h 127.0.0.1 -p 5432 -U paper_user -d paper_archive -f db/init/02_seed.sql
     ```
     （端口与账号请与本地实例一致。）
 3. **数据库连接分项**：根目录 `.env` 中与库相关的项为 `POSTGRES_USER`、`POSTGRES_PASSWORD`、`POSTGRES_DB`、`POSTGRES_PORT`、`POSTGRES_HOST`；后端启动时会自动拼成 `DATABASE_URL`。在宿主机上跑 **uvicorn** 时请保持 **`POSTGRES_HOST=127.0.0.1`**（或本机 IP），**不要使用主机名 `db`**（`db` 只在 Compose 内部可解析）。若修改了 **`POSTGRES_PORT`**（例如 `5433`），无需再改别处。若仍需整串覆盖，可设置可选环境变量 **`DATABASE_URL`**。
@@ -53,7 +52,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 # 若根目录无 .env，可再导出：
 export APP_SECRET_KEY=dev-secret
-export FRONTEND_ORIGIN=http://localhost:3000
+export PUBLIC_ORIGIN=http://localhost:3000
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
@@ -65,7 +64,7 @@ conda create -n researchdock python=3.12 -y
 conda activate researchdock
 pip install -r requirements.txt
 $env:APP_SECRET_KEY = "dev-secret"
-$env:FRONTEND_ORIGIN = "http://localhost:3000"
+$env:PUBLIC_ORIGIN = "http://localhost:3000"
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
@@ -132,7 +131,6 @@ celery -A app.celery_app.celery_app worker --loglevel=info
 cd frontend
 npm install
 export NEXT_PUBLIC_API_URL=http://localhost:8000
-export NEXT_PUBLIC_N8N_URL=http://localhost:5678
 npm run dev
 ```
 
@@ -142,7 +140,6 @@ npm run dev
 cd frontend
 npm install
 $env:NEXT_PUBLIC_API_URL = "http://localhost:8000"
-$env:NEXT_PUBLIC_N8N_URL = "http://localhost:5678"
 npm run dev
 ```
 
@@ -155,18 +152,16 @@ npm run dev
 **Bash / zsh：**
 
 ```bash
-export N8N_PORT=5678
 npx n8n
 ```
 
 **PowerShell：**
 
 ```powershell
-$env:N8N_PORT = "5678"
 npx n8n
 ```
 
-浏览器打开 [http://localhost:5678](http://localhost:5678)。
+浏览器默认打开 [http://localhost:5678](http://localhost:5678)。
 
 ---
 
@@ -181,24 +176,26 @@ npx n8n
    docker compose up -d --build
   ```
    需要直接在终端看全部容器日志时，去掉 `-d`：
-3. 验收访问：
+3. 验收访问（Compose 内 `nginx` 仅监听宿主机本机回环地址，由服务器外部 `nginx` 统一接管 HTTPS 与域名入口）：
 
   | 入口     | URL                                                          | 说明                    |
   | ------ | ------------------------------------------------------------ | --------------------- |
-  | 前端     | [http://localhost:3000](http://localhost:3000)               | 登录后进入首页               |
-  | 后端健康检查 | [http://localhost:8000/health](http://localhost:8000/health) | 应返回 `{"status":"ok"}` |
-  | n8n    | [http://localhost:5678](http://localhost:5678)               | 首次打开按向导初始化            |
+  | 前端     | [https://your-domain](https://your-domain)                   | 由服务器外部 `nginx` 转发到 Compose 内 `nginx` |
+  | 后端健康检查 | [https://your-domain/health](https://your-domain/health)     | 由外部 `nginx` 转发，返回 `{"status":"ok"}` |
+  | n8n    | [https://your-domain/n8n/](https://your-domain/n8n/)         | 由外部 `nginx` 转发，首次打开按向导初始化 |
 
 
 ---
 
 ## 使用 ACR 构建、推送与部署
 
-适合将 `frontend` 与 `backend` 镜像推送到 Azure Container Registry（ACR），再在服务器上拉取并部署。相关脚本已放在 `scripts/` 目录中：
+适合将 `frontend` 与 `backend` 镜像推送到 Azure Container Registry（ACR），再在服务器上拉取并部署。部署相关文件统一放在 `deploy/` 目录中：
 
-- `scripts/build-and-push-acr.sh`
-- `scripts/build-and-push-acr.ps1`
-- `scripts/deploy-from-acr.sh`
+- `deploy/build-and-push-acr.sh`
+- `deploy/build-and-push-acr.ps1`
+- `deploy/deploy-from-acr.sh`
+- `deploy/nginx/default.conf`
+- `deploy/nginx/external-site.conf.example`
 
 ### 1. 配置 ACR 环境变量
 
@@ -216,12 +213,11 @@ IMAGE_NAMESPACE=researchdock
 IMAGE_TAG=latest
 ```
 
-可选但常用的前端构建参数：
+若走远程部署，请额外在服务器本机 `nginx` 中配置域名入口。仓库已提供可直接复制的模板：
 
-```env
-NEXT_PUBLIC_API_URL=http://your-api-domain-or-ip:8000
-NEXT_PUBLIC_N8N_URL=http://your-n8n-domain-or-ip:5678
-```
+- `deploy/nginx/external-site.conf.example`
+
+将其中的域名、证书路径和本机回源端口改成你的实际值即可。
 
 ### 2. 构建并推送到 ACR
 
@@ -234,30 +230,30 @@ docker login your-registry.azurecr.io
 **Bash / zsh：**
 
 ```bash
-bash scripts/build-and-push-acr.sh
+bash deploy/build-and-push-acr.sh
 ```
 
 **PowerShell（Windows）：**
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\build-and-push-acr.ps1
+powershell -ExecutionPolicy Bypass -File .\deploy\build-and-push-acr.ps1
 ```
 
 如需指定其他环境文件或镜像 tag，也可以在执行前覆盖环境变量：
 
 ```bash
-ENV_FILE=.env.prod IMAGE_TAG=v1.0.0 bash scripts/build-and-push-acr.sh
+ENV_FILE=.env.prod IMAGE_TAG=v1.0.0 bash deploy/build-and-push-acr.sh
 ```
 
 ```powershell
 $env:ENV_FILE = ".env.prod"
 $env:IMAGE_TAG = "v1.0.0"
-powershell -ExecutionPolicy Bypass -File .\scripts\build-and-push-acr.ps1
+powershell -ExecutionPolicy Bypass -File .\deploy\build-and-push-acr.ps1
 ```
 
 ### 3. 服务器上从 ACR 拉取并部署
 
-部署脚本会复用当前仓库中的 `docker-compose.yml`，但将 `backend`、`celery-worker`、`frontend` 切换为 ACR 镜像，其余服务仍按 compose 配置启动。
+部署脚本会复用当前仓库中的 `docker-compose.yml`，但将 `backend`、`celery-worker`、`frontend` 切换为 ACR 镜像；Compose 内部仍通过 `nginx` 汇总前端、后端与 `/n8n/`，而 HTTPS 与域名入口交给服务器本机 `nginx`。
 
 同样请先在服务器上自行完成：
 
@@ -274,13 +270,23 @@ cp .env.example .env
 填写好服务器自己的 `.env` 后运行：
 
 ```bash
-bash scripts/deploy-from-acr.sh
+bash deploy/deploy-from-acr.sh all
+```
+
+如果只想更新代码相关服务（`backend` / `frontend` / `celery-worker`，并在完成后重启内部 `nginx`）：
+
+```bash
+bash deploy/deploy-from-acr.sh app
 ```
 
 如需指定其他环境文件、compose 文件或镜像 tag：
 
 ```bash
-ENV_FILE=.env.prod COMPOSE_FILE=docker-compose.yml IMAGE_TAG=v1.0.0 bash scripts/deploy-from-acr.sh
+ENV_FILE=.env.prod COMPOSE_FILE=docker-compose.yml IMAGE_TAG=v1.0.0 bash deploy/deploy-from-acr.sh all
+```
+
+```bash
+ENV_FILE=.env.prod COMPOSE_FILE=docker-compose.yml IMAGE_TAG=v1.0.0 bash deploy/deploy-from-acr.sh app
 ```
 
 部署完成后可用以下命令检查：
@@ -295,8 +301,11 @@ docker compose logs -f frontend
 
 - 构建脚本会分别构建并推送 `backend`、`frontend` 两个镜像。
 - 镜像命名规则为 `ACR_REGISTRY/IMAGE_NAMESPACE/backend:IMAGE_TAG` 和 `ACR_REGISTRY/IMAGE_NAMESPACE/frontend:IMAGE_TAG`。
-- 部署脚本会自动执行 `docker compose pull`、`docker compose up -d`。
+- 部署脚本支持两种模式：`all` 为全量重部署整套 Compose，`app` 为仅重部署应用相关服务。
+- 部署脚本会自动执行 `docker compose pull`、`docker compose up -d --force-recreate`，并在完成后额外重启一次 Compose 内 `nginx`。
 - `celery-worker` 会复用 `backend` 的同一镜像。
+- Compose 内 `nginx` 统一代理前端页面、`/api/*`、`/api/ws/*`、`/health` 与 `/n8n/`，默认仅监听 `127.0.0.1:${FRONTEND_PORT}`。
+- 服务器本机 `nginx` 负责监听 `80/443`、配置 SSL 证书，并反向代理到 `http://127.0.0.1:${FRONTEND_PORT}`。
 - 如果服务器上的仓库路径不是默认位置，可通过 `ENV_FILE` 与 `COMPOSE_FILE` 指向对应文件。
 
 ---
@@ -308,7 +317,7 @@ docker compose logs -f frontend
 
 请在生产环境修改密码或删除种子脚本后自行维护用户数据。
 
-种子在首次创建数据库卷时由 `db/init/02_seed.sql` 写入；若需重新初始化，请删除对应的 Docker 数据卷后重新 `docker compose up`。
+初始表结构与默认 `admin` 种子都在 `db/init/01_schema.sql` 中；若需重新初始化，请删除对应的 Docker 数据卷后重新 `docker compose up`。
 
 ---
 
@@ -329,6 +338,7 @@ docker compose logs -f frontend
 ├── backend/           # FastAPI：认证、论文上传/列表/详情、任务、对话
 ├── frontend/          # Next.js：登录页、论文工作台、通用对话、任务查看
 ├── db/init/           # PostgreSQL 初始化 SQL（表结构 + admin 种子）
+├── deploy/            # 构建/部署脚本与 nginx 配置
 ├── docker-compose.yml
 └── .env.example
 ```
@@ -341,9 +351,10 @@ docker compose logs -f frontend
 
 - `POSTGRES_*`：`POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` / **`POSTGRES_PORT`** / **`POSTGRES_HOST`**（本机后端用 `127.0.0.1`，Compose 内后台服务由编排注入 **`POSTGRES_HOST=db`**），后端会自动拼接连接串。**可选** `DATABASE_URL`：设置且非空时覆盖拼接结果。
 - `POSTGRES_PORT`：数据库容器映射到主机的端口，便于本机 `psql` 与本地 uvicorn 使用 `127.0.0.1`（或 `POSTGRES_HOST`）连接。
-- `NEXT_PUBLIC_API_URL`：浏览器访问后端的地址（默认 `http://localhost:8000`）。
-- `NEXT_PUBLIC_N8N_URL`：前端「打开 n8n」链接（默认 `http://localhost:5678`）。
-- `FRONTEND_ORIGIN`：后端 CORS 允许的前端源（默认 `http://localhost:3000`）。
+- `PUBLIC_ORIGIN`：浏览器访问系统的公开地址；后端 CORS 与 Compose 下的 API 同源访问都基于它。远程部署建议使用 `https://your-domain`。
+- `FRONTEND_PORT`：Compose 内 `nginx` 映射到宿主机本机回环地址的 HTTP 端口；推荐设为 `8080`，再由服务器本机 `nginx` 反向代理到 `http://127.0.0.1:FRONTEND_PORT`。
+- `PUBLIC_ORIGIN/n8n/`：Compose 部署下 n8n 的公开访问地址，由 `nginx` 反向代理到容器内部的 `5678` 端口。
+- `deploy/nginx/external-site.conf.example`：服务器本机 `nginx` 的站点模板，负责 SSL 终止并转发到本机 `FRONTEND_PORT`。
 - `APP_SECRET_KEY`：JWT 签名密钥，生产环境务必更换。
 - `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL`：首页通用对话与论文摘要生成使用的 OpenAI 兼容接口配置。
 - `OPENAI_TIMEOUT_SECONDS` / `OPENAI_VERIFY_SSL`：控制聊天与摘要请求的超时和证书校验。

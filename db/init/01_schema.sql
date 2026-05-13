@@ -1,4 +1,5 @@
--- ResearchDock MVP schema (Milestone 4)
+-- ResearchDock bootstrap schema for fresh database initialization
+-- Includes the current schema and initial admin seed data.
 -- Requires PostgreSQL with pgvector (e.g. pgvector/pgvector image)
 
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -137,3 +138,12 @@ CREATE TABLE jobs (
     finished_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Initial admin user (password: 123456) — bcrypt hash generated at project setup
+INSERT INTO users (username, password_hash, is_active)
+VALUES (
+    'admin',
+    '$2b$12$FWCFMmz/kramxYvmhhW8e.Icx3D/TOEeoknZAffydgnEai/G6OEny',
+    TRUE
+)
+ON CONFLICT (username) DO NOTHING;

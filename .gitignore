@@ -156,6 +156,11 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+deploy/nginx/certs/*.pem
+deploy/nginx/certs/*.key
+deploy/nginx/certs/*.crt
+deploy/nginx/certs/*.cer
+!deploy/nginx/certs/.gitkeep
 
 # Spyder project settings
 .spyderproject
