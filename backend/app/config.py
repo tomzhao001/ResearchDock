@@ -61,6 +61,9 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
     llm_provider: str = "auto"
+    # Chat completion（对话、论文摘要等）单独超时；嵌入/轻量请求仍用 OPENAI_TIMEOUT_SECONDS / GLM_TIMEOUT_SECONDS
+    llm_chat_timeout_seconds: int = 300
+    llm_chat_max_retries: int = 2
     openai_embedding_model: str = "text-embedding-3-small"
     embedding_provider: str = "auto"
     openai_timeout_seconds: int = 120

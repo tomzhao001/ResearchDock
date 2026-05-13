@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -118,14 +119,21 @@ def _extract_json_object(content: str) -> dict:
         return json.loads(text[start : end + 1])
 
 
+def _httpx_timeout(read_write_seconds: int) -> httpx.Timeout:
+    """读/写阶段可较长（生成摘要慢），连接与连接池不宜拖到与读相同。"""
+    s = max(float(read_write_seconds), 1.0)
+    return httpx.Timeout(30.0, connect=30.0, read=s, write=s, pool=60.0)
+
+
 def _post_json(
     url: str,
     *,
     api_key: str,
     payload: dict,
-    timeout: int,
+    timeout: int | httpx.Timeout,
     verify_ssl: bool,
 ) -> dict:
+    timeout_val = timeout if isinstance(timeout, httpx.Timeout) else _httpx_timeout(timeout)
     response = httpx.post(
         url,
         headers={
@@ -133,7 +141,7 @@ def _post_json(
             "Content-Type": "application/json",
         },
         json=payload,
-        timeout=timeout,
+        timeout=timeout_val,
         verify=verify_ssl,
     )
     response.raise_for_status()
@@ -146,36 +154,52 @@ def _request_chat_completion(
     temperature: float = 0.3,
 ) -> tuple[str, str | None]:
     provider = _get_llm_provider()
+    chat_timeout = max(int(settings.llm_chat_timeout_seconds), 1)
+    retries = max(int(settings.llm_chat_max_retries), 0)
     if provider == "glm":
         if not settings.glm_api_key.strip():
             raise RuntimeError("GLM_API_KEY is not configured")
         model_name = (settings.glm_model or "").strip() or settings.openai_model
-        payload = _post_json(
-            _build_chat_completions_url(settings.glm_base_url),
-            api_key=settings.glm_api_key,
-            payload={
-                "model": model_name,
-                "messages": list(messages),
-                "temperature": temperature,
-            },
-            timeout=settings.glm_timeout_seconds,
-            verify_ssl=settings.glm_verify_ssl,
-        )
+        for attempt in range(retries + 1):
+            try:
+                payload = _post_json(
+                    _build_chat_completions_url(settings.glm_base_url),
+                    api_key=settings.glm_api_key,
+                    payload={
+                        "model": model_name,
+                        "messages": list(messages),
+                        "temperature": temperature,
+                    },
+                    timeout=chat_timeout,
+                    verify_ssl=settings.glm_verify_ssl,
+                )
+                break
+            except httpx.TimeoutException:
+                if attempt >= retries:
+                    raise
+                time.sleep(1.0 * (attempt + 1))
     else:
         if not settings.openai_api_key.strip():
             raise RuntimeError("OPENAI_API_KEY is not configured")
         model_name = settings.openai_model
-        payload = _post_json(
-            _build_chat_completions_url(settings.openai_base_url),
-            api_key=settings.openai_api_key,
-            payload={
-                "model": model_name,
-                "messages": list(messages),
-                "temperature": temperature,
-            },
-            timeout=settings.openai_timeout_seconds,
-            verify_ssl=settings.openai_verify_ssl,
-        )
+        for attempt in range(retries + 1):
+            try:
+                payload = _post_json(
+                    _build_chat_completions_url(settings.openai_base_url),
+                    api_key=settings.openai_api_key,
+                    payload={
+                        "model": model_name,
+                        "messages": list(messages),
+                        "temperature": temperature,
+                    },
+                    timeout=chat_timeout,
+                    verify_ssl=settings.openai_verify_ssl,
+                )
+                break
+            except httpx.TimeoutException:
+                if attempt >= retries:
+                    raise
+                time.sleep(1.0 * (attempt + 1))
     choices = payload.get("choices") or []
     message = choices[0].get("message") if choices else None
     content = message.get("content") if isinstance(message, dict) else None
