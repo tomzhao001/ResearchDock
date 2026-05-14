@@ -119,4 +119,12 @@ FROM organizations o
 WHERE o.slug = 'default'
   AND u.username = 'admin';
 
+CREATE TABLE IF NOT EXISTS alembic_version (
+    version_num VARCHAR(32) NOT NULL PRIMARY KEY
+);
+
+INSERT INTO alembic_version (version_num)
+VALUES ('20260514_01')
+ON CONFLICT (version_num) DO NOTHING;
+
 COMMIT;

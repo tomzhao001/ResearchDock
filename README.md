@@ -31,12 +31,13 @@
   ```
 2. **数据库**任选其一：
   - **仅起数据库容器**（本机不单独装 PostgreSQL 时）：
-     `docker-compose.yml` 已将数据库端口映射到宿主机（默认 `POSTGRES_PORT=5432`，可在 `.env` 中修改）。首次启动会自动执行 `db/init/` 下的建表与种子数据。
+     `docker-compose.yml` 已将数据库端口映射到宿主机（默认 `POSTGRES_PORT=5432`，可在 `.env` 中修改）。首次启动会自动执行 `db/init/` 下的建表、种子数据与 Alembic 基线版本写入。
   - **本机已安装 PostgreSQL + pgvector**：自行创建库 `paper_archive` 与用户，并手动执行：
+    创建一个**空库**即可；后端启动时会自动执行 Alembic `upgrade head`，完成建表、默认组织与 `admin` 种子写入。若你接的是一个**已有表但尚未纳入 Alembic 管理**的旧库，首次启动会拒绝自动迁移，此时请在 `backend` 目录执行：
     ```bash
-    psql -h 127.0.0.1 -p 5432 -U paper_user -d paper_archive -f db/init/01_schema.sql
+    alembic stamp head
     ```
-    （端口与账号请与本地实例一致。）
+    若确认旧库已经与当前 schema 对齐，也可临时设置 `DB_AUTO_STAMP_EXISTING_SCHEMA=true` 后启动一次，由后端自动补写版本表。
 3. **数据库连接分项**：根目录 `.env` 中与库相关的项为 `POSTGRES_USER`、`POSTGRES_PASSWORD`、`POSTGRES_DB`、`POSTGRES_PORT`、`POSTGRES_HOST`；后端启动时会自动拼成 `DATABASE_URL`。在宿主机上跑 **uvicorn** 时请保持 **`POSTGRES_HOST=127.0.0.1`**（或本机 IP），**不要使用主机名 `db`**（`db` 只在 Compose 内部可解析）。若修改了 **`POSTGRES_PORT`**（例如 `5433`），无需再改别处。若仍需整串覆盖，可设置可选环境变量 **`DATABASE_URL`**。
 
 ### 2. 启动后端（FastAPI）
@@ -69,6 +70,8 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 若提示无法 `conda activate`，可先执行 `conda init powershell` 后**重新打开**终端；环境 `researchdock` 只需创建一次，之后直接进入 `backend` 执行 `conda activate researchdock` 即可。
+
+后端默认会在启动时自动同步数据库到最新 Alembic revision。若你需要在测试、排障或只读环境里关闭它，可设置 `DB_AUTO_MIGRATE_ON_STARTUP=false`。
 
 健康检查：[http://localhost:8000/health](http://localhost:8000/health)
 
@@ -340,7 +343,7 @@ docker compose logs -f frontend
 
 请在生产环境修改密码或删除种子脚本后自行维护用户数据。
 
-初始表结构与默认 `admin` 种子都在 `db/init/01_schema.sql` 中；若需重新初始化，请删除对应的 Docker 数据卷后重新 `docker compose up`。
+初始表结构与默认 `admin` 种子由 Alembic 基线 revision 和 `db/init/01_schema.sql` 共同维护：前者用于应用启动自动升级，后者用于 Docker 首次初始化时的快速 bootstrap。若需重新初始化，请删除对应的 Docker 数据卷后重新 `docker compose up`。
 
 ---
 

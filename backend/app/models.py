@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import JSON, BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import JSON, BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, desc, false, func, true
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column
 from pgvector.sqlalchemy import Vector
@@ -20,7 +20,7 @@ class Organization(Base):
     id: Mapped[int] = mapped_column(bigint_sqlite, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     slug: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
-    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=true())
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -51,6 +51,29 @@ class OrganizationSettings(Base):
     )
 
 
+class AppSettings(Base):
+    __tablename__ = "app_settings"
+
+    id: Mapped[int] = mapped_column(bigint_sqlite, primary_key=True, autoincrement=True)
+    openai_base_url: Mapped[str | None] = mapped_column(Text)
+    openai_api_key_encrypted: Mapped[str | None] = mapped_column(Text)
+    chat_model: Mapped[str | None] = mapped_column(String(255))
+    embedding_model: Mapped[str | None] = mapped_column(String(255))
+    default_summary_language: Mapped[str | None] = mapped_column(String(32))
+    default_chunk_size: Mapped[int | None] = mapped_column(Integer)
+    default_chunk_overlap: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -58,10 +81,33 @@ class User(Base):
     organization_id: Mapped[int] = mapped_column(bigint_sqlite, ForeignKey("organizations.id"), nullable=False)
     username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
-    role: Mapped[str] = mapped_column(String(32), nullable=False, default="org_member")
-    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    role: Mapped[str] = mapped_column(String(32), nullable=False, default="org_member", server_default="org_member")
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=true())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class Source(Base):
+    __tablename__ = "sources"
+
+    id: Mapped[int] = mapped_column(bigint_sqlite, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    source_type: Mapped[str | None] = mapped_column(String(64))
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=true())
+    schedule_cron: Mapped[str | None] = mapped_column(String(128))
+    max_items_per_run: Mapped[int | None] = mapped_column(Integer)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
 
 
 class Paper(Base):
@@ -96,7 +142,7 @@ class PaperAsset(Base):
     __tablename__ = "paper_assets"
 
     id: Mapped[int] = mapped_column(bigint_sqlite, primary_key=True, autoincrement=True)
-    paper_id: Mapped[int] = mapped_column(bigint_sqlite, nullable=False)
+    paper_id: Mapped[int] = mapped_column(bigint_sqlite, ForeignKey("papers.id", ondelete="CASCADE"), nullable=False)
     asset_type: Mapped[str | None] = mapped_column(String(64))
     storage_path: Mapped[str | None] = mapped_column(Text)
     mime_type: Mapped[str | None] = mapped_column(String(128))
@@ -109,16 +155,37 @@ class PaperAsset(Base):
     )
 
 
+class PaperSummary(Base):
+    __tablename__ = "paper_summaries"
+
+    id: Mapped[int] = mapped_column(bigint_sqlite, primary_key=True, autoincrement=True)
+    paper_id: Mapped[int] = mapped_column(bigint_sqlite, ForeignKey("papers.id", ondelete="CASCADE"), nullable=False)
+    summary_language: Mapped[str | None] = mapped_column(String(32))
+    abstract_zh: Mapped[str | None] = mapped_column(Text)
+    summary_points: Mapped[list[dict] | None] = mapped_column(json_field)
+    research_problem: Mapped[str | None] = mapped_column(Text)
+    method: Mapped[str | None] = mapped_column(Text)
+    findings: Mapped[str | None] = mapped_column(Text)
+    limitations: Mapped[str | None] = mapped_column(Text)
+    model_name: Mapped[str | None] = mapped_column(String(255))
+    prompt_version: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
 class Job(Base):
     __tablename__ = "jobs"
 
     id: Mapped[int] = mapped_column(bigint_sqlite, primary_key=True, autoincrement=True)
     job_type: Mapped[str | None] = mapped_column(String(64))
-    source_id: Mapped[int | None] = mapped_column(bigint_sqlite)
-    paper_id: Mapped[int | None] = mapped_column(bigint_sqlite)
+    source_id: Mapped[int | None] = mapped_column(bigint_sqlite, ForeignKey("sources.id", ondelete="SET NULL"))
+    paper_id: Mapped[int | None] = mapped_column(bigint_sqlite, ForeignKey("papers.id", ondelete="SET NULL"))
     status: Mapped[str | None] = mapped_column(String(32))
     error_message: Mapped[str | None] = mapped_column(Text)
-    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
@@ -132,7 +199,7 @@ class PaperChunk(Base):
     __tablename__ = "paper_chunks"
 
     id: Mapped[int] = mapped_column(bigint_sqlite, primary_key=True, autoincrement=True)
-    paper_id: Mapped[int] = mapped_column(bigint_sqlite, nullable=False)
+    paper_id: Mapped[int] = mapped_column(bigint_sqlite, ForeignKey("papers.id", ondelete="CASCADE"), nullable=False)
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     embedding: Mapped[list[float] | None] = mapped_column(vector_field)
@@ -152,8 +219,8 @@ class ChatTopic(Base):
     __tablename__ = "chat_topics"
 
     id: Mapped[int] = mapped_column(bigint_sqlite, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(bigint_sqlite, nullable=False)
-    title: Mapped[str] = mapped_column(String(255), nullable=False, default="新话题")
+    user_id: Mapped[int] = mapped_column(bigint_sqlite, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False, default="新话题", server_default="新话题")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -170,12 +237,12 @@ class ChatMessage(Base):
     __tablename__ = "chat_messages"
 
     id: Mapped[int] = mapped_column(bigint_sqlite, primary_key=True, autoincrement=True)
-    topic_id: Mapped[int] = mapped_column(bigint_sqlite, nullable=False)
+    topic_id: Mapped[int] = mapped_column(bigint_sqlite, ForeignKey("chat_topics.id", ondelete="CASCADE"), nullable=False)
     role: Mapped[str] = mapped_column(String(32), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     model: Mapped[str | None] = mapped_column(String(255))
     answer_mode: Mapped[str | None] = mapped_column(String(32))
-    used_knowledge_base: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    used_knowledge_base: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
     citations_json: Mapped[list[dict] | None] = mapped_column(json_field)
     metadata_json: Mapped[dict | None] = mapped_column(json_field)
     created_at: Mapped[datetime] = mapped_column(
@@ -183,3 +250,17 @@ class ChatMessage(Base):
         nullable=False,
         server_default=func.now(),
     )
+
+
+Index("idx_paper_chunks_paper_id", PaperChunk.paper_id)
+Index("idx_paper_chunks_paper_chunk", PaperChunk.paper_id, PaperChunk.chunk_index)
+Index("idx_paper_chunks_search_vector", PaperChunk.search_vector, postgresql_using="gin")
+Index(
+    "idx_paper_chunks_embedding_cosine",
+    PaperChunk.embedding,
+    postgresql_using="ivfflat",
+    postgresql_ops={"embedding": "vector_cosine_ops"},
+    postgresql_with={"lists": 100},
+)
+Index("idx_chat_topics_user_updated_at", ChatTopic.user_id, desc(ChatTopic.updated_at))
+Index("idx_chat_messages_topic_created_at", ChatMessage.topic_id, ChatMessage.created_at)

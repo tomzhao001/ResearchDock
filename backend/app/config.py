@@ -60,6 +60,8 @@ class Settings(BaseSettings):
     celery_broker_url: str = ""
     celery_result_backend: str = ""
     celery_task_always_eager: bool = False
+    db_auto_migrate_on_startup: bool = True
+    db_auto_stamp_existing_schema: bool = False
     openai_base_url: str = "https://api.openai.com/v1"
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
