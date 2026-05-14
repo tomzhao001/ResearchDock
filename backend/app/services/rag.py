@@ -35,6 +35,13 @@ FALLBACK_SYSTEM_PROMPT = (
     "随后你可以基于通用知识给出简短补充，但必须避免伪造论文引用。"
 )
 
+
+def _preview_log_text(text: str, *, limit: int = 100) -> str:
+    compact = re.sub(r"\s+", " ", (text or "").strip())
+    if len(compact) <= limit:
+        return compact
+    return f"{compact[: limit - 3]}..."
+
 QUERY_PLAN_SYSTEM_PROMPT = (
     "你是跨语言学术检索规划器。"
     "请把用户问题转成适合英文论文检索的 JSON 计划。"
@@ -422,6 +429,12 @@ def _build_crosslingual_query_plan(query: str) -> RetrievalQueryPlan:
     if detected_language in {"zh", "mixed"}:
         rewrite_status = "fallback_only"
         if _llm_available_for_query_rewrite():
+            rewrite_started_at = time.perf_counter()
+            logger.info(
+                "RAG query rewrite started: language=%s query=%s",
+                detected_language,
+                _preview_log_text(original_query),
+            )
             try:
                 content, _ = chat_with_messages(
                     [
@@ -451,8 +464,22 @@ def _build_crosslingual_query_plan(query: str) -> RetrievalQueryPlan:
                 ) or generation_instruction
                 rewrite_status = "llm_rewritten"
                 used_llm = True
-            except Exception:
+                logger.info(
+                    "RAG query rewrite finished: language=%s status=%s retrieval_query_en=%s subqueries=%s elapsed=%.2fs",
+                    detected_language,
+                    rewrite_status,
+                    _preview_log_text(retrieval_query_en),
+                    len(subqueries_en),
+                    time.perf_counter() - rewrite_started_at,
+                )
+            except Exception as exc:
                 rewrite_status = "llm_failed_fallback"
+                logger.warning(
+                    "RAG query rewrite failed, falling back: language=%s error=%s elapsed=%.2fs",
+                    detected_language,
+                    exc,
+                    time.perf_counter() - rewrite_started_at,
+                )
         if not retrieval_query_en:
             english_terms = [term for term in exact_terms if re.search(r"[A-Za-z]", term)]
             retrieval_query_en = _normalize_query_text(" ".join(english_terms))
@@ -1815,8 +1842,20 @@ def _select_claim_supporting_evidence(
         evidence_candidates=evidence_candidates,
     )
     if not evidence_candidates or not _llm_available_for_grounding():
+        logger.info(
+            "RAG evidence selection skipped: candidates=%s method=%s question=%s",
+            len(evidence_candidates),
+            fallback.method,
+            _preview_log_text(question),
+        )
         return fallback
 
+    selection_started_at = time.perf_counter()
+    logger.info(
+        "RAG evidence selection started: candidates=%s question=%s",
+        len(evidence_candidates),
+        _preview_log_text(question),
+    )
     evidence_text = "\n\n".join(
         [
             (
@@ -1921,6 +1960,11 @@ def _select_claim_supporting_evidence(
             if len(selected) >= settings.rag_attribution_max_evidence:
                 break
         if not selected:
+            logger.warning(
+                "RAG evidence selection returned empty result, using heuristic fallback: candidates=%s elapsed=%.2fs",
+                len(evidence_candidates),
+                time.perf_counter() - selection_started_at,
+            )
             return _heuristic_select_claim_supporting_evidence(
                 question=question,
                 query_plan=query_plan,
@@ -1946,12 +1990,24 @@ def _select_claim_supporting_evidence(
             missing_information=missing_information,
             method="llm",
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "RAG evidence selection failed, using heuristic fallback: candidates=%s error=%s elapsed=%.2fs",
+            len(evidence_candidates),
+            exc,
+            time.perf_counter() - selection_started_at,
+        )
         return _heuristic_select_claim_supporting_evidence(
             question=question,
             query_plan=query_plan,
             evidence_candidates=evidence_candidates,
             reason_suffix="LLM 选择失败，已回退到启发式",
+        )
+    finally:
+        logger.info(
+            "RAG evidence selection finished: candidates=%s elapsed=%.2fs",
+            len(evidence_candidates),
+            time.perf_counter() - selection_started_at,
         )
 
 
@@ -2009,7 +2065,18 @@ def _verify_grounded_answer(
         selection_result=selection_result,
     )
     if not selected_evidence or not _llm_available_for_grounding():
+        logger.info(
+            "RAG grounding verifier skipped: evidence=%s method=%s",
+            len(selected_evidence),
+            fallback.get("method"),
+        )
         return fallback
+    verifier_started_at = time.perf_counter()
+    logger.info(
+        "RAG grounding verifier started: evidence=%s question=%s",
+        len(selected_evidence),
+        _preview_log_text(question),
+    )
     prompt = (
         "请检查最终答案是否被证据支持，并返回 JSON 对象，字段必须包含：\n"
         "- supported: boolean\n"
@@ -2041,8 +2108,19 @@ def _verify_grounded_answer(
             "unsupported_claims": [str(item) for item in (payload.get("unsupported_claims") or []) if str(item).strip()],
             "notes": str(payload.get("notes") or ""),
         }
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "RAG grounding verifier failed, using heuristic fallback: error=%s elapsed=%.2fs",
+            exc,
+            time.perf_counter() - verifier_started_at,
+        )
         return fallback
+    finally:
+        logger.info(
+            "RAG grounding verifier finished: evidence=%s elapsed=%.2fs",
+            len(selected_evidence),
+            time.perf_counter() - verifier_started_at,
+        )
 
 
 def _serialize_trace_candidates(results: list[RetrievalResult]) -> list[dict]:
@@ -2139,6 +2217,14 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
     retrieval_candidates = _search_chunks(db, query=retrieval_query, top_k=candidate_limit, trace=retrieval_debug)
     retrieval_results = retrieval_candidates[: settings.rag_top_k]
     evidence_candidates = _build_evidence_candidates(retrieval_results, query=message)
+    selection_started_at = time.perf_counter()
+    logger.info(
+        "RAG evidence candidate preparation finished: topic_id=%s retrieval_results=%s evidence_candidates=%s elapsed=%.2fs",
+        topic.id,
+        len(retrieval_results),
+        len(evidence_candidates),
+        time.perf_counter() - started_at,
+    )
     selection_result = _select_claim_supporting_evidence(
         question=message,
         query_plan=retrieval_debug.get("query_plan") if isinstance(retrieval_debug.get("query_plan"), dict) else {},
@@ -2180,6 +2266,7 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
         "generation_instruction": retrieval_debug.get("generation_instruction"),
         "rerank_query": retrieval_debug.get("rerank_query"),
         "search_ms": round((time.perf_counter() - started_at) * 1000, 2),
+        "evidence_selection_ms": round((time.perf_counter() - selection_started_at) * 1000, 2),
     }
 
     if selection_result.sufficiency_decision.get("is_sufficient") and selected_evidence:
@@ -2192,6 +2279,12 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
         )
         model: str | None = None
         try:
+            answer_started_at = time.perf_counter()
+            logger.info(
+                "RAG answer draft started: topic_id=%s evidence=%s",
+                topic.id,
+                len(selected_evidence),
+            )
             answer, model = chat_with_messages(
                 [
                     {"role": "system", "content": RAG_SYSTEM_PROMPT},
@@ -2210,6 +2303,12 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
                 ],
                 temperature=0.2,
             )
+            logger.info(
+                "RAG answer draft finished: topic_id=%s model=%s elapsed=%.2fs",
+                topic.id,
+                model,
+                time.perf_counter() - answer_started_at,
+            )
             verifier_result = _verify_grounded_answer(
                 question=message,
                 answer=answer,
@@ -2222,6 +2321,13 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
                 "知识库中未找到确切依据" in (answer or "")
                 or not verifier_result.get("supported")
                 or float(verifier_result.get("support_score") or 0.0) < settings.rag_attribution_verifier_min_support_score
+            )
+            logger.info(
+                "RAG verifier decision: topic_id=%s supported=%s support_score=%s use_abstain=%s",
+                topic.id,
+                verifier_result.get("supported"),
+                verifier_result.get("support_score"),
+                use_abstain_path,
             )
         except Exception as exc:
             logger.warning("RAG generation failed, falling back to abstain: topic_id=%s error=%s", topic.id, exc)

@@ -163,6 +163,29 @@ npx n8n
 
 浏览器默认打开 [http://localhost:5678](http://localhost:5678)。
 
+### 6. 运行 sample-data eval
+
+用于验证 sample 数据集上的 retrieval / e2e 表现。建议在 `backend` 目录运行，并先确认 `.env` 中数据库与模型接口配置可用。
+
+```bash
+cd backend
+python -m scripts.sample_data_eval --mode both --subset smoke
+```
+
+只跑单个问题时，可用 `--question-id` 指定题号；此时 `--timeout-seconds` 会生效，默认超时为 600 秒：
+
+```bash
+python -m scripts.sample_data_eval --mode e2e --subset smoke --question-id en_001
+python -m scripts.sample_data_eval --mode e2e --subset smoke --question-id zh_061 --timeout-seconds 300
+python -m scripts.sample_data_eval --mode retrieval --subset full --question-id cross_093 --timeout-seconds 180
+```
+
+说明：
+
+- `--question-id` 只会运行当前 `subset` 内的单个问题；若题号不在当前子集，会直接报错。
+- `--timeout-seconds` 仅在单题模式下生效；传 `0` 或负数表示不启用单题超时。
+- 若想把结果落盘，可继续配合 `--output path/to/report.json` 使用。
+
 ---
 
 ## 快速启动（Docker Compose，适合服务器发布）

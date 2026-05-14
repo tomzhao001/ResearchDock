@@ -793,10 +793,39 @@ def evaluate_end_to_end(
         )
         assistant = result.assistant_message
         citations = assistant.citations_json if isinstance(assistant.citations_json, list) else []
+        metadata = assistant.metadata_json if isinstance(assistant.metadata_json, dict) else {}
+        retrieval_metadata = metadata.get("retrieval") if isinstance(metadata.get("retrieval"), dict) else {}
+        selected_evidence = retrieval_metadata.get("selected_evidence") if isinstance(retrieval_metadata.get("selected_evidence"), list) else []
+        verifier_result = retrieval_metadata.get("verifier_result") if isinstance(retrieval_metadata.get("verifier_result"), dict) else {}
+        sufficiency_decision = (
+            retrieval_metadata.get("sufficiency_decision")
+            if isinstance(retrieval_metadata.get("sufficiency_decision"), dict)
+            else {}
+        )
+        selected_match_sets = [
+            _trace_candidate_match_indexes(candidate, resolved.gold_evidence_refs)
+            for candidate in selected_evidence
+            if isinstance(candidate, dict)
+        ]
+        matched_selected_indexes: set[int] = set().union(*selected_match_sets) if selected_match_sets else set()
+        evidence_selection_precision = (
+            sum(1 for match_set in selected_match_sets if match_set) / len(selected_match_sets)
+            if selected_match_sets
+            else (1.0 if resolved.question.expected_abstention else 0.0)
+        )
+        support_coverage = (
+            len(matched_selected_indexes) / len(resolved.gold_evidence_refs)
+            if resolved.gold_evidence_refs
+            else 1.0
+        )
         heuristic = _grade_heuristic(resolved, assistant.content, citations, assistant.answer_mode)
         llm_grade = _grade_with_llm(resolved, assistant.content, citations, heuristic) if judge_mode == "llm" else None
         grounded = bool(llm_grade["grounded"]) if llm_grade else bool(heuristic["grounded"])
         citation_precision = float(llm_grade["citation_precision"]) if llm_grade else float(heuristic["citation_precision"])
+        verifier_alignment = (
+            (not resolved.question.expected_abstention and bool(verifier_result.get("supported")))
+            or (resolved.question.expected_abstention and not bool(verifier_result.get("supported")))
+        ) if verifier_result else ((assistant.answer_mode != "knowledge_base") == resolved.question.expected_abstention)
         rows.append(
             {
                 "q_id": resolved.question.q_id,
@@ -808,12 +837,18 @@ def evaluate_end_to_end(
                 "expected_abstention": resolved.question.expected_abstention,
                 "answer": assistant.content,
                 "citations": citations,
-                "metadata": assistant.metadata_json if isinstance(assistant.metadata_json, dict) else {},
+                "selected_evidence": selected_evidence,
+                "metadata": metadata,
                 "grounded": grounded,
                 "citation_precision": round(citation_precision, 4),
+                "evidence_selection_precision": round(float(evidence_selection_precision), 4),
+                "support_coverage": round(float(support_coverage), 4),
+                "verifier_alignment": bool(verifier_alignment),
                 "abstention_accuracy": bool(heuristic["abstention_accuracy"]),
                 "keyword_hits": int(heuristic["keyword_hits"]),
                 "cited_gold": int(heuristic["cited_gold"]),
+                "verifier_result": verifier_result,
+                "sufficiency_decision": sufficiency_decision,
                 "judge_notes": llm_grade["notes"] if llm_grade else "heuristic",
             }
         )
@@ -843,6 +878,9 @@ def evaluate_end_to_end(
         "count": len(rows),
         "groundedness": round(_mean([1.0 if row["grounded"] else 0.0 for row in rows]), 4),
         "citation_precision": round(_mean([float(row["citation_precision"]) for row in rows]), 4),
+        "evidence_selection_precision": round(_mean([float(row["evidence_selection_precision"]) for row in rows]), 4),
+        "support_coverage": round(_mean([float(row["support_coverage"]) for row in rows]), 4),
+        "verifier_alignment": round(_mean([1.0 if row["verifier_alignment"] else 0.0 for row in rows]), 4),
         "abstention_accuracy": round(_mean([1.0 if row["abstention_accuracy"] else 0.0 for row in rows]), 4),
     }
     breakdown = {
@@ -851,6 +889,9 @@ def evaluate_end_to_end(
             key_fn=lambda row: row["category"],
             score_fns={
                 "groundedness": lambda row: 1.0 if row["grounded"] else 0.0,
+                "evidence_selection_precision": lambda row: float(row["evidence_selection_precision"]),
+                "support_coverage": lambda row: float(row["support_coverage"]),
+                "verifier_alignment": lambda row: 1.0 if row["verifier_alignment"] else 0.0,
                 "abstention_accuracy": lambda row: 1.0 if row["abstention_accuracy"] else 0.0,
             },
         ),
@@ -859,15 +900,19 @@ def evaluate_end_to_end(
             key_fn=lambda row: row["language"],
             score_fns={
                 "groundedness": lambda row: 1.0 if row["grounded"] else 0.0,
+                "evidence_selection_precision": lambda row: float(row["evidence_selection_precision"]),
+                "support_coverage": lambda row: float(row["support_coverage"]),
+                "verifier_alignment": lambda row: 1.0 if row["verifier_alignment"] else 0.0,
                 "abstention_accuracy": lambda row: 1.0 if row["abstention_accuracy"] else 0.0,
             },
         ),
     }
     logger.info(
-        "End-to-end evaluation finished: completed=%s groundedness=%.4f citation_precision=%.4f abstention_accuracy=%.4f",
+        "End-to-end evaluation finished: completed=%s groundedness=%.4f citation_precision=%.4f evidence_selection_precision=%.4f abstention_accuracy=%.4f",
         summary["count"],
         summary["groundedness"],
         summary["citation_precision"],
+        summary["evidence_selection_precision"],
         summary["abstention_accuracy"],
     )
     return {"summary": summary, "breakdown": breakdown, "questions": rows}
@@ -879,6 +924,7 @@ def run_sample_data_evaluation(
     mode: str = "both",
     subset: str = "full",
     judge_mode: str = "heuristic",
+    question_id: str | None = None,
     extractor: PDFTextExtractor | None = None,
     data_dir: Path | None = None,
 ) -> dict[str, Any]:
@@ -912,6 +958,26 @@ def run_sample_data_evaluation(
             ]
             sessions = [item for item in sessions if item.question_ids]
             logger.info("Applied smoke subset: questions=%s sessions=%s", len(questions), len(sessions))
+        if question_id is not None:
+            available_question_ids = {item.q_id for item in questions}
+            if question_id not in available_question_ids:
+                raise ValueError(f"Unknown question_id for current subset: {question_id}")
+            questions = [item for item in questions if item.q_id == question_id]
+            sessions = [
+                SampleSession(
+                    session_id=item.session_id,
+                    question_ids=tuple(q_id for q_id in item.question_ids if q_id == question_id),
+                )
+                for item in sessions
+                if question_id in item.question_ids
+            ]
+            sessions = [item for item in sessions if item.question_ids]
+            logger.info(
+                "Applied single-question filter: question_id=%s remaining_questions=%s sessions=%s",
+                question_id,
+                len(questions),
+                len(sessions),
+            )
         chunk_cache = _load_chunk_cache(db, papers_by_key)
         logger.info("Loaded chunk cache: papers=%s", len(chunk_cache))
         resolve_started_at = time.perf_counter()
@@ -926,6 +992,7 @@ def run_sample_data_evaluation(
             "mode": mode,
             "subset": subset,
             "judge_mode": judge_mode,
+            "question_id": question_id,
             "paper_ids": {key: paper.id for key, paper in papers_by_key.items()},
         }
         if mode in {"retrieval", "both"}:
