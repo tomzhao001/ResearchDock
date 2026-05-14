@@ -4,8 +4,8 @@ from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, st
 from redis.asyncio import Redis
 
 from app.database import SessionLocal
-from app.deps import get_token_from_websocket, resolve_current_user
-from app.services.task_events import TASK_STATUS_CHANNEL
+from app.deps import get_token_from_websocket, resolve_current_user_context
+from app.services.task_events import get_task_status_channel
 
 router = APIRouter(tags=["ws"])
 
@@ -14,7 +14,7 @@ router = APIRouter(tags=["ws"])
 async def task_status_stream(websocket: WebSocket):
     db = SessionLocal()
     try:
-        resolve_current_user(db, get_token_from_websocket(websocket))
+        context = resolve_current_user_context(db, get_token_from_websocket(websocket))
     except HTTPException:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
@@ -25,7 +25,8 @@ async def task_status_stream(websocket: WebSocket):
 
     redis = Redis.from_url(websocket.app.state.redis_url, decode_responses=True)
     pubsub = redis.pubsub()
-    await pubsub.subscribe(TASK_STATUS_CHANNEL)
+    channel = get_task_status_channel(context.organization.id)
+    await pubsub.subscribe(channel)
     try:
         while True:
             message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
@@ -35,6 +36,6 @@ async def task_status_stream(websocket: WebSocket):
     except (WebSocketDisconnect, RuntimeError):
         return
     finally:
-        await pubsub.unsubscribe(TASK_STATUS_CHANNEL)
+        await pubsub.unsubscribe(channel)
         await pubsub.aclose()
         await redis.aclose()

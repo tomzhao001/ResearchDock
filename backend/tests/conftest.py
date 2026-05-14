@@ -10,7 +10,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.auth import pwd_context
 from app.database import Base, get_db
 from app.main import app
-from app.models import User
+from app.models import Organization, User
+from app.permissions import ROLE_ORG_OWNER
 
 
 @pytest.fixture()
@@ -61,10 +62,47 @@ def db_session(session_factory: sessionmaker) -> Generator[Session, None, None]:
 
 
 @pytest.fixture()
-def user(db_session: Session) -> User:
+def organization(db_session: Session) -> Organization:
+    record = Organization(name="Test Org", slug="test-org", is_active=True)
+    db_session.add(record)
+    db_session.commit()
+    db_session.refresh(record)
+    return record
+
+
+@pytest.fixture()
+def second_organization(db_session: Session) -> Organization:
+    record = Organization(name="Other Org", slug="other-org", is_active=True)
+    db_session.add(record)
+    db_session.commit()
+    db_session.refresh(record)
+    return record
+
+
+@pytest.fixture()
+def user(db_session: Session, organization: Organization) -> User:
     record = User(
+        organization_id=organization.id,
         username="admin",
         password_hash=pwd_context.hash("123456"),
+        role=ROLE_ORG_OWNER,
+        is_active=True,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+    db_session.add(record)
+    db_session.commit()
+    db_session.refresh(record)
+    return record
+
+
+@pytest.fixture()
+def second_user(db_session: Session, second_organization: Organization) -> User:
+    record = User(
+        organization_id=second_organization.id,
+        username="other-admin",
+        password_hash=pwd_context.hash("654321"),
+        role=ROLE_ORG_OWNER,
         is_active=True,
         created_at=datetime.now(timezone.utc),
         updated_at=datetime.now(timezone.utc),

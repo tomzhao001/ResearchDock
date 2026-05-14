@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { CheckCircle2, Clock3, LoaderCircle, Trash2, TriangleAlert } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { useHasPermission } from "@/lib/session";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { deleteJob, fetchJobs, subscribeTaskStatusEvents, type JobPublic } from "@/lib/papers";
@@ -42,6 +43,7 @@ function mergeJobs(currentJobs: JobPublic[], nextJob: JobPublic): JobPublic[] {
 }
 
 export function TaskListPopover({ onOpenPaper }: TaskListPopoverProps) {
+  const canManageJobs = useHasPermission("jobs:manage");
   const [open, setOpen] = useState(false);
   const [jobs, setJobs] = useState<JobPublic[]>([]);
   const [loading, setLoading] = useState(true);
@@ -181,17 +183,19 @@ export function TaskListPopover({ onOpenPaper }: TaskListPopoverProps) {
                       <span className={cn("rounded-full px-2.5 py-1 text-xs font-medium ring-1", getStatusClassName(job.status))}>
                         {statusLabel(job.status)}
                       </span>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon-sm"
-                        aria-label={`删除任务 ${job.id}`}
-                        onClick={() => void handleDeleteJob(job)}
-                        disabled={isNonDeletable || isDeleting}
-                        title={isNonDeletable ? "处理中的任务暂不支持删除" : "删除任务"}
-                      >
-                        {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
-                      </Button>
+                      {canManageJobs ? (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-sm"
+                          aria-label={`删除任务 ${job.id}`}
+                          onClick={() => void handleDeleteJob(job)}
+                          disabled={isNonDeletable || isDeleting}
+                          title={isNonDeletable ? "处理中的任务暂不支持删除" : "删除任务"}
+                        >
+                          {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+                        </Button>
+                      ) : null}
                     </div>
                   </div>
                   <div className="mt-3 grid gap-1 text-xs text-slate-500">

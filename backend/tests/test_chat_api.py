@@ -9,6 +9,11 @@ def login(client) -> None:
     assert response.status_code == 200
 
 
+def login_as(client, *, username: str, password: str) -> None:
+    response = client.post("/api/auth/login", json={"username": username, "password": password})
+    assert response.status_code == 200
+
+
 def test_chat_requires_auth(client, user) -> None:
     response = client.get("/api/chat/topics")
     assert response.status_code == 401
@@ -17,7 +22,12 @@ def test_chat_requires_auth(client, user) -> None:
 def test_chat_topic_roundtrip_with_knowledge_base_citations(client, user, db_session, monkeypatch: pytest.MonkeyPatch) -> None:
     login(client)
 
-    paper = Paper(title="Transformer Paper", source_url="https://example.com/paper", status="completed")
+    paper = Paper(
+        organization_id=user.organization_id,
+        title="Transformer Paper",
+        source_url="https://example.com/paper",
+        status="completed",
+    )
     db_session.add(paper)
     db_session.flush()
     chunk = PaperChunk(
@@ -128,7 +138,12 @@ def test_chat_abstains_when_verifier_rejects_answer(client, user, db_session, mo
     login(client)
     monkeypatch.setattr("app.config.settings.openai_api_key", "test-key")
 
-    paper = Paper(title="Crosslingual Paper", source_url="https://example.com/cross", status="completed")
+    paper = Paper(
+        organization_id=user.organization_id,
+        title="Crosslingual Paper",
+        source_url="https://example.com/cross",
+        status="completed",
+    )
     db_session.add(paper)
     db_session.flush()
     chunk = PaperChunk(
@@ -211,3 +226,71 @@ def test_chat_abstains_when_verifier_rejects_answer(client, user, db_session, mo
     assert assistant_message.metadata_json is not None
     assert assistant_message.metadata_json["retrieval"]["selected_evidence"][0]["evidence_id"] == f"chunk-{chunk.id}"
     assert assistant_message.metadata_json["retrieval"]["verifier_result"]["supported"] is False
+
+
+def test_chat_retrieval_is_limited_to_users_organization(
+    client,
+    user,
+    second_user,
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    login_as(client, username=second_user.username, password="654321")
+
+    other_org_paper = Paper(
+        organization_id=user.organization_id,
+        title="Org A Paper",
+        source_url="https://example.com/org-a",
+        status="completed",
+    )
+    visible_paper = Paper(
+        organization_id=second_user.organization_id,
+        title="Org B Paper",
+        source_url="https://example.com/org-b",
+        status="completed",
+    )
+    db_session.add_all([other_org_paper, visible_paper])
+    db_session.flush()
+    db_session.add_all(
+        [
+            PaperChunk(
+                paper_id=other_org_paper.id,
+                chunk_index=0,
+                content="secret result from another organization",
+                embedding=None,
+                token_count=5,
+                page_from=1,
+                page_to=1,
+                metadata_json={"body_text": "secret result from another organization"},
+            ),
+            PaperChunk(
+                paper_id=visible_paper.id,
+                chunk_index=0,
+                content="organization scoped result for current user",
+                embedding=None,
+                token_count=6,
+                page_from=1,
+                page_to=1,
+                metadata_json={"body_text": "organization scoped result for current user"},
+            ),
+        ]
+    )
+    db_session.commit()
+
+    def fake_chat(_: list[dict[str, str]], *, temperature: float = 0.3) -> tuple[str, str | None]:
+        return "基于知识库，当前组织的结果可见。", "rag-model"
+
+    monkeypatch.setattr("app.services.rag.chat_with_messages", fake_chat)
+
+    topic_response = client.post("/api/chat/topics", json={})
+    assert topic_response.status_code == 201
+    topic_id = topic_response.json()["id"]
+
+    response = client.post(
+        f"/api/chat/topics/{topic_id}/messages",
+        json={"message": "Which organization result is visible?"},
+    )
+    assert response.status_code == 200
+    citations = response.json()["assistant_message"]["citations"]
+    assert len(citations) == 1
+    assert citations[0]["paper_title"] == "Org B Paper"

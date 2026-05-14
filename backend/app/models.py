@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import JSON, BigInteger, Boolean, DateTime, Integer, String, Text, func
+from sqlalchemy import JSON, BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column
 from pgvector.sqlalchemy import Vector
@@ -14,12 +14,51 @@ vector_field = Vector(max(settings.glm_embedding_dimensions, 1)).with_variant(JS
 search_vector_field = Text().with_variant(TSVECTOR(), "postgresql")
 
 
+class Organization(Base):
+    __tablename__ = "organizations"
+
+    id: Mapped[int] = mapped_column(bigint_sqlite, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    slug: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class OrganizationSettings(Base):
+    __tablename__ = "organization_settings"
+
+    id: Mapped[int] = mapped_column(bigint_sqlite, primary_key=True, autoincrement=True)
+    organization_id: Mapped[int] = mapped_column(bigint_sqlite, ForeignKey("organizations.id"), nullable=False, unique=True)
+    auto_extraction_questions_json: Mapped[list[dict] | None] = mapped_column(json_field)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
 class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(bigint_sqlite, primary_key=True, autoincrement=True)
+    organization_id: Mapped[int] = mapped_column(bigint_sqlite, ForeignKey("organizations.id"), nullable=False)
     username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[str] = mapped_column(String(32), nullable=False, default="org_member")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -29,6 +68,7 @@ class Paper(Base):
     __tablename__ = "papers"
 
     id: Mapped[int] = mapped_column(bigint_sqlite, primary_key=True, autoincrement=True)
+    organization_id: Mapped[int] = mapped_column(bigint_sqlite, ForeignKey("organizations.id"), nullable=False)
     title: Mapped[str | None] = mapped_column(Text)
     authors: Mapped[str | None] = mapped_column(Text)
     abstract_raw: Mapped[str | None] = mapped_column(Text)

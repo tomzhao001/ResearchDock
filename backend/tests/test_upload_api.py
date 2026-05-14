@@ -49,6 +49,11 @@ def login(client) -> None:
     assert response.status_code == 200
 
 
+def login_as(client, *, username: str, password: str) -> None:
+    response = client.post("/api/auth/login", json={"username": username, "password": password})
+    assert response.status_code == 200
+
+
 def make_eager_upload_delay(
     session_factory: sessionmaker,
     *,
@@ -372,6 +377,83 @@ def test_upload_overwrite_soft_deletes_previous_paper(
     assert items[0]["id"] == second.json()["paper_id"]
 
 
+def test_same_filename_can_exist_in_different_organizations(
+    client,
+    user,
+    second_user,
+    monkeypatch: pytest.MonkeyPatch,
+    session_factory: sessionmaker,
+) -> None:
+    login(client)
+
+    original_delay = papers_router.process_uploaded_pdf.delay
+    monkeypatch.setattr(
+        papers_router.process_uploaded_pdf,
+        "delay",
+        make_eager_upload_delay(session_factory, extractor=SuccessfulTextExtractor()),
+    )
+
+    try:
+        first = client.post(
+            "/api/papers/upload",
+            files={"file": ("shared.pdf", make_pdf_bytes("first org"), "application/pdf")},
+        )
+        login_as(client, username=second_user.username, password="654321")
+        second = client.post(
+            "/api/papers/upload",
+            files={"file": ("shared.pdf", make_pdf_bytes("second org"), "application/pdf")},
+        )
+    finally:
+        monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", original_delay)
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+
+
+def test_papers_and_jobs_are_scoped_to_current_organization(
+    client,
+    user,
+    second_user,
+    monkeypatch: pytest.MonkeyPatch,
+    session_factory: sessionmaker,
+) -> None:
+    login(client)
+
+    original_delay = papers_router.process_uploaded_pdf.delay
+    monkeypatch.setattr(
+        papers_router.process_uploaded_pdf,
+        "delay",
+        make_eager_upload_delay(session_factory, extractor=SuccessfulTextExtractor()),
+    )
+
+    try:
+        upload_response = client.post(
+            "/api/papers/upload",
+            files={"file": ("org-a.pdf", make_pdf_bytes("org a paper"), "application/pdf")},
+        )
+    finally:
+        monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", original_delay)
+
+    assert upload_response.status_code == 202
+    payload = upload_response.json()
+
+    login_as(client, username=second_user.username, password="654321")
+
+    list_response = client.get("/api/papers")
+    assert list_response.status_code == 200
+    assert list_response.json()["items"] == []
+
+    detail_response = client.get(f"/api/papers/{payload['paper_id']}")
+    assert detail_response.status_code == 404
+
+    jobs_response = client.get("/api/jobs")
+    assert jobs_response.status_code == 200
+    assert jobs_response.json()["items"] == []
+
+    job_detail_response = client.get(f"/api/jobs/{payload['job_id']}")
+    assert job_detail_response.status_code == 404
+
+
 def test_patch_paper_title_allows_duplicate_display_name(
     client,
     user,
@@ -493,7 +575,7 @@ def test_delete_completed_job(
 def test_delete_active_job_is_rejected(client, user, db_session: Session) -> None:
     login(client)
 
-    paper = Paper(title="active paper", status="processing")
+    paper = Paper(organization_id=user.organization_id, title="active paper", status="processing")
     db_session.add(paper)
     db_session.flush()
     job = Job(job_type="pdf_ingest", paper_id=paper.id, status="processing")
@@ -508,7 +590,7 @@ def test_delete_active_job_is_rejected(client, user, db_session: Session) -> Non
 def test_delete_queued_job_is_allowed(client, user, db_session: Session) -> None:
     login(client)
 
-    paper = Paper(title="queued paper", status="queued")
+    paper = Paper(organization_id=user.organization_id, title="queued paper", status="queued")
     db_session.add(paper)
     db_session.flush()
     job = Job(job_type="pdf_ingest", paper_id=paper.id, status="queued")
@@ -567,7 +649,7 @@ def test_delete_paper_soft_deletes_and_removes_jobs(
 def test_delete_paper_with_active_job_is_rejected(client, user, db_session: Session) -> None:
     login(client)
 
-    paper = Paper(title="active paper", status="processing")
+    paper = Paper(organization_id=user.organization_id, title="active paper", status="processing")
     db_session.add(paper)
     db_session.flush()
     job = Job(job_type="pdf_ingest", paper_id=paper.id, status="queued")

@@ -9,9 +9,20 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class UserPublic(BaseModel):
+class OrganizationPublic(BaseModel):
+    id: int
+    name: str
+    slug: str
+
+    model_config = {"from_attributes": True}
+
+
+class UserSessionPublic(BaseModel):
     id: int
     username: str
+    role: str
+    permissions: list[str]
+    organization: OrganizationPublic
 
     model_config = {"from_attributes": True}
 
@@ -60,6 +71,7 @@ class JobListResponse(BaseModel):
 
 class PaperListItem(BaseModel):
     id: int
+    organization_id: int
     title: str | None
     original_filename: str | None = None
     abstract_raw: str | None
@@ -78,6 +90,7 @@ class PaperListResponse(BaseModel):
 
 class PaperDetailResponse(BaseModel):
     id: int
+    organization_id: int
     title: str | None
     authors: str | None
     abstract_raw: str | None

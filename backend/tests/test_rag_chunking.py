@@ -371,7 +371,7 @@ def test_boost_exact_match_candidates_demotes_caption_only_for_table_queries() -
             "block_types": ["table_like"],
         },
     )
-    paper = Paper(id=9, title="中文论文", status="completed")
+    paper = Paper(id=9, organization_id=1, title="中文论文", status="completed")
 
     boosted = _boost_exact_match_candidates(
         "表3中，研究组干预后的 θ 波频率是多少？",
@@ -392,7 +392,7 @@ def test_boost_exact_match_candidates_demotes_caption_only_for_table_queries() -
 def test_claim_level_evidence_selection_supports_crosslingual_query(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("app.config.settings.openai_api_key", "test-key")
     question = "文中的 tES 指什么？"
-    paper = Paper(id=7, title="ADHD Study", status="completed")
+    paper = Paper(id=7, organization_id=1, title="ADHD Study", status="completed")
     chunk = PaperChunk(
         id=101,
         paper_id=7,

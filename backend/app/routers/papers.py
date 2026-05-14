@@ -4,8 +4,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, s
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.deps import get_current_user
-from app.models import User
+from app.deps import AuthContext, get_current_user_context, require_permission
 from app.schemas import (
     JobAcceptedResponse,
     JobPublic,
@@ -51,6 +50,7 @@ def build_paper_detail_response(detail) -> PaperDetailResponse:
     latest_summary_job = JobPublic.model_validate(detail.latest_summary_job) if detail.latest_summary_job else None
     return PaperDetailResponse(
         id=detail.paper.id,
+        organization_id=detail.paper.organization_id,
         title=detail.paper.title,
         authors=detail.paper.authors,
         abstract_raw=detail.paper.abstract_raw,
@@ -76,15 +76,16 @@ def build_paper_detail_response(detail) -> PaperDetailResponse:
 @router.get("", response_model=PaperListResponse)
 def get_papers(
     db: Annotated[Session, Depends(get_db)],
-    _: Annotated[User, Depends(get_current_user)],
+    context: Annotated[AuthContext, Depends(require_permission("papers:read"))],
 ):
     items = []
-    for item in list_papers(db):
-        detail = get_paper_detail(db, item.id)
+    for item in list_papers(db, organization_id=context.organization.id):
+        detail = get_paper_detail(db, item.id, organization_id=context.organization.id)
         original_filename = get_original_filename(detail.asset) if detail else None
         items.append(
             PaperListItem(
                 id=item.id,
+                organization_id=item.organization_id,
                 title=item.title,
                 original_filename=original_filename,
                 abstract_raw=item.abstract_raw,
@@ -102,9 +103,9 @@ def get_papers(
 def get_paper(
     paper_id: int,
     db: Annotated[Session, Depends(get_db)],
-    _: Annotated[User, Depends(get_current_user)],
+    context: Annotated[AuthContext, Depends(require_permission("papers:read"))],
 ):
-    detail = get_paper_detail(db, paper_id)
+    detail = get_paper_detail(db, paper_id, organization_id=context.organization.id)
     if detail is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Paper not found")
     return build_paper_detail_response(detail)
@@ -115,10 +116,15 @@ def patch_paper(
     paper_id: int,
     payload: PaperUpdateRequest,
     db: Annotated[Session, Depends(get_db)],
-    _: Annotated[User, Depends(get_current_user)],
+    context: Annotated[AuthContext, Depends(require_permission("papers:write"))],
 ):
     try:
-        detail = update_paper_metadata(db, paper_id, payload.model_dump(exclude_unset=True))
+        detail = update_paper_metadata(
+            db,
+            paper_id,
+            payload.model_dump(exclude_unset=True),
+            organization_id=context.organization.id,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
@@ -131,10 +137,10 @@ def patch_paper(
 def delete_paper_item(
     paper_id: int,
     db: Annotated[Session, Depends(get_db)],
-    _: Annotated[User, Depends(get_current_user)],
+    context: Annotated[AuthContext, Depends(require_permission("papers:delete"))],
 ):
     try:
-        deleted = delete_paper(db, paper_id)
+        deleted = delete_paper(db, paper_id, organization_id=context.organization.id)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
@@ -147,10 +153,10 @@ def delete_paper_item(
 def rerun_paper_ocr(
     paper_id: int,
     db: Annotated[Session, Depends(get_db)],
-    _: Annotated[User, Depends(get_current_user)],
+    context: Annotated[AuthContext, Depends(require_permission("papers:write"))],
 ):
     try:
-        job = enqueue_paper_ocr_rerun(db, paper_id)
+        job = enqueue_paper_ocr_rerun(db, paper_id, organization_id=context.organization.id)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
@@ -170,10 +176,10 @@ def rerun_paper_ocr(
 def regenerate_paper_summary(
     paper_id: int,
     db: Annotated[Session, Depends(get_db)],
-    _: Annotated[User, Depends(get_current_user)],
+    context: Annotated[AuthContext, Depends(require_permission("papers:write"))],
 ):
     try:
-        job = enqueue_paper_summary_regeneration(db, paper_id)
+        job = enqueue_paper_summary_regeneration(db, paper_id, organization_id=context.organization.id)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
@@ -193,7 +199,7 @@ def regenerate_paper_summary(
 async def upload_paper(
     file: Annotated[UploadFile, File(...)],
     db: Annotated[Session, Depends(get_db)],
-    _: Annotated[User, Depends(get_current_user)],
+    context: Annotated[AuthContext, Depends(require_permission("papers:write"))],
     overwrite: Annotated[bool, Form()] = False,
 ):
     filename = file.filename or "upload.pdf"
@@ -209,6 +215,7 @@ async def upload_paper(
     try:
         artifacts = create_upload_artifacts(
             db,
+            organization_id=context.organization.id,
             filename=filename,
             content_type=mime_type or "application/pdf",
             payload=payload,

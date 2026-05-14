@@ -4,10 +4,21 @@
 
 CREATE EXTENSION IF NOT EXISTS vector;
 
+CREATE TABLE organizations (
+    id BIGSERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL UNIQUE,
+    slug VARCHAR(128) NOT NULL UNIQUE,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE users (
     id BIGSERIAL PRIMARY KEY,
+    organization_id BIGINT NOT NULL REFERENCES organizations (id),
     username VARCHAR(64) NOT NULL UNIQUE,
     password_hash VARCHAR(255) NOT NULL,
+    role VARCHAR(32) NOT NULL DEFAULT 'org_member',
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -22,6 +33,14 @@ CREATE TABLE app_settings (
     default_summary_language VARCHAR(32),
     default_chunk_size INTEGER,
     default_chunk_overlap INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE organization_settings (
+    id BIGSERIAL PRIMARY KEY,
+    organization_id BIGINT NOT NULL UNIQUE REFERENCES organizations (id) ON DELETE CASCADE,
+    auto_extraction_questions_json JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -41,6 +60,7 @@ CREATE TABLE sources (
 
 CREATE TABLE papers (
     id BIGSERIAL PRIMARY KEY,
+    organization_id BIGINT NOT NULL REFERENCES organizations (id),
     title TEXT,
     authors TEXT,
     abstract_raw TEXT,
@@ -139,11 +159,17 @@ CREATE TABLE jobs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+INSERT INTO organizations (name, slug, is_active)
+VALUES ('Default Organization', 'default', TRUE)
+ON CONFLICT (slug) DO NOTHING;
+
 -- Initial admin user (password: 123456) — bcrypt hash generated at project setup
-INSERT INTO users (username, password_hash, is_active)
+INSERT INTO users (organization_id, username, password_hash, role, is_active)
 VALUES (
+    (SELECT id FROM organizations WHERE slug = 'default'),
     'admin',
     '$2b$12$FWCFMmz/kramxYvmhhW8e.Icx3D/TOEeoknZAffydgnEai/G6OEny',
+    'org_owner',
     TRUE
 )
 ON CONFLICT (username) DO NOTHING;

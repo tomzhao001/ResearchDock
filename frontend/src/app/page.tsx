@@ -9,13 +9,12 @@ import { PaperWorkbench } from "@/components/paper-workbench";
 import { TaskListPopover } from "@/components/task-list-popover";
 import { Button } from "@/components/ui/button";
 import { apiFetch } from "@/lib/api";
+import { SessionProvider, type SessionUser } from "@/lib/session";
 import { cn } from "@/lib/utils";
-
-type Me = { id: number; username: string };
 
 export default function Home() {
   const router = useRouter();
-  const [me, setMe] = useState<Me | null>(null);
+  const [me, setMe] = useState<SessionUser | null>(null);
   const [phase, setPhase] = useState<"loading" | "ready" | "redirect">("loading");
   const [activeTab, setActiveTab] = useState<"papers" | "chat">("papers");
   const [selectedPaperId, setSelectedPaperId] = useState<number | null>(null);
@@ -27,7 +26,7 @@ export default function Home() {
         router.replace("/login");
         return;
       }
-      void r.json().then((data: Me) => {
+      void r.json().then((data: SessionUser) => {
         setMe(data);
         setPhase("ready");
       });
@@ -48,56 +47,66 @@ export default function Home() {
     );
   }
 
+  const canReadPapers = me.permissions.includes("papers:read");
+  const canReadJobs = me.permissions.includes("jobs:read");
+  const resolvedTab = activeTab === "papers" && !canReadPapers ? "chat" : activeTab;
+
   return (
-    <div className="h-dvh overflow-hidden bg-[radial-gradient(circle_at_top,rgba(148,163,184,0.18),transparent_34%),linear-gradient(180deg,#f8fafc_0%,#eef2ff_45%,#f8fafc_100%)]">
-      <div className="mx-auto flex h-full min-h-0 max-w-7xl flex-col gap-6 px-6 py-6 lg:px-10">
-        <header className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
-          <div className="grid gap-3">
-            <div className="inline-flex w-fit items-center rounded-full border border-slate-200 bg-white/80 px-3 py-1 text-xs font-medium text-slate-600 shadow-sm backdrop-blur">
-              Milestone 4 Knowledge Base
+    <SessionProvider value={me}>
+      <div className="h-dvh overflow-hidden bg-[radial-gradient(circle_at_top,rgba(148,163,184,0.18),transparent_34%),linear-gradient(180deg,#f8fafc_0%,#eef2ff_45%,#f8fafc_100%)]">
+        <div className="mx-auto flex h-full min-h-0 max-w-7xl flex-col gap-6 px-6 py-6 lg:px-10">
+          <header className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
+            <div className="grid gap-3">
+              <div className="inline-flex w-fit items-center rounded-full border border-slate-200 bg-white/80 px-3 py-1 text-xs font-medium text-slate-600 shadow-sm backdrop-blur">
+                Milestone 4 Knowledge Base
+              </div>
+              <div>
+                <h1 className="text-3xl font-semibold tracking-tight text-slate-950">ResearchDock</h1>
+                <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-600">
+                  首页直接进入论文归档工作台与知识库对话页，支持围绕论文归档进行带引用问答、话题上下文保存，以及右上角任务追踪。
+                </p>
+              </div>
             </div>
-            <div>
-              <h1 className="text-3xl font-semibold tracking-tight text-slate-950">ResearchDock</h1>
-              <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-600">
-                首页直接进入论文归档工作台与知识库对话页，支持围绕论文归档进行带引用问答、话题上下文保存，以及右上角任务追踪。
-              </p>
+
+            <div className="flex flex-wrap items-center gap-3">
+              {canReadJobs ? (
+                <TaskListPopover
+                  onOpenPaper={(paperId) => {
+                    setActiveTab("papers");
+                    setSelectedPaperId(paperId);
+                  }}
+                />
+              ) : null}
+              <div className="rounded-full border border-slate-200 bg-white/80 px-3 py-1.5 text-sm text-slate-600 shadow-sm backdrop-blur">
+                已登录：{me.username} / {me.organization.name}
+              </div>
+              <Button variant="outline" size="sm" onClick={() => void logout()}>
+                退出
+              </Button>
             </div>
-          </div>
+          </header>
 
           <div className="flex flex-wrap items-center gap-3">
-            <TaskListPopover
-              onOpenPaper={(paperId) => {
-                setActiveTab("papers");
-                setSelectedPaperId(paperId);
-              }}
-            />
-            <div className="rounded-full border border-slate-200 bg-white/80 px-3 py-1.5 text-sm text-slate-600 shadow-sm backdrop-blur">
-              已登录：{me.username}
-            </div>
-            <Button variant="outline" size="sm" onClick={() => void logout()}>
-              退出
-            </Button>
+            {canReadPapers ? (
+              <TabButton active={resolvedTab === "papers"} onClick={() => setActiveTab("papers")} icon={<FileText className="size-4" />}>
+                论文
+              </TabButton>
+            ) : null}
+            <TabButton active={resolvedTab === "chat"} onClick={() => setActiveTab("chat")} icon={<MessagesSquare className="size-4" />}>
+              对话
+            </TabButton>
           </div>
-        </header>
 
-        <div className="flex flex-wrap items-center gap-3">
-          <TabButton active={activeTab === "papers"} onClick={() => setActiveTab("papers")} icon={<FileText className="size-4" />}>
-            论文
-          </TabButton>
-          <TabButton active={activeTab === "chat"} onClick={() => setActiveTab("chat")} icon={<MessagesSquare className="size-4" />}>
-            对话
-          </TabButton>
-        </div>
-
-        <div className="min-h-0 flex-1 overflow-hidden">
-          {activeTab === "papers" ? (
-            <PaperWorkbench selectedPaperId={selectedPaperId} onSelectedPaperChange={setSelectedPaperId} />
-          ) : (
-            <ChatPanel />
-          )}
+          <div className="min-h-0 flex-1 overflow-hidden">
+            {resolvedTab === "papers" ? (
+              <PaperWorkbench selectedPaperId={selectedPaperId} onSelectedPaperChange={setSelectedPaperId} />
+            ) : (
+              <ChatPanel />
+            )}
+          </div>
         </div>
       </div>
-    </div>
+    </SessionProvider>
   );
 }
 

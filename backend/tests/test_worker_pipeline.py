@@ -37,9 +37,11 @@ def make_blank_pdf() -> bytes:
 def test_worker_persists_ocr_fallback_result(
     db_session: Session,
     session_factory: sessionmaker,
+    organization,
 ) -> None:
     artifacts = create_upload_artifacts(
         db_session,
+        organization_id=organization.id,
         filename="scan.pdf",
         content_type="application/pdf",
         payload=make_blank_pdf(),
@@ -63,15 +65,17 @@ def test_worker_persists_ocr_fallback_result(
     assert asset.metadata_json["extraction"]["used_ocr_pages"] == [1]
     assert asset.metadata_json["extraction"]["pages"][0]["ocr_metadata"]["provider"] == "glm_ocr"
     assert len(chunks) == 1
-    assert chunks[0].embedding is None
+    assert "ocr recovered text" in chunks[0].content
 
 
 def test_worker_marks_job_failed_when_glm_ocr_errors(
     db_session: Session,
     session_factory: sessionmaker,
+    organization,
 ) -> None:
     artifacts = create_upload_artifacts(
         db_session,
+        organization_id=organization.id,
         filename="scan.pdf",
         content_type="application/pdf",
         payload=make_blank_pdf(),

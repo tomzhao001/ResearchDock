@@ -16,7 +16,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.auth import pwd_context
-from app.models import Paper, PaperChunk, User
+from app.models import Organization, Paper, PaperChunk, User
+from app.permissions import ROLE_ORG_OWNER
 from app.services.llm import chat_with_messages
 from app.services.papers import create_upload_artifacts, run_pdf_ingest_job
 from app.services.pdf_extraction import PDFTextExtractor
@@ -377,13 +378,26 @@ def load_sample_data_smoke_question_ids(data_dir: Path | None = None) -> set[str
 
 
 def ensure_sample_data_eval_user(db: Session) -> User:
+    organization = db.scalar(select(Organization).where(Organization.slug == "sample-data"))
+    if organization is None:
+        organization = Organization(name="Sample Data", slug="sample-data", is_active=True)
+        db.add(organization)
+        db.flush()
     user = db.scalar(select(User).where(User.username == "sample_data_eval"))
     if user is not None:
+        if user.organization_id != organization.id or not user.role:
+            user.organization_id = organization.id
+            user.role = ROLE_ORG_OWNER
+            user.updated_at = datetime.now(timezone.utc)
+            db.commit()
+            db.refresh(user)
         return user
     now = datetime.now(timezone.utc)
     user = User(
+        organization_id=organization.id,
         username="sample_data_eval",
         password_hash=pwd_context.hash("sample_data_eval"),
+        role=ROLE_ORG_OWNER,
         is_active=True,
         created_at=now,
         updated_at=now,
@@ -402,6 +416,7 @@ def ingest_sample_data_papers(
     data_dir: Path | None = None,
 ) -> dict[str, Paper]:
     papers_by_key: dict[str, Paper] = {}
+    user = ensure_sample_data_eval_user(db)
     specs = load_sample_data_paper_specs(data_dir)
     logger.info("Sample paper ingest started: total=%s", len(specs))
     for index, spec in enumerate(specs, start=1):
@@ -416,6 +431,7 @@ def ingest_sample_data_papers(
         payload = spec.pdf_path.read_bytes()
         upload = create_upload_artifacts(
             db,
+            organization_id=user.organization_id,
             filename=spec.upload_filename,
             content_type="application/pdf",
             payload=payload,
@@ -523,6 +539,7 @@ def evaluate_retrieval(
     *,
     k_values: tuple[int, ...] = (1, 5, 10),
 ) -> dict[str, Any]:
+    user = ensure_sample_data_eval_user(db)
     max_k = max(k_values)
     rows: list[dict[str, Any]] = []
     logger.info("Retrieval evaluation started: total_questions=%s k_values=%s", len(questions), k_values)
@@ -538,7 +555,13 @@ def evaluate_retrieval(
             _preview_text(resolved.question.question),
         )
         retrieval_trace: dict[str, Any] = {}
-        results = _search_chunks(db, query=resolved.question.question, top_k=max_k, trace=retrieval_trace)
+        results = _search_chunks(
+            db,
+            query=resolved.question.question,
+            organization_id=user.organization_id,
+            top_k=max_k,
+            trace=retrieval_trace,
+        )
         retrieved_match_sets = [_result_match_indexes(item, resolved.gold_evidence_refs) for item in results]
         first_hit_rank = _first_hit_rank_from_match_sets(retrieved_match_sets)
         trace_chunk_ids = {

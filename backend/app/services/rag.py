@@ -585,11 +585,11 @@ def _normalize_embedding(value: Any) -> list[float] | None:
     return None
 
 
-def _search_chunks_legacy(db: Session, *, query: str, top_k: int) -> list[RetrievalResult]:
+def _search_chunks_legacy(db: Session, *, query: str, top_k: int, organization_id: int) -> list[RetrievalResult]:
     rows = db.execute(
         select(PaperChunk, Paper)
         .join(Paper, Paper.id == PaperChunk.paper_id)
-        .where(Paper.deleted_at.is_(None))
+        .where(Paper.deleted_at.is_(None), Paper.organization_id == organization_id)
         .order_by(PaperChunk.paper_id.asc(), PaperChunk.chunk_index.asc())
     ).all()
     if not rows:
@@ -628,6 +628,7 @@ def _search_sparse_chunks_postgres(
     *,
     query: str,
     limit: int,
+    organization_id: int,
     exact_terms: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     if not query.strip():
@@ -637,7 +638,7 @@ def _search_sparse_chunks_postgres(
     exact_terms = exact_terms if exact_terms is not None else _extract_exact_match_terms(query)
     exact_match_clauses: list[str] = []
     exact_bonus_clauses: list[str] = []
-    params: dict[str, Any] = {"query": query.strip(), "limit": limit}
+    params: dict[str, Any] = {"query": query.strip(), "limit": limit, "organization_id": organization_id}
     for index, term in enumerate(exact_terms):
         term_key = f"exact_term_{index}"
         bonus_key = f"exact_bonus_{index}"
@@ -660,6 +661,7 @@ def _search_sparse_chunks_postgres(
             FROM paper_chunks AS pc
             JOIN papers AS p ON p.id = pc.paper_id
             WHERE p.deleted_at IS NULL
+              AND p.organization_id = :organization_id
               AND (
                     pc.search_vector @@ plainto_tsquery('{search_config}', :query)
                     OR {exact_match_sql}
@@ -685,6 +687,7 @@ def _search_dense_chunks_postgres(
     *,
     query_embedding: list[float] | None,
     limit: int,
+    organization_id: int,
 ) -> list[dict[str, Any]]:
     if query_embedding is None:
         return []
@@ -696,7 +699,7 @@ def _search_dense_chunks_postgres(
             (1 - distance).label("score"),
         )
         .join(Paper, Paper.id == PaperChunk.paper_id)
-        .where(Paper.deleted_at.is_(None), PaperChunk.embedding.is_not(None))
+        .where(Paper.deleted_at.is_(None), Paper.organization_id == organization_id, PaperChunk.embedding.is_not(None))
         .order_by(distance.asc(), PaperChunk.id.asc())
         .limit(limit)
     ).all()
@@ -816,6 +819,7 @@ def _load_chunk_record_map(
     db: Session,
     *,
     chunk_ids: Iterable[int],
+    organization_id: int,
 ) -> dict[int, tuple[PaperChunk, Paper]]:
     ids = [int(chunk_id) for chunk_id in chunk_ids]
     if not ids:
@@ -823,7 +827,7 @@ def _load_chunk_record_map(
     rows = db.execute(
         select(PaperChunk, Paper)
         .join(Paper, Paper.id == PaperChunk.paper_id)
-        .where(Paper.deleted_at.is_(None), PaperChunk.id.in_(ids))
+        .where(Paper.deleted_at.is_(None), Paper.organization_id == organization_id, PaperChunk.id.in_(ids))
     ).all()
     return {int(chunk.id): (chunk, paper) for chunk, paper in rows}
 
@@ -1443,6 +1447,7 @@ def _search_chunks(
     db: Session,
     *,
     query: str,
+    organization_id: int,
     top_k: int | None = None,
     trace: dict[str, Any] | None = None,
 ) -> list[RetrievalResult]:
@@ -1454,7 +1459,12 @@ def _search_chunks(
     if not _is_postgres_session(db):
         variant_results: dict[str, list[RetrievalResult]] = {}
         for variant in query_plan.variants:
-            variant_results[variant.name] = _search_chunks_legacy(db, query=variant.query, top_k=max(settings.rag_rerank_top_n, limit))
+            variant_results[variant.name] = _search_chunks_legacy(
+                db,
+                query=variant.query,
+                top_k=max(settings.rag_rerank_top_n, limit),
+                organization_id=organization_id,
+            )
         source_hits: dict[str, list[dict[str, Any]]] = {}
         variant_traces: dict[str, dict[str, Any]] = {}
         for variant in query_plan.variants:
@@ -1558,6 +1568,7 @@ def _search_chunks(
                 db,
                 query=variant.query,
                 limit=sparse_limit,
+                organization_id=organization_id,
                 exact_terms=exact_terms_for_boost if variant.language == "en" else [],
             )
             if variant_sparse_hits:
@@ -1569,6 +1580,7 @@ def _search_chunks(
                 db,
                 query_embedding=dense_embeddings.get(variant.query),
                 limit=dense_limit,
+                organization_id=organization_id,
             )
             if variant_dense_hits:
                 source_name = f"{variant.name}_dense"
@@ -1603,6 +1615,7 @@ def _search_chunks(
                 *[candidate for hits in all_source_hits.values() for candidate in hits],
             ]
         ],
+        organization_id=organization_id,
     )
     if exact_terms_for_boost:
         fused_candidates = _boost_exact_match_candidates(query, candidates=fused_candidates, record_map=record_map)[:fusion_limit]
@@ -2214,7 +2227,13 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
         candidate_limit,
         retrieval_query,
     )
-    retrieval_candidates = _search_chunks(db, query=retrieval_query, top_k=candidate_limit, trace=retrieval_debug)
+    retrieval_candidates = _search_chunks(
+        db,
+        query=retrieval_query,
+        organization_id=user.organization_id,
+        top_k=candidate_limit,
+        trace=retrieval_debug,
+    )
     retrieval_results = retrieval_candidates[: settings.rag_top_k]
     evidence_candidates = _build_evidence_candidates(retrieval_results, query=message)
     selection_started_at = time.perf_counter()

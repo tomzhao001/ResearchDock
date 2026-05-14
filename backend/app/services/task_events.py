@@ -23,6 +23,10 @@ def _get_publisher() -> Redis:
     return _publisher
 
 
+def get_task_status_channel(organization_id: int) -> str:
+    return f"{TASK_STATUS_CHANNEL}:{organization_id}"
+
+
 def _build_paper_detail_response(detail) -> PaperDetailResponse:
     from app.services.papers import get_job_phase_status, get_original_filename
 
@@ -38,6 +42,7 @@ def _build_paper_detail_response(detail) -> PaperDetailResponse:
     latest_summary_job = JobPublic.model_validate(detail.latest_summary_job) if detail.latest_summary_job else None
     return PaperDetailResponse(
         id=detail.paper.id,
+        organization_id=detail.paper.organization_id,
         title=detail.paper.title,
         authors=detail.paper.authors,
         abstract_raw=detail.paper.abstract_raw,
@@ -65,6 +70,7 @@ def _build_paper_list_item(detail) -> PaperListItem:
 
     return PaperListItem(
         id=detail.paper.id,
+        organization_id=detail.paper.organization_id,
         title=detail.paper.title,
         original_filename=get_original_filename(detail.asset),
         abstract_raw=detail.paper.abstract_raw,
@@ -79,7 +85,7 @@ def _build_paper_list_item(detail) -> PaperListItem:
 def build_task_status_event(db: Session, *, paper_id: int, job_id: int | None = None) -> TaskStatusEvent | None:
     from app.services.papers import get_paper_detail
 
-    detail = get_paper_detail(db, paper_id)
+    detail = get_paper_detail(db, paper_id, organization_id=None)
     if detail is None:
         return None
 
@@ -111,6 +117,6 @@ def publish_task_status_event(db: Session, *, paper_id: int, job_id: int | None 
     if event is None:
         return
     try:
-        _get_publisher().publish(TASK_STATUS_CHANNEL, event.model_dump_json())
+        _get_publisher().publish(get_task_status_channel(event.paper_detail.organization_id), event.model_dump_json())
     except Exception:
         logger.exception("Failed to publish task status event for paper %s", paper_id)

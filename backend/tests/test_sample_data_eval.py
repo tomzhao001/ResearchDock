@@ -130,7 +130,7 @@ def test_sample_data_smoke_eval_runs_and_returns_reports(
     assert "support_coverage" in report["end_to_end"]["questions"][0]
 
 
-def test_evaluate_retrieval_reports_stage_hit_ranks(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_evaluate_retrieval_reports_stage_hit_ranks(db_session, monkeypatch: pytest.MonkeyPatch, user) -> None:
     question = SampleQuestion(
         q_id="en_trace",
         question="What is the Table 1 p-value?",
@@ -154,8 +154,9 @@ def test_evaluate_retrieval_reports_stage_hit_ranks(monkeypatch: pytest.MonkeyPa
         gold_evidence_refs=((7, "p-value"),),
     )
 
-    def fake_search(_db, *, query: str, top_k: int | None = None, trace: dict | None = None):
+    def fake_search(_db, *, query: str, organization_id: int, top_k: int | None = None, trace: dict | None = None):
         assert query == question.question
+        assert organization_id == user.organization_id
         assert top_k == 10
         if trace is not None:
             trace.update(
@@ -180,8 +181,9 @@ def test_evaluate_retrieval_reports_stage_hit_ranks(monkeypatch: pytest.MonkeyPa
         return []
 
     monkeypatch.setattr("app.evals.sample_data._search_chunks", fake_search)
+    monkeypatch.setattr("app.evals.sample_data.ensure_sample_data_eval_user", lambda _db: user)
 
-    report = evaluate_retrieval(None, [resolved])
+    report = evaluate_retrieval(db_session, [resolved])
 
     assert report["summary"]["count"] == 1
     assert report["breakdown"]["by_failure_stage"]["fusion"]["count"] == 1
@@ -196,7 +198,7 @@ def test_evaluate_retrieval_reports_stage_hit_ranks(monkeypatch: pytest.MonkeyPa
     assert report["questions"][0]["retrieval_trace"]["retrieval_backend"] == "postgres_hybrid"
 
 
-def test_evaluate_retrieval_uses_content_hit_instead_of_gold_chunk_id(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_evaluate_retrieval_uses_content_hit_instead_of_gold_chunk_id(db_session, monkeypatch: pytest.MonkeyPatch, user) -> None:
     question = SampleQuestion(
         q_id="zh_content",
         question="本文纳入研究对象总共多少例？",
@@ -219,7 +221,7 @@ def test_evaluate_retrieval_uses_content_hit_instead_of_gold_chunk_id(monkeypatc
         gold_evidence_texts=("纳入109例患儿",),
         gold_evidence_refs=((7, "纳入109例患儿"),),
     )
-    paper = Paper(id=7, title="Demo Paper", status="completed")
+    paper = Paper(id=7, organization_id=user.organization_id, title="Demo Paper", status="completed")
     chunk = PaperChunk(
         id=101,
         paper_id=7,
@@ -232,8 +234,9 @@ def test_evaluate_retrieval_uses_content_hit_instead_of_gold_chunk_id(monkeypatc
         metadata_json={"body_text": "本文共纳入109例患儿，随机分组。"},
     )
 
-    def fake_search(_db, *, query: str, top_k: int | None = None, trace: dict | None = None):
+    def fake_search(_db, *, query: str, organization_id: int, top_k: int | None = None, trace: dict | None = None):
         assert query == question.question
+        assert organization_id == user.organization_id
         if trace is not None:
             trace.update(
                 {
@@ -247,8 +250,9 @@ def test_evaluate_retrieval_uses_content_hit_instead_of_gold_chunk_id(monkeypatc
         return [RetrievalResult(chunk=chunk, paper=paper, score=0.9)]
 
     monkeypatch.setattr("app.evals.sample_data._search_chunks", fake_search)
+    monkeypatch.setattr("app.evals.sample_data.ensure_sample_data_eval_user", lambda _db: user)
 
-    report = evaluate_retrieval(None, [resolved])
+    report = evaluate_retrieval(db_session, [resolved])
 
     assert report["summary"]["count"] == 1
     assert report["summary"]["hit@1"] == 1.0

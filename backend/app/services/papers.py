@@ -50,21 +50,31 @@ def normalize_filename(filename: str) -> str:
     return Path(filename or "upload.pdf").name.strip().casefold()
 
 
-def _active_paper_asset_rows(db: Session) -> list[tuple[Paper, PaperAsset]]:
-    rows = db.execute(
+def _active_paper_asset_rows(db: Session, *, organization_id: int | None = None) -> list[tuple[Paper, PaperAsset]]:
+    statement = (
         select(Paper, PaperAsset)
         .join(PaperAsset, PaperAsset.paper_id == Paper.id)
         .where(
             Paper.deleted_at.is_(None),
             PaperAsset.asset_type == "original_pdf",
         )
-    ).all()
+    )
+    if organization_id is not None:
+        statement = statement.where(Paper.organization_id == organization_id)
+    rows = db.execute(statement).all()
     return [(paper, asset) for paper, asset in rows]
 
 
-def find_active_paper_by_original_filename(db: Session, filename: str) -> Paper | None:
+def _get_scoped_paper(db: Session, paper_id: int, *, organization_id: int | None = None) -> Paper | None:
+    statement = select(Paper).where(Paper.id == paper_id, Paper.deleted_at.is_(None))
+    if organization_id is not None:
+        statement = statement.where(Paper.organization_id == organization_id)
+    return db.scalar(statement)
+
+
+def find_active_paper_by_original_filename(db: Session, filename: str, *, organization_id: int) -> Paper | None:
     normalized = normalize_filename(filename)
-    for paper, asset in _active_paper_asset_rows(db):
+    for paper, asset in _active_paper_asset_rows(db, organization_id=organization_id):
         metadata = asset.metadata_json or {}
         original_filename = metadata.get("original_filename") if isinstance(metadata, dict) else None
         if isinstance(original_filename, str) and normalize_filename(original_filename) == normalized:
@@ -132,13 +142,14 @@ def get_job_phase_status(job: Job | None) -> str | None:
 def create_upload_artifacts(
     db: Session,
     *,
+    organization_id: int,
     filename: str,
     content_type: str,
     payload: bytes,
     overwrite: bool = False,
 ) -> UploadArtifacts:
     safe_name = Path(filename or "upload.pdf").name
-    existing_paper = find_active_paper_by_original_filename(db, safe_name)
+    existing_paper = find_active_paper_by_original_filename(db, safe_name, organization_id=organization_id)
     if existing_paper is not None and not overwrite:
         raise DuplicateFilenameError(safe_name, existing_paper.id)
 
@@ -155,6 +166,7 @@ def create_upload_artifacts(
     stored_path.write_bytes(payload)
 
     paper = Paper(
+        organization_id=organization_id,
         title=Path(safe_name).stem or "Untitled PDF",
         content_hash=content_hash,
         ingest_type="upload",
@@ -187,18 +199,18 @@ def create_upload_artifacts(
     return UploadArtifacts(paper_id=paper.id, job_id=job.id, filename=safe_name)
 
 
-def list_papers(db: Session, *, limit: int = 50) -> list[Paper]:
+def list_papers(db: Session, *, organization_id: int, limit: int = 50) -> list[Paper]:
     statement = (
         select(Paper)
-        .where(Paper.deleted_at.is_(None))
+        .where(Paper.deleted_at.is_(None), Paper.organization_id == organization_id)
         .order_by(Paper.updated_at.desc(), Paper.id.desc())
         .limit(limit)
     )
     return db.scalars(statement).all()
 
 
-def get_paper_detail(db: Session, paper_id: int) -> PaperDetailData | None:
-    paper = db.scalar(select(Paper).where(Paper.id == paper_id, Paper.deleted_at.is_(None)))
+def get_paper_detail(db: Session, paper_id: int, *, organization_id: int | None = None) -> PaperDetailData | None:
+    paper = _get_scoped_paper(db, paper_id, organization_id=organization_id)
     if paper is None:
         return None
 
@@ -225,8 +237,8 @@ def get_original_filename(asset: PaperAsset | None) -> str | None:
     return original_filename if isinstance(original_filename, str) else None
 
 
-def update_paper_metadata(db: Session, paper_id: int, updates: dict) -> PaperDetailData | None:
-    paper = db.scalar(select(Paper).where(Paper.id == paper_id, Paper.deleted_at.is_(None)))
+def update_paper_metadata(db: Session, paper_id: int, updates: dict, *, organization_id: int) -> PaperDetailData | None:
+    paper = _get_scoped_paper(db, paper_id, organization_id=organization_id)
     if paper is None:
         return None
 
@@ -258,15 +270,22 @@ def update_paper_metadata(db: Session, paper_id: int, updates: dict) -> PaperDet
 
     paper.updated_at = datetime.now(timezone.utc)
     db.commit()
-    return get_paper_detail(db, paper_id)
+    return get_paper_detail(db, paper_id, organization_id=organization_id)
 
 
-def update_paper_title(db: Session, paper_id: int, title: str) -> PaperDetailData | None:
-    return update_paper_metadata(db, paper_id, {"title": title})
+def update_paper_title(db: Session, paper_id: int, title: str, *, organization_id: int) -> PaperDetailData | None:
+    return update_paper_metadata(db, paper_id, {"title": title}, organization_id=organization_id)
 
 
-def delete_job(db: Session, job_id: int) -> bool:
-    job = db.get(Job, job_id)
+def delete_job(db: Session, job_id: int, *, organization_id: int | None = None) -> bool:
+    if organization_id is None:
+        job = db.get(Job, job_id)
+    else:
+        job = db.scalar(
+            select(Job)
+            .join(Paper, Paper.id == Job.paper_id)
+            .where(Job.id == job_id, Paper.organization_id == organization_id, Paper.deleted_at.is_(None))
+        )
     if job is None:
         return False
     if job.status in NON_DELETABLE_JOB_STATUSES:
@@ -277,8 +296,8 @@ def delete_job(db: Session, job_id: int) -> bool:
     return True
 
 
-def delete_paper(db: Session, paper_id: int) -> bool:
-    paper = db.scalar(select(Paper).where(Paper.id == paper_id, Paper.deleted_at.is_(None)))
+def delete_paper(db: Session, paper_id: int, *, organization_id: int) -> bool:
+    paper = _get_scoped_paper(db, paper_id, organization_id=organization_id)
     if paper is None:
         return False
 
@@ -295,8 +314,8 @@ def delete_paper(db: Session, paper_id: int) -> bool:
     return True
 
 
-def enqueue_paper_ocr_rerun(db: Session, paper_id: int) -> Job | None:
-    paper = db.scalar(select(Paper).where(Paper.id == paper_id, Paper.deleted_at.is_(None)))
+def enqueue_paper_ocr_rerun(db: Session, paper_id: int, *, organization_id: int) -> Job | None:
+    paper = _get_scoped_paper(db, paper_id, organization_id=organization_id)
     if paper is None:
         return None
     if _get_original_pdf_asset(db, paper_id) is None:
@@ -315,8 +334,8 @@ def enqueue_paper_ocr_rerun(db: Session, paper_id: int) -> Job | None:
     return job
 
 
-def enqueue_paper_summary_regeneration(db: Session, paper_id: int) -> Job | None:
-    paper = db.scalar(select(Paper).where(Paper.id == paper_id, Paper.deleted_at.is_(None)))
+def enqueue_paper_summary_regeneration(db: Session, paper_id: int, *, organization_id: int) -> Job | None:
+    paper = _get_scoped_paper(db, paper_id, organization_id=organization_id)
     if paper is None:
         return None
     asset = _get_original_pdf_asset(db, paper_id)

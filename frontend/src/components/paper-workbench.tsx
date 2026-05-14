@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
 import { TabPanel, Tabs } from "@/components/ui/tabs";
+import { useHasPermission } from "@/lib/session";
 import { Tooltip } from "./ui/tooltip";
 import { cn } from "@/lib/utils";
 import {
@@ -131,6 +132,8 @@ type PaperWorkbenchProps = {
 };
 
 export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: PaperWorkbenchProps) {
+  const canWritePapers = useHasPermission("papers:write");
+  const canDeletePapers = useHasPermission("papers:delete");
   const [papers, setPapers] = useState<PaperListItem[]>([]);
   const [paperDetail, setPaperDetail] = useState<PaperDetail | null>(null);
   const [loadingList, setLoadingList] = useState(true);
@@ -482,10 +485,12 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                   <RefreshCw className={cn("size-4", manualRefreshing ? "animate-spin" : "")} />
                   刷新状态
                 </Button>
-                <Button type="button" size="sm" className="gap-2" onClick={() => setUploadDialogOpen(true)} disabled={isBusy}>
-                  <Upload className="size-4" />
-                  上传 PDF
-                </Button>
+                {canWritePapers ? (
+                  <Button type="button" size="sm" className="gap-2" onClick={() => setUploadDialogOpen(true)} disabled={isBusy}>
+                    <Upload className="size-4" />
+                    上传 PDF
+                  </Button>
+                ) : null}
               </div>
             </div>
           </CardHeader>
@@ -605,21 +610,25 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                           </p>
                         </div>
                         <div className="flex flex-wrap gap-3">
-                          <Button type="button" variant="outline" size="sm" className="gap-2" onClick={() => setMetadataDialogOpen(true)} disabled={isBusy}>
-                            <FilePenLine className="size-4" />
-                            编辑文档信息
-                          </Button>
-                          <Button
-                            type="button"
-                            variant="destructive"
-                            size="sm"
-                            className="gap-2"
-                            onClick={() => setDeleteConfirmOpen(true)}
-                            disabled={hasActiveJob || isBusy}
-                          >
-                            <Trash2 className="size-4" />
-                            删除文档
-                          </Button>
+                          {canWritePapers ? (
+                            <Button type="button" variant="outline" size="sm" className="gap-2" onClick={() => setMetadataDialogOpen(true)} disabled={isBusy}>
+                              <FilePenLine className="size-4" />
+                              编辑文档信息
+                            </Button>
+                          ) : null}
+                          {canDeletePapers ? (
+                            <Button
+                              type="button"
+                              variant="destructive"
+                              size="sm"
+                              className="gap-2"
+                              onClick={() => setDeleteConfirmOpen(true)}
+                              disabled={hasActiveJob || isBusy}
+                            >
+                              <Trash2 className="size-4" />
+                              删除文档
+                            </Button>
+                          ) : null}
                         </div>
                         {actionError ? <p className="text-sm text-destructive">{actionError}</p> : null}
                       </div>
@@ -627,24 +636,32 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                         <PhaseBadge
                           label="OCR"
                           status={paperDetail.ocr_status}
-                          action={{
-                            tooltip: "重新执行 OCR",
-                            ariaLabel: "重新执行 OCR",
-                            disabled: hasActiveJob || isBusy,
-                            loading: actionLoading === "rerun-ocr",
-                            onClick: () => setConfirmAction("rerun-ocr"),
-                          }}
+                          action={
+                            canWritePapers
+                              ? {
+                                  tooltip: "重新执行 OCR",
+                                  ariaLabel: "重新执行 OCR",
+                                  disabled: hasActiveJob || isBusy,
+                                  loading: actionLoading === "rerun-ocr",
+                                  onClick: () => setConfirmAction("rerun-ocr"),
+                                }
+                              : undefined
+                          }
                         />
                         <PhaseBadge
                           label="摘要"
                           status={paperDetail.summary_status}
-                          action={{
-                            tooltip: "重新生成摘要",
-                            ariaLabel: "重新生成摘要",
-                            disabled: hasActiveJob || isBusy,
-                            loading: actionLoading === "regenerate-summary",
-                            onClick: () => setConfirmAction("regenerate-summary"),
-                          }}
+                          action={
+                            canWritePapers
+                              ? {
+                                  tooltip: "重新生成摘要",
+                                  ariaLabel: "重新生成摘要",
+                                  disabled: hasActiveJob || isBusy,
+                                  loading: actionLoading === "regenerate-summary",
+                                  onClick: () => setConfirmAction("regenerate-summary"),
+                                }
+                              : undefined
+                          }
                         />
                       </div>
                     </div>
