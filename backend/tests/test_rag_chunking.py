@@ -6,11 +6,15 @@ from app.models import Paper, PaperChunk
 from app.services.document_preprocess import preprocess_document
 from app.services.pdf_extraction import DocumentExtractionResult, PageExtractionResult
 from app.services.rag import (
+    RetrievalResult,
     _boost_exact_match_candidates,
+    _build_evidence_candidates,
     _build_crosslingual_query_plan,
     _extract_exact_match_terms,
     _is_exact_match_heavy_query,
+    _select_claim_supporting_evidence,
     _split_text,
+    _verify_grounded_answer,
 )
 
 
@@ -383,3 +387,91 @@ def test_boost_exact_match_candidates_demotes_caption_only_for_table_queries() -
 
     assert boosted[0]["chunk_id"] == 2
     assert boosted[0]["exact_match_bonus"] > boosted[1]["exact_match_bonus"]
+
+
+def test_claim_level_evidence_selection_supports_crosslingual_query(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.config.settings.openai_api_key", "test-key")
+    question = "文中的 tES 指什么？"
+    paper = Paper(id=7, title="ADHD Study", status="completed")
+    chunk = PaperChunk(
+        id=101,
+        paper_id=7,
+        chunk_index=0,
+        content="Table 1 reports that tES stands for transcranial electrical stimulation.",
+        embedding=None,
+        token_count=10,
+        page_from=3,
+        page_to=3,
+        metadata_json={
+            "section_path": "Results > Table 1",
+            "body_text": "Table 1 reports that tES stands for transcranial electrical stimulation.",
+        },
+    )
+    candidates = _build_evidence_candidates(
+        [RetrievalResult(chunk=chunk, paper=paper, score=0.88)],
+        query=question,
+    )
+
+    def fake_chat(messages: list[dict[str, str]], *, temperature: float = 0.3) -> tuple[str, str | None]:
+        system = messages[0]["content"]
+        if "归因证据选择器" in system:
+            return (
+                """
+                {
+                  "claims": [
+                    {
+                      "claim_text": "tES 指 transcranial electrical stimulation",
+                      "supporting_evidence_ids": ["chunk-101"],
+                      "support_score": 0.93,
+                      "selection_reason": "英文证据给出了缩写全称"
+                    }
+                  ],
+                  "selected_evidence": [
+                    {
+                      "evidence_id": "chunk-101",
+                      "support_score": 0.93,
+                      "selection_reason": "直接术语定义"
+                    }
+                  ],
+                  "overall_support_score": 0.93,
+                  "is_sufficient": true,
+                  "missing_information": ""
+                }
+                """.strip(),
+                "selector-model",
+            )
+        return (
+            """
+            {
+              "supported": true,
+              "support_score": 0.91,
+              "unsupported_claims": [],
+              "notes": "crosslingual support ok"
+            }
+            """.strip(),
+            "verifier-model",
+        )
+
+    monkeypatch.setattr("app.services.rag.chat_with_messages", fake_chat)
+
+    selection = _select_claim_supporting_evidence(
+        question=question,
+        query_plan={"detected_language": "zh", "generation_instruction": "请用中文回答，保留英文术语原文。"},
+        evidence_candidates=candidates,
+    )
+
+    assert selection.method == "llm"
+    assert selection.sufficiency_decision["is_sufficient"] is True
+    assert selection.selected_evidence[0]["evidence_id"] == "chunk-101"
+    assert selection.selected_evidence[0]["claim_texts"] == ["tES 指 transcranial electrical stimulation"]
+
+    verifier = _verify_grounded_answer(
+        question=question,
+        answer="tES 指 transcranial electrical stimulation。",
+        query_plan={"detected_language": "zh"},
+        selected_evidence=[dict(item) for item in selection.selected_evidence],
+        selection_result=selection,
+    )
+
+    assert verifier["supported"] is True
+    assert verifier["support_score"] >= 0.9

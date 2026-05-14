@@ -143,14 +143,19 @@ class ChatTopicListResponse(BaseModel):
 
 
 class ChatCitation(BaseModel):
+    evidence_id: str | None = None
     chunk_id: int
     paper_id: int
     paper_title: str | None
     source_url: str | None
     snippet: str
     score: float | None = None
+    support_score: float | None = None
     page_from: int | None = None
     page_to: int | None = None
+    section_path: str | None = None
+    selection_reason: str | None = None
+    claim_texts: list[str] = []
 
 
 class ChatMessageCreateRequest(BaseModel):

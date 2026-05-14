@@ -118,8 +118,16 @@ def test_sample_data_smoke_eval_runs_and_returns_reports(
     assert report["retrieval"]["summary"]["skipped_without_gold"] == 1
     assert report["end_to_end"]["summary"]["count"] == 14
     assert "groundedness" in report["end_to_end"]["summary"]
+    assert "evidence_selection_precision" in report["end_to_end"]["summary"]
+    assert "support_coverage" in report["end_to_end"]["summary"]
+    assert "verifier_alignment" in report["end_to_end"]["summary"]
     assert report["end_to_end"]["questions"][0]["metadata"]["retrieval"]["retrieval_backend"] == "legacy"
     assert "query_plan" in report["end_to_end"]["questions"][0]["metadata"]["retrieval"]
+    assert "selected_evidence" in report["end_to_end"]["questions"][0]["metadata"]["retrieval"]
+    assert "sufficiency_decision" in report["end_to_end"]["questions"][0]["metadata"]["retrieval"]
+    assert "verifier_result" in report["end_to_end"]["questions"][0]["metadata"]["retrieval"]
+    assert "evidence_selection_precision" in report["end_to_end"]["questions"][0]
+    assert "support_coverage" in report["end_to_end"]["questions"][0]
 
 
 def test_evaluate_retrieval_reports_stage_hit_ranks(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -91,6 +91,10 @@ class Settings(BaseSettings):
     rag_crosslingual_query_rewrite_enabled: bool = True
     rag_crosslingual_max_subqueries: int = 2
     rag_hyde_enabled: bool = False
+    rag_attribution_max_evidence: int = 4
+    rag_attribution_min_support_score: float = 0.55
+    rag_attribution_min_total_support_score: float = 0.9
+    rag_attribution_verifier_min_support_score: float = 0.5
     ocr_provider: str = "glm_ocr"
     llm_ocr_base_url: str = "https://api.z.ai/api/paas/v4/layout_parsing"
     llm_ocr_api_key: str = ""
