@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from sqlalchemy import select
 
@@ -12,6 +14,27 @@ def login(client) -> None:
 def login_as(client, *, username: str, password: str) -> None:
     response = client.post("/api/auth/login", json={"username": username, "password": password})
     assert response.status_code == 200
+
+
+def collect_sse_events(response) -> list[tuple[str, dict]]:
+    events: list[tuple[str, dict]] = []
+    current_event = "message"
+    current_data: list[str] = []
+    for line in response.iter_lines():
+        if line == "":
+            if current_data:
+                events.append((current_event, json.loads("\n".join(current_data))))
+            current_event = "message"
+            current_data = []
+            continue
+        if line.startswith("event:"):
+            current_event = line.split(":", 1)[1].strip() or "message"
+            continue
+        if line.startswith("data:"):
+            current_data.append(line.split(":", 1)[1].strip())
+    if current_data:
+        events.append((current_event, json.loads("\n".join(current_data))))
+    return events
 
 
 def test_chat_requires_auth(client, user) -> None:
@@ -92,6 +115,68 @@ def test_chat_topic_roundtrip_with_knowledge_base_citations(client, user, db_ses
     assert isinstance(assistant_message.metadata_json["retrieval"]["selected_evidence"], list)
     assert isinstance(assistant_message.metadata_json["retrieval"]["sufficiency_decision"], dict)
     assert isinstance(assistant_message.metadata_json["retrieval"]["verifier_result"], dict)
+
+
+def test_chat_stream_endpoint_emits_sse_and_persists_message(client, user, db_session, monkeypatch: pytest.MonkeyPatch) -> None:
+    login(client)
+
+    paper = Paper(
+        organization_id=user.organization_id,
+        title="Streaming Paper",
+        source_url="https://example.com/stream",
+        status="completed",
+    )
+    db_session.add(paper)
+    db_session.flush()
+    chunk = PaperChunk(
+        paper_id=paper.id,
+        chunk_index=0,
+        content="streaming answer uses retrieved knowledge from the paper",
+        embedding=None,
+        token_count=8,
+        page_from=1,
+        page_to=1,
+        metadata_json={"body_text": "streaming answer uses retrieved knowledge from the paper"},
+    )
+    db_session.add(chunk)
+    db_session.commit()
+
+    def fake_chat(_: list[dict[str, str]], *, temperature: float = 0.3) -> tuple[str, str | None]:
+        return "这是一个流式返回的知识库答案。", "stream-model"
+
+    monkeypatch.setattr("app.services.rag.chat_with_messages", fake_chat)
+    monkeypatch.setattr("app.routers.chat.publish_chat_progress_event", lambda **_kwargs: None)
+
+    topic_response = client.post("/api/chat/topics", json={})
+    assert topic_response.status_code == 201
+    topic_id = topic_response.json()["id"]
+
+    with client.stream(
+        "POST",
+        f"/api/chat/topics/{topic_id}/messages/stream",
+        json={"message": "What does the paper say?"},
+    ) as response:
+        assert response.status_code == 200
+        events = collect_sse_events(response)
+
+    event_names = [name for name, _ in events]
+    assert event_names[0] == "user_message"
+    assert "assistant_start" in event_names
+    assert "assistant_delta" in event_names
+    assert event_names[-2] == "assistant_complete"
+    assert event_names[-1] == "done"
+
+    assistant_complete = next(payload for name, payload in events if name == "assistant_complete")
+    assert assistant_complete["assistant_message"]["content"] == "这是一个流式返回的知识库答案。"
+    assert assistant_complete["assistant_message"]["model"] == "stream-model"
+
+    assistant_message = db_session.scalar(
+        select(ChatMessage)
+        .where(ChatMessage.topic_id == topic_id, ChatMessage.role == "assistant")
+        .order_by(ChatMessage.id.desc())
+    )
+    assert assistant_message is not None
+    assert assistant_message.content == "这是一个流式返回的知识库答案。"
 
 
 def test_chat_falls_back_to_general_answer_when_no_kb_match(

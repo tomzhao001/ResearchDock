@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import httpx
 
 from app.config import settings
+from app.services.http_clients import get_shared_http_client
 
 DEFAULT_SYSTEM_PROMPT = (
     "你是 ResearchDock 的研究助理。"
@@ -128,13 +129,15 @@ def _httpx_timeout(read_write_seconds: int) -> httpx.Timeout:
 def _post_json(
     url: str,
     *,
+    client_name: str,
     api_key: str,
     payload: dict,
     timeout: int | httpx.Timeout,
     verify_ssl: bool,
 ) -> dict:
     timeout_val = timeout if isinstance(timeout, httpx.Timeout) else _httpx_timeout(timeout)
-    response = httpx.post(
+    client = get_shared_http_client(name=client_name, verify_ssl=verify_ssl)
+    response = client.post(
         url,
         headers={
             "Authorization": f"Bearer {api_key}",
@@ -164,6 +167,7 @@ def _request_chat_completion(
             try:
                 payload = _post_json(
                     _build_chat_completions_url(settings.glm_base_url),
+                    client_name="glm",
                     api_key=settings.glm_api_key,
                     payload={
                         "model": model_name,
@@ -186,6 +190,7 @@ def _request_chat_completion(
             try:
                 payload = _post_json(
                     _build_chat_completions_url(settings.openai_base_url),
+                    client_name="openai",
                     api_key=settings.openai_api_key,
                     payload={
                         "model": model_name,
@@ -218,6 +223,7 @@ def _request_openai_embeddings(inputs: Sequence[str]) -> list[list[float]]:
 
     payload = _post_json(
         _build_embeddings_url(settings.openai_base_url),
+        client_name="openai",
         api_key=settings.openai_api_key,
         payload={
             "model": settings.openai_embedding_model,
@@ -256,6 +262,7 @@ def _request_glm_embeddings(inputs: Sequence[str]) -> list[list[float]]:
 
     payload = _post_json(
         _build_embeddings_url(settings.glm_base_url),
+        client_name="glm",
         api_key=settings.glm_api_key,
         payload=payload_data,
         timeout=settings.glm_timeout_seconds,
@@ -299,6 +306,7 @@ def _request_glm_rerank(
 
     payload = _post_json(
         _build_rerank_url(settings.glm_base_url),
+        client_name="glm",
         api_key=settings.glm_api_key,
         payload=payload_data,
         timeout=settings.glm_timeout_seconds,

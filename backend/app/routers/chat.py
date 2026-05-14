@@ -1,6 +1,8 @@
+import json
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -15,7 +17,17 @@ from app.schemas import (
     ChatTopicPublic,
     ChatTurnResponse,
 )
-from app.services.rag import create_topic, get_topic, list_topic_messages, list_topics, send_topic_message
+from app.services.chat_events import publish_chat_progress_event
+from app.services.rag import (
+    build_topic_assistant_draft,
+    create_topic,
+    get_topic,
+    list_topic_messages,
+    list_topics,
+    persist_topic_assistant_message,
+    start_topic_message,
+    send_topic_message,
+)
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -44,6 +56,16 @@ def _serialize_message(message) -> ChatMessagePublic:
         citations=citations,
         created_at=message.created_at,
     )
+
+
+def _sse_event(event: str, payload: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _iter_answer_chunks(text: str, *, chunk_size: int = 24):
+    content = text or ""
+    for start in range(0, len(content), chunk_size):
+        yield content[start : start + chunk_size]
 
 
 @router.get("/topics", response_model=ChatTopicListResponse)
@@ -97,4 +119,73 @@ def create_chat_completion(
         topic=_serialize_topic(result.topic),
         user_message=_serialize_message(result.user_message),
         assistant_message=_serialize_message(result.assistant_message),
+    )
+
+
+@router.post("/topics/{topic_id}/messages/stream")
+def stream_chat_completion(
+    topic_id: int,
+    payload: ChatMessageCreateRequest,
+    db: Annotated[Session, Depends(get_db)],
+    user: Annotated[User, Depends(get_current_user)],
+):
+    def event_stream():
+        try:
+            started_turn = start_topic_message(
+                db,
+                user=user,
+                topic_id=topic_id,
+                prompt=payload.message,
+            )
+            yield _sse_event(
+                "user_message",
+                {"user_message": _serialize_message(started_turn.user_message).model_dump(mode="json")},
+            )
+            assistant_draft = build_topic_assistant_draft(
+                db,
+                user=user,
+                started_turn=started_turn,
+                progress_callback=lambda phase, progress_status, message, detail=None: publish_chat_progress_event(
+                    user_id=user.id,
+                    topic_id=topic_id,
+                    phase=phase,
+                    status=progress_status,
+                    message=message,
+                    detail=detail,
+                ),
+            )
+            yield _sse_event(
+                "assistant_start",
+                {
+                    "answer_mode": assistant_draft.answer_mode,
+                    "used_knowledge_base": assistant_draft.used_knowledge_base,
+                },
+            )
+            for chunk in _iter_answer_chunks(assistant_draft.content):
+                yield _sse_event("assistant_delta", {"delta": chunk})
+            assistant_message = persist_topic_assistant_message(
+                db,
+                topic=started_turn.topic,
+                assistant_draft=assistant_draft,
+            )
+            yield _sse_event(
+                "assistant_complete",
+                {"assistant_message": _serialize_message(assistant_message).model_dump(mode="json")},
+            )
+            yield _sse_event("done", {"ok": True})
+        except ValueError as exc:
+            yield _sse_event("error", {"detail": str(exc) or "Topic not found"})
+        except RuntimeError as exc:
+            yield _sse_event("error", {"detail": str(exc) or "Chat service is unavailable"})
+        except Exception:
+            yield _sse_event("error", {"detail": "聊天流式输出失败"})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )

@@ -5,7 +5,7 @@ import logging
 import math
 import re
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -95,6 +95,31 @@ class ChatTurnResult:
     assistant_message: ChatMessage
 
 
+@dataclass(frozen=True)
+class AssistantMessageDraft:
+    content: str
+    model: str | None
+    answer_mode: str | None
+    used_knowledge_base: bool
+    citations_json: list[dict[str, Any]]
+    metadata_json: dict[str, Any]
+
+
+@dataclass
+class PreparedChatTurn:
+    topic: ChatTopic
+    user_message: ChatMessage
+    assistant_draft: AssistantMessageDraft
+
+
+@dataclass
+class StartedChatTurn:
+    topic: ChatTopic
+    user_message: ChatMessage
+    records: list[ChatMessage]
+    prompt: str
+
+
 @dataclass
 class RetrievalResult:
     chunk: PaperChunk
@@ -134,6 +159,9 @@ class EvidenceSelectionResult:
     sufficiency_decision: dict[str, Any]
     missing_information: str
     method: str
+
+
+ChatProgressCallback = Callable[[str, str, str, str | None], None]
 
 
 def _normalize_title(title: str | None) -> str:
@@ -2204,23 +2232,39 @@ def _rename_topic_from_first_message(db: Session, *, topic: ChatTopic, prompt: s
     db.refresh(topic)
 
 
-def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -> ChatTurnResult:
-    message = (prompt or "").strip()
-    if not message:
-        raise RuntimeError("message is required")
+def _emit_chat_progress(
+    progress_callback: ChatProgressCallback | None,
+    *,
+    phase: str,
+    status: str,
+    message: str,
+    detail: str | None = None,
+) -> None:
+    if progress_callback is None:
+        return
+    progress_callback(phase, status, message, detail)
 
-    topic = get_topic(db, user_id=user.id, topic_id=topic_id)
-    if topic is None:
-        raise ValueError("Topic not found")
 
-    user_message = _create_message(db, topic=topic, role="user", content=message)
-    _rename_topic_from_first_message(db, topic=topic, prompt=message)
-
-    records = list_topic_messages(db, topic_id=topic.id)
+def _build_assistant_message_draft(
+    db: Session,
+    *,
+    user: User,
+    topic: ChatTopic,
+    records: list[ChatMessage],
+    message: str,
+    progress_callback: ChatProgressCallback | None = None,
+) -> AssistantMessageDraft:
     started_at = time.perf_counter()
     retrieval_query = _build_retrieval_query(records, message)
     candidate_limit = max(settings.rag_top_k, settings.rag_rerank_top_n, 10)
     retrieval_debug: dict[str, Any] = {}
+    _emit_chat_progress(
+        progress_callback,
+        phase="retrieval",
+        status="started",
+        message="正在检索知识库",
+        detail=_preview_log_text(retrieval_query),
+    )
     logger.info(
         "RAG retrieval started: topic_id=%s candidate_limit=%s query=%s",
         topic.id,
@@ -2244,6 +2288,19 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
         len(evidence_candidates),
         time.perf_counter() - started_at,
     )
+    _emit_chat_progress(
+        progress_callback,
+        phase="retrieval",
+        status="finished",
+        message="知识库检索完成",
+        detail=f"候选证据 {len(evidence_candidates)} 条",
+    )
+    _emit_chat_progress(
+        progress_callback,
+        phase="evidence_selection",
+        status="started",
+        message="正在筛选可支撑答案的证据",
+    )
     selection_result = _select_claim_supporting_evidence(
         question=message,
         query_plan=retrieval_debug.get("query_plan") if isinstance(retrieval_debug.get("query_plan"), dict) else {},
@@ -2251,6 +2308,13 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
     )
     selected_evidence = [dict(item) for item in selection_result.selected_evidence]
     citations = _serialize_evidence_list(selected_evidence)
+    _emit_chat_progress(
+        progress_callback,
+        phase="evidence_selection",
+        status="finished",
+        message="证据筛选完成",
+        detail=f"选中证据 {len(selected_evidence)} 条",
+    )
     logger.info(
         "RAG retrieval finished: topic_id=%s backend=%s candidates=%s selected_evidence=%s elapsed=%.2fs",
         topic.id,
@@ -2291,6 +2355,12 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
     if selection_result.sufficiency_decision.get("is_sufficient") and selected_evidence:
         generation_started_at = time.perf_counter()
         evidence_text = _build_evidence_prompt_text(selected_evidence)
+        _emit_chat_progress(
+            progress_callback,
+            phase="generation",
+            status="started",
+            message="正在生成答案草稿",
+        )
         logger.info(
             "RAG generation started: topic_id=%s mode=knowledge_base citations=%s",
             topic.id,
@@ -2328,6 +2398,19 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
                 model,
                 time.perf_counter() - answer_started_at,
             )
+            _emit_chat_progress(
+                progress_callback,
+                phase="generation",
+                status="finished",
+                message="答案草稿已生成",
+                detail=model,
+            )
+            _emit_chat_progress(
+                progress_callback,
+                phase="verification",
+                status="started",
+                message="正在校验答案可靠性",
+            )
             verifier_result = _verify_grounded_answer(
                 question=message,
                 answer=answer,
@@ -2340,6 +2423,13 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
                 "知识库中未找到确切依据" in (answer or "")
                 or not verifier_result.get("supported")
                 or float(verifier_result.get("support_score") or 0.0) < settings.rag_attribution_verifier_min_support_score
+            )
+            _emit_chat_progress(
+                progress_callback,
+                phase="verification",
+                status="finished",
+                message="答案校验完成",
+                detail=f"supported={bool(verifier_result.get('supported'))}",
             )
             logger.info(
                 "RAG verifier decision: topic_id=%s supported=%s support_score=%s use_abstain=%s",
@@ -2358,6 +2448,13 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
                 "unsupported_claims": [message],
                 "notes": "generation_failed",
             }
+            _emit_chat_progress(
+                progress_callback,
+                phase="verification",
+                status="failed",
+                message="答案生成或校验失败，已回退为保守回答",
+                detail=str(exc),
+            )
             use_abstain_path = True
         final_answer = answer if not use_abstain_path else "知识库中未找到确切依据。"
         final_citations = citations if not use_abstain_path else []
@@ -2372,10 +2469,7 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
         retrieval_trace["generation_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
         retrieval_trace["answer_mode"] = answer_mode
         logger.info("rag_trace %s", retrieval_trace)
-        assistant_message = _create_message(
-            db,
-            topic=topic,
-            role="assistant",
+        draft = AssistantMessageDraft(
             content=final_answer,
             model=model,
             answer_mode=answer_mode,
@@ -2388,10 +2482,7 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
         retrieval_trace["generation_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
         retrieval_trace["answer_mode"] = "kb_insufficient_evidence"
         logger.info("rag_trace %s", retrieval_trace)
-        assistant_message = _create_message(
-            db,
-            topic=topic,
-            role="assistant",
+        draft = AssistantMessageDraft(
             content="知识库中未找到确切依据。",
             model=None,
             answer_mode="kb_insufficient_evidence",
@@ -2400,8 +2491,97 @@ def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -
             metadata_json={"retrieval": retrieval_trace},
         )
 
-    return ChatTurnResult(
-        topic=_topic_summary(db, topic),
+    _emit_chat_progress(
+        progress_callback,
+        phase="answer_ready",
+        status="finished",
+        message="最终答案已准备完成",
+    )
+    return draft
+
+
+def start_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -> StartedChatTurn:
+    message = (prompt or "").strip()
+    if not message:
+        raise RuntimeError("message is required")
+
+    topic = get_topic(db, user_id=user.id, topic_id=topic_id)
+    if topic is None:
+        raise ValueError("Topic not found")
+
+    user_message = _create_message(db, topic=topic, role="user", content=message)
+    _rename_topic_from_first_message(db, topic=topic, prompt=message)
+    records = list_topic_messages(db, topic_id=topic.id)
+    return StartedChatTurn(
+        topic=topic,
         user_message=user_message,
+        records=records,
+        prompt=message,
+    )
+
+
+def build_topic_assistant_draft(
+    db: Session,
+    *,
+    user: User,
+    started_turn: StartedChatTurn,
+    progress_callback: ChatProgressCallback | None = None,
+) -> AssistantMessageDraft:
+    return _build_assistant_message_draft(
+        db,
+        user=user,
+        topic=started_turn.topic,
+        records=started_turn.records,
+        message=started_turn.prompt,
+        progress_callback=progress_callback,
+    )
+
+
+def prepare_topic_message(
+    db: Session,
+    *,
+    user: User,
+    topic_id: int,
+    prompt: str,
+    progress_callback: ChatProgressCallback | None = None,
+) -> PreparedChatTurn:
+    started_turn = start_topic_message(db, user=user, topic_id=topic_id, prompt=prompt)
+    assistant_draft = build_topic_assistant_draft(
+        db,
+        user=user,
+        started_turn=started_turn,
+        progress_callback=progress_callback,
+    )
+    return PreparedChatTurn(
+        topic=started_turn.topic,
+        user_message=started_turn.user_message,
+        assistant_draft=assistant_draft,
+    )
+
+
+def persist_topic_assistant_message(db: Session, *, topic: ChatTopic, assistant_draft: AssistantMessageDraft) -> ChatMessage:
+    return _create_message(
+        db,
+        topic=topic,
+        role="assistant",
+        content=assistant_draft.content,
+        model=assistant_draft.model,
+        answer_mode=assistant_draft.answer_mode,
+        used_knowledge_base=assistant_draft.used_knowledge_base,
+        citations_json=assistant_draft.citations_json,
+        metadata_json=assistant_draft.metadata_json,
+    )
+
+
+def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -> ChatTurnResult:
+    prepared_turn = prepare_topic_message(db, user=user, topic_id=topic_id, prompt=prompt)
+    assistant_message = persist_topic_assistant_message(
+        db,
+        topic=prepared_turn.topic,
+        assistant_draft=prepared_turn.assistant_draft,
+    )
+    return ChatTurnResult(
+        topic=_topic_summary(db, prepared_turn.topic),
+        user_message=prepared_turn.user_message,
         assistant_message=assistant_message,
     )

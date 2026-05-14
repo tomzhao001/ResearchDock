@@ -5,27 +5,17 @@ from redis.asyncio import Redis
 
 from app.database import SessionLocal
 from app.deps import get_token_from_websocket, resolve_current_user_context
+from app.models import ChatTopic
+from app.services.chat_events import chat_progress_channel
 from app.services.task_events import get_task_status_channel
 
 router = APIRouter(tags=["ws"])
 
 
-@router.websocket("/api/ws/tasks")
-async def task_status_stream(websocket: WebSocket):
-    db = SessionLocal()
-    try:
-        context = resolve_current_user_context(db, get_token_from_websocket(websocket))
-    except HTTPException:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
-    finally:
-        db.close()
-
+async def _stream_channel(websocket: WebSocket, *, channel: str):
     await websocket.accept()
-
     redis = Redis.from_url(websocket.app.state.redis_url, decode_responses=True)
     pubsub = redis.pubsub()
-    channel = get_task_status_channel(context.organization.id)
     await pubsub.subscribe(channel)
     try:
         while True:
@@ -39,3 +29,37 @@ async def task_status_stream(websocket: WebSocket):
         await pubsub.unsubscribe(channel)
         await pubsub.aclose()
         await redis.aclose()
+
+
+@router.websocket("/api/ws/tasks")
+async def task_status_stream(websocket: WebSocket):
+    db = SessionLocal()
+    try:
+        context = resolve_current_user_context(db, get_token_from_websocket(websocket))
+    except HTTPException:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+    finally:
+        db.close()
+
+    await _stream_channel(websocket, channel=get_task_status_channel(context.organization.id))
+
+
+@router.websocket("/api/ws/chat-progress/{topic_id}")
+async def chat_progress_stream(websocket: WebSocket, topic_id: int):
+    db = SessionLocal()
+    try:
+        context = resolve_current_user_context(db, get_token_from_websocket(websocket))
+        topic = db.get(ChatTopic, topic_id)
+        if topic is None or topic.user_id != context.user.id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Topic not found")
+    except HTTPException:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+    finally:
+        db.close()
+
+    await _stream_channel(
+        websocket,
+        channel=chat_progress_channel(user_id=context.user.id, topic_id=topic_id),
+    )

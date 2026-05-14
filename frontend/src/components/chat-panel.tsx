@@ -9,7 +9,9 @@ import {
   createChatTopic,
   fetchChatTopics,
   fetchTopicMessages,
-  sendTopicMessage,
+  streamTopicMessage,
+  subscribeChatProgressEvents,
+  type ChatProgressEvent,
   type ChatMessage,
   type ChatTopic,
 } from "@/lib/chat";
@@ -35,7 +37,14 @@ export function ChatPanel() {
   const [creatingTopic, setCreatingTopic] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [progressEvents, setProgressEvents] = useState<ChatProgressEvent[]>([]);
+  const [streamingAssistantDraft, setStreamingAssistantDraft] = useState<{
+    content: string;
+    answerMode: string | null;
+    usedKnowledgeBase: boolean;
+  } | null>(null);
   const messageViewportRef = useRef<HTMLDivElement | null>(null);
+  const streamAbortRef = useRef<AbortController | null>(null);
 
   const selectedTopic = useMemo(
     () => topics.find((topic) => topic.id === selectedTopicId) ?? null,
@@ -103,7 +112,32 @@ export function ChatPanel() {
     const viewport = messageViewportRef.current;
     if (!viewport) return;
     viewport.scrollTop = viewport.scrollHeight;
-  }, [messages, submitting]);
+  }, [messages, progressEvents, streamingAssistantDraft, submitting]);
+
+  useEffect(() => {
+    if (!selectedTopicId) {
+      setProgressEvents([]);
+      return;
+    }
+    const unsubscribe = subscribeChatProgressEvents({
+      topicId: selectedTopicId,
+      onEvent: (event) => {
+        setProgressEvents((current) => [...current, event].slice(-8));
+      },
+    });
+    return unsubscribe;
+  }, [selectedTopicId]);
+
+  useEffect(() => {
+    setProgressEvents([]);
+    setStreamingAssistantDraft(null);
+  }, [selectedTopicId]);
+
+  useEffect(() => {
+    return () => {
+      streamAbortRef.current?.abort();
+    };
+  }, []);
 
   async function handleCreateTopic() {
     setCreatingTopic(true);
@@ -135,16 +169,52 @@ export function ChatPanel() {
 
     setSubmitting(true);
     setError(null);
+    setProgressEvents([]);
+    setStreamingAssistantDraft(null);
 
     try {
-      const response = await sendTopicMessage(selectedTopicId, prompt);
-      setInput("");
-      upsertTopic(response.topic);
-      setMessages((current) => [...current, response.user_message, response.assistant_message]);
+      const controller = new AbortController();
+      streamAbortRef.current = controller;
+      await streamTopicMessage(selectedTopicId, prompt, {
+        signal: controller.signal,
+        onUserMessage: (userMessage) => {
+          setInput("");
+          setMessages((current) => [...current, userMessage]);
+        },
+        onAssistantStart: ({ answer_mode, used_knowledge_base }) => {
+          setStreamingAssistantDraft({
+            content: "",
+            answerMode: answer_mode,
+            usedKnowledgeBase: used_knowledge_base,
+          });
+        },
+        onAssistantDelta: (delta) => {
+          setStreamingAssistantDraft((current) =>
+            current
+              ? { ...current, content: current.content + delta }
+              : {
+                  content: delta,
+                  answerMode: null,
+                  usedKnowledgeBase: false,
+                }
+          );
+        },
+        onAssistantComplete: (assistantMessage) => {
+          setStreamingAssistantDraft(null);
+          setMessages((current) => [...current, assistantMessage]);
+        },
+      });
+      await loadTopics();
     } catch (submitError) {
-      const message = submitError instanceof Error ? submitError.message : "发送失败";
+      const message =
+        submitError instanceof Error && submitError.name === "AbortError"
+          ? "已取消本次生成"
+          : submitError instanceof Error
+            ? submitError.message
+            : "发送失败";
       setError(message);
     } finally {
+      streamAbortRef.current = null;
       setSubmitting(false);
     }
   }
@@ -275,8 +345,36 @@ export function ChatPanel() {
               <div className="max-w-[92%] rounded-3xl bg-white px-4 py-4 text-sm text-slate-500 shadow-sm ring-1 ring-slate-200">
                 <div className="flex items-center gap-2">
                   <LoaderCircle className="size-4 animate-spin" />
-                  正在检索知识库并生成回复...
+                  {streamingAssistantDraft ? "正在输出最终答案..." : "正在处理你的问题..."}
                 </div>
+                {progressEvents.length > 0 ? (
+                  <div className="mt-3 grid gap-2">
+                    {progressEvents.map((event, index) => (
+                      <div key={`${event.created_at}-${index}`} className="rounded-2xl bg-slate-50 px-3 py-2 text-xs text-slate-600 ring-1 ring-slate-200">
+                        <div className="font-medium text-slate-700">{event.message}</div>
+                        {event.detail ? <div className="mt-1 text-slate-500">{event.detail}</div> : null}
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+                {streamingAssistantDraft ? (
+                  <div className="mt-3">
+                    <div className="mb-3 flex flex-wrap gap-2">
+                      {streamingAssistantDraft.usedKnowledgeBase ? (
+                        <span className="rounded-full bg-emerald-500/10 px-2.5 py-1 text-xs text-emerald-700 ring-1 ring-emerald-500/20">
+                          知识库回答
+                        </span>
+                      ) : (
+                        <span className="rounded-full bg-amber-500/10 px-2.5 py-1 text-xs text-amber-700 ring-1 ring-amber-500/20">
+                          保守回答
+                        </span>
+                      )}
+                    </div>
+                    <p className="whitespace-pre-wrap text-sm leading-7 text-slate-700">
+                      {streamingAssistantDraft.content || "正在准备输出..."}
+                    </p>
+                  </div>
+                ) : null}
               </div>
             ) : null}
           </div>

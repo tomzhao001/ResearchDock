@@ -1,10 +1,24 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from app.db_migrations import run_startup_migrations
 from app.routers import auth_routes, chat, health, jobs, papers, ws
+from app.services.http_clients import close_shared_http_clients
 
-app = FastAPI(title=settings.app_name)
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    try:
+        run_startup_migrations()
+        yield
+    finally:
+        close_shared_http_clients()
+
+
+app = FastAPI(title=settings.app_name, lifespan=lifespan)
 app.state.redis_url = settings.redis_url
 
 app.add_middleware(

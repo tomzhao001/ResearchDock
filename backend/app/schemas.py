@@ -128,6 +128,16 @@ class TaskStatusEvent(BaseModel):
     paper_detail: PaperDetailResponse
 
 
+class ChatProgressEvent(BaseModel):
+    type: Literal["chat-progress"] = "chat-progress"
+    topic_id: int
+    phase: str
+    status: str
+    message: str
+    detail: str | None = None
+    created_at: datetime
+
+
 class PaperUpdateRequest(BaseModel):
     title: str | None = None
     authors: str | None = None
