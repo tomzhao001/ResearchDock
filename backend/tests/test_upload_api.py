@@ -11,6 +11,33 @@ from app.services.papers import run_paper_summary_job, run_pdf_ingest_job
 from app.services.pdf_extraction import DocumentExtractionResult, PDFTextExtractor
 
 
+def make_summary_payload(
+    *,
+    abstract_cn: str = "这是一段中文摘要。",
+    key_points: list[str] | None = None,
+    research_question: str = "研究问题",
+    method: str = "研究方法",
+    findings: str = "主要发现",
+    limitations: str = "局限性",
+    authors: str = "Alice Example; Bob Example",
+    doi: str = "10.1000/researchdock",
+    source_url: str = "https://example.com/papers/researchdock",
+    published_at: str = "2024-05-01",
+) -> dict:
+    return {
+        "abstract_cn": abstract_cn,
+        "key_points": key_points or ["要点一", "要点二", "要点三"],
+        "research_question": research_question,
+        "method": method,
+        "findings": findings,
+        "limitations": limitations,
+        "authors": authors,
+        "doi": doi,
+        "source_url": source_url,
+        "published_at": published_at,
+    }
+
+
 def make_pdf_bytes(text: str) -> bytes:
     doc = fitz.open()
     page = doc.new_page()
@@ -96,14 +123,7 @@ def mock_summary(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("app.config.settings.llm_provider", "openai")
 
     def fake_summary(_: str) -> dict:
-        return {
-            "abstract_cn": "这是一段中文摘要。",
-            "key_points": ["要点一", "要点二", "要点三"],
-            "research_question": "研究问题",
-            "method": "研究方法",
-            "findings": "主要发现",
-            "limitations": "局限性",
-        }
+        return make_summary_payload()
 
     monkeypatch.setattr(llm, "summarize_paper_text", fake_summary)
     monkeypatch.setattr("app.services.papers.summarize_paper_text", fake_summary)
@@ -143,6 +163,7 @@ def test_upload_creates_records_and_completes_job(
     session_factory: sessionmaker,
 ) -> None:
     login(client)
+    monkeypatch.setattr("app.config.settings.openai_api_key", "test-key")
 
     original_delay = papers_router.process_uploaded_pdf.delay
     monkeypatch.setattr(
@@ -178,11 +199,17 @@ def test_upload_creates_records_and_completes_job(
     assert job.status == "completed"
     assert paper is not None
     assert paper.status == "completed"
+    assert paper.authors == "Alice Example; Bob Example"
+    assert paper.doi == "10.1000/researchdock"
+    assert paper.source_url == "https://example.com/papers/researchdock"
+    assert paper.published_at is not None
+    assert paper.published_at.date().isoformat() == "2024-05-01"
     assert asset is not None
     assert "embedded text layer" in (asset.raw_text or "")
     assert isinstance(asset.metadata_json, dict)
     assert asset.metadata_json["preanalysis"]["schema_version"] == 1
     assert asset.metadata_json["preanalysis"]["chunking_hints"]["block_count"] >= 1
+    assert asset.metadata_json["structured_summary"]["doi"] == "10.1000/researchdock"
     assert len(chunks) > 0
     assert chunks[0].content
     assert chunks[0].page_from == 1
@@ -236,7 +263,7 @@ def test_paper_list_and_detail_return_preview_data(
     assert items[0]["id"] == body["paper_id"]
     assert items[0]["abstract_raw"] == "这是一段中文摘要。"
     assert "published_at" in items[0]
-    assert items[0]["published_at"] is None
+    assert items[0]["published_at"].startswith("2024-05-01")
     assert items[0]["ocr_status"] == "completed"
     assert items[0]["summary_status"] == "completed"
 
@@ -246,6 +273,11 @@ def test_paper_list_and_detail_return_preview_data(
     assert "embedded text layer" in detail["preview_text"]
     assert detail["original_filename"] == "milestone3.pdf"
     assert detail["structured_summary"]["method"] == "研究方法"
+    assert detail["structured_summary"]["authors"] == "Alice Example; Bob Example"
+    assert detail["authors"] == "Alice Example; Bob Example"
+    assert detail["doi"] == "10.1000/researchdock"
+    assert detail["source_url"] == "https://example.com/papers/researchdock"
+    assert detail["published_at"].startswith("2024-05-01")
     assert detail["ocr_status"] == "completed"
     assert detail["summary_status"] == "completed"
     assert detail["latest_ocr_job"]["job_type"] == "pdf_ingest"
@@ -718,14 +750,18 @@ def test_regenerate_summary_creates_summary_job_without_clearing_ocr_text(
     original_summary_delay = papers_router.process_paper_summary.delay
 
     def second_summary(_: str) -> dict:
-        return {
-            "abstract_cn": "重新生成后的摘要。",
-            "key_points": ["新要点"],
-            "research_question": "新研究问题",
-            "method": "新方法",
-            "findings": "新发现",
-            "limitations": "新局限",
-        }
+        return make_summary_payload(
+            abstract_cn="重新生成后的摘要。",
+            key_points=["新要点"],
+            research_question="新研究问题",
+            method="新方法",
+            findings="新发现",
+            limitations="新局限",
+            authors="Regenerated Author",
+            doi="10.2000/regenerated",
+            source_url="https://example.com/regenerated",
+            published_at="2025-01-02",
+        )
 
     monkeypatch.setattr(
         papers_router.process_uploaded_pdf,
@@ -764,6 +800,126 @@ def test_regenerate_summary_creates_summary_job_without_clearing_ocr_text(
     assert body["preview_text"] == preview_text
     assert body["abstract_raw"] == "重新生成后的摘要。"
     assert body["structured_summary"]["method"] == "新方法"
+    assert body["authors"] == "Alice Example; Bob Example"
+    assert body["doi"] == "10.1000/researchdock"
     assert body["latest_job"]["job_type"] == "paper_summary"
     assert body["ocr_status"] == "completed"
     assert body["summary_status"] == "completed"
+
+
+def test_summary_invalid_metadata_keeps_paper_fields_empty(
+    client,
+    user,
+    monkeypatch: pytest.MonkeyPatch,
+    session_factory: sessionmaker,
+) -> None:
+    login(client)
+    monkeypatch.setattr("app.config.settings.openai_api_key", "test-key")
+
+    def invalid_summary(_: str) -> dict:
+        return make_summary_payload(
+            authors="   ",
+            doi="doi: not-a-doi",
+            source_url="ftp://example.com/paper",
+            published_at="not-a-date",
+        )
+
+    monkeypatch.setattr(llm, "summarize_paper_text", invalid_summary)
+    monkeypatch.setattr("app.services.papers.summarize_paper_text", invalid_summary)
+
+    original_delay = papers_router.process_uploaded_pdf.delay
+    monkeypatch.setattr(
+        papers_router.process_uploaded_pdf,
+        "delay",
+        make_eager_upload_delay(session_factory, extractor=SuccessfulTextExtractor()),
+    )
+
+    try:
+        upload_response = client.post(
+            "/api/papers/upload",
+            files={"file": ("invalid-metadata.pdf", make_pdf_bytes("paper body"), "application/pdf")},
+        )
+    finally:
+        monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", original_delay)
+
+    assert upload_response.status_code == 202
+    detail_response = client.get(f"/api/papers/{upload_response.json()['paper_id']}")
+    assert detail_response.status_code == 200
+    body = detail_response.json()
+    assert body["authors"] is None
+    assert body["doi"] is None
+    assert body["source_url"] is None
+    assert body["published_at"] is None
+    assert body["structured_summary"]["authors"] == ""
+    assert body["structured_summary"]["doi"] == ""
+    assert body["structured_summary"]["source_url"] == ""
+    assert body["structured_summary"]["published_at"] == ""
+
+
+def test_regenerate_summary_does_not_override_manual_metadata(
+    client,
+    user,
+    monkeypatch: pytest.MonkeyPatch,
+    session_factory: sessionmaker,
+) -> None:
+    login(client)
+    monkeypatch.setattr("app.config.settings.openai_api_key", "test-key")
+
+    original_upload_delay = papers_router.process_uploaded_pdf.delay
+    original_summary_delay = papers_router.process_paper_summary.delay
+    monkeypatch.setattr(
+        papers_router.process_uploaded_pdf,
+        "delay",
+        make_eager_upload_delay(session_factory, extractor=SuccessfulTextExtractor()),
+    )
+
+    try:
+        upload_response = client.post(
+            "/api/papers/upload",
+            files={"file": ("manual-metadata.pdf", make_pdf_bytes("paper body"), "application/pdf")},
+        )
+        assert upload_response.status_code == 202
+        paper_id = upload_response.json()["paper_id"]
+    finally:
+        monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", original_upload_delay)
+
+    manual_update = client.patch(
+        f"/api/papers/{paper_id}",
+        json={
+            "authors": "Manual Author",
+            "doi": "10.3000/manual",
+            "source_url": "https://example.com/manual",
+            "published_at": "2023-12-31T00:00:00Z",
+        },
+    )
+    assert manual_update.status_code == 200
+
+    def regenerated_summary(_: str) -> dict:
+        return make_summary_payload(
+            abstract_cn="人工信息保护后的摘要。",
+            authors="Another Extracted Author",
+            doi="10.4000/extracted",
+            source_url="https://example.com/extracted",
+            published_at="2025-06-01",
+        )
+
+    monkeypatch.setattr(llm, "summarize_paper_text", regenerated_summary)
+    monkeypatch.setattr("app.services.papers.summarize_paper_text", regenerated_summary)
+    monkeypatch.setattr(papers_router.process_paper_summary, "delay", make_eager_summary_delay(session_factory))
+
+    try:
+        regenerate_response = client.post(f"/api/papers/{paper_id}/regenerate-summary")
+    finally:
+        monkeypatch.setattr(papers_router.process_paper_summary, "delay", original_summary_delay)
+
+    assert regenerate_response.status_code == 202
+    detail_response = client.get(f"/api/papers/{paper_id}")
+    assert detail_response.status_code == 200
+    body = detail_response.json()
+    assert body["abstract_raw"] == "人工信息保护后的摘要。"
+    assert body["structured_summary"]["authors"] == "Another Extracted Author"
+    assert body["structured_summary"]["doi"] == "10.4000/extracted"
+    assert body["authors"] == "Manual Author"
+    assert body["doi"] == "10.3000/manual"
+    assert body["source_url"] == "https://example.com/manual"
+    assert body["published_at"].startswith("2023-12-31")

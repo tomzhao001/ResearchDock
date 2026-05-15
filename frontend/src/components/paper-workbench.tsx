@@ -48,6 +48,36 @@ function formatTime(value: string | null): string {
   return new Date(value).toLocaleString("zh-CN");
 }
 
+type MetadataSourceLabel = "摘要自动提取" | "手动编辑" | null;
+
+function normalizeMetadataValue(value: string | null | undefined): string {
+  return (value || "").trim();
+}
+
+function normalizeMetadataDate(value: string | null | undefined): string {
+  const normalized = normalizeMetadataValue(value);
+  if (!normalized) return "";
+  const timestamp = Date.parse(normalized);
+  return Number.isNaN(timestamp) ? normalized : new Date(timestamp).toISOString();
+}
+
+function getMetadataSourceLabel({
+  currentValue,
+  extractedValue,
+  isDate = false,
+}: {
+  currentValue: string | null | undefined;
+  extractedValue: string | null | undefined;
+  isDate?: boolean;
+}): MetadataSourceLabel {
+  const normalize = isDate ? normalizeMetadataDate : normalizeMetadataValue;
+  const current = normalize(currentValue);
+  if (!current) return null;
+  const extracted = normalize(extractedValue);
+  if (!extracted) return "手动编辑";
+  return current === extracted ? "摘要自动提取" : "手动编辑";
+}
+
 function getStatusClassName(status: string | null): string {
   if (status === "completed") return "bg-emerald-500/10 text-emerald-700 ring-emerald-500/20";
   if (status === "failed") return "bg-rose-500/10 text-rose-700 ring-rose-500/20";
@@ -766,10 +796,39 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                     </div>
 
                     <section className="grid gap-3 md:grid-cols-2">
-                      <SummaryBlock label="作者" value={paperDetail.authors || "-"} />
-                      <SummaryBlock label="DOI" value={paperDetail.doi || "-"} />
-                      <SummaryBlock label="来源链接" value={paperDetail.source_url || "-"} />
-                      <SummaryBlock label="发布时间" value={paperDetail.published_at ? formatTime(paperDetail.published_at) : "-"} />
+                      <SummaryBlock
+                        label="作者"
+                        value={paperDetail.authors || "-"}
+                        sourceLabel={getMetadataSourceLabel({
+                          currentValue: paperDetail.authors,
+                          extractedValue: paperDetail.structured_summary?.authors,
+                        })}
+                      />
+                      <SummaryBlock
+                        label="DOI"
+                        value={paperDetail.doi || "-"}
+                        sourceLabel={getMetadataSourceLabel({
+                          currentValue: paperDetail.doi,
+                          extractedValue: paperDetail.structured_summary?.doi,
+                        })}
+                      />
+                      <SummaryBlock
+                        label="来源链接"
+                        value={paperDetail.source_url || "-"}
+                        sourceLabel={getMetadataSourceLabel({
+                          currentValue: paperDetail.source_url,
+                          extractedValue: paperDetail.structured_summary?.source_url,
+                        })}
+                      />
+                      <SummaryBlock
+                        label="发布时间"
+                        value={paperDetail.published_at ? formatTime(paperDetail.published_at) : "-"}
+                        sourceLabel={getMetadataSourceLabel({
+                          currentValue: paperDetail.published_at,
+                          extractedValue: paperDetail.structured_summary?.published_at,
+                          isDate: true,
+                        })}
+                      />
                     </section>
 
                     <section className="grid gap-2">
@@ -828,10 +887,32 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
   );
 }
 
-function SummaryBlock({ label, value }: { label: string; value: string }) {
+function SummaryBlock({
+  label,
+  value,
+  sourceLabel = null,
+}: {
+  label: string;
+  value: string;
+  sourceLabel?: MetadataSourceLabel;
+}) {
   return (
     <div className="rounded-2xl bg-white px-4 py-4 shadow-sm ring-1 ring-slate-200">
-      <h4 className="text-sm font-medium text-slate-700">{label}</h4>
+      <div className="flex items-center justify-between gap-2">
+        <h4 className="text-sm font-medium text-slate-700">{label}</h4>
+        {sourceLabel ? (
+          <span
+            className={cn(
+              "rounded-full px-2.5 py-1 text-xs ring-1",
+              sourceLabel === "摘要自动提取"
+                ? "bg-emerald-500/10 text-emerald-700 ring-emerald-500/20"
+                : "bg-slate-200/80 text-slate-600 ring-slate-300"
+            )}
+          >
+            来源：{sourceLabel}
+          </span>
+        ) : null}
+      </div>
       <p className="mt-2 text-sm leading-6 text-slate-600">{value || "-"}</p>
     </div>
   );

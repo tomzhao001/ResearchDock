@@ -126,10 +126,48 @@ describe("PaperWorkbench", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: /Alpha/ })).toBeInTheDocument());
     await waitFor(() => expectPaperOrder(["Beta", "Zebra", "Alpha"]));
 
-    await user.click(screen.getByRole("button", { name: "论文时间" }));
+    await user.click(screen.getByRole("button", { name: "当前按论文时间排序，点击切换到字母" }));
     await waitFor(() => expectPaperOrder(["Zebra", "Beta", "Alpha"]));
 
-    await user.click(screen.getByRole("button", { name: "倒序" }));
+    await user.click(screen.getByRole("button", { name: "当前倒序，点击切换到正序" }));
     await waitFor(() => expectPaperOrder(["Alpha", "Beta", "Zebra"]));
+  });
+
+  it("为自动提取和手动编辑的元数据显示来源", async () => {
+    const papers = [makePaperListItem({ id: 1, title: "Alpha", publishedAt: "2024-05-01T00:00:00Z" })];
+
+    fetchPapers.mockResolvedValue(papers);
+    fetchPaper.mockResolvedValue({
+      ...makePaperDetail(1, "Alpha"),
+      authors: "Alice Example; Bob Example",
+      doi: "10.3000/manual",
+      source_url: "https://example.com/papers/alpha",
+      published_at: "2024-05-01T00:00:00Z",
+      structured_summary: {
+        abstract_cn: "这是一段中文摘要。",
+        key_points: ["要点一"],
+        research_question: "研究问题",
+        method: "研究方法",
+        findings: "主要发现",
+        limitations: "局限性",
+        authors: "Alice Example; Bob Example",
+        doi: "10.1000/extracted",
+        source_url: "https://example.com/papers/alpha",
+        published_at: "2024-05-01",
+      },
+    });
+
+    function Harness() {
+      const [selectedPaperId, setSelectedPaperId] = useState<number | null>(1);
+      return <PaperWorkbench selectedPaperId={selectedPaperId} onSelectedPaperChange={setSelectedPaperId} />;
+    }
+
+    render(<Harness />);
+
+    await waitFor(() => expect(fetchPapers).toHaveBeenCalled());
+    await waitFor(() => expect(fetchPaper).toHaveBeenCalledWith(1));
+
+    expect(screen.getAllByText("来源：摘要自动提取")).toHaveLength(3);
+    expect(screen.getByText("来源：手动编辑")).toBeInTheDocument();
   });
 });

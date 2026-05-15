@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlparse
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
@@ -44,6 +46,7 @@ class DuplicateFilenameError(RuntimeError):
 
 ACTIVE_JOB_STATUSES = {"queued", "processing"}
 NON_DELETABLE_JOB_STATUSES = {"processing"}
+DOI_PATTERN = re.compile(r"^10\.\S+/\S+$", re.IGNORECASE)
 
 
 def normalize_filename(filename: str) -> str:
@@ -137,6 +140,60 @@ def _queue_summary_job_if_needed(db: Session, paper: Paper, asset: PaperAsset) -
 
 def get_job_phase_status(job: Job | None) -> str | None:
     return job.status if job else None
+
+
+def _normalize_summary_text(value: object) -> str:
+    if value is None:
+        return ""
+    normalized = str(value).strip()
+    return normalized
+
+
+def _normalize_summary_doi(value: object) -> str:
+    normalized = _normalize_summary_text(value)
+    if not normalized:
+        return ""
+    lowered = normalized.lower()
+    if lowered.startswith("doi:"):
+        normalized = normalized[4:].strip()
+    elif lowered.startswith("https://doi.org/") or lowered.startswith("http://doi.org/"):
+        parsed = urlparse(normalized)
+        normalized = parsed.path.lstrip("/").strip()
+    return normalized if DOI_PATTERN.match(normalized) else ""
+
+
+def _normalize_summary_url(value: object) -> str:
+    normalized = _normalize_summary_text(value)
+    if not normalized:
+        return ""
+    parsed = urlparse(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return normalized
+
+
+def _parse_summary_published_at(value: object) -> datetime | None:
+    normalized = _normalize_summary_text(value)
+    if not normalized:
+        return None
+    iso_value = f"{normalized[:-1]}+00:00" if normalized.endswith("Z") else normalized
+    try:
+        parsed = datetime.fromisoformat(iso_value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _serialize_summary_published_at(value: datetime | None) -> str:
+    if value is None:
+        return ""
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _paper_text_field_is_empty(value: str | None) -> bool:
+    return value is None or not str(value).strip()
 
 
 def create_upload_artifacts(
@@ -456,10 +513,23 @@ def run_paper_summary_job(
         publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
 
         summary = summarize_paper_text(asset.raw_text)
+        summary["authors"] = _normalize_summary_text(summary.get("authors"))
+        summary["doi"] = _normalize_summary_doi(summary.get("doi"))
+        summary["source_url"] = _normalize_summary_url(summary.get("source_url"))
+        published_at = _parse_summary_published_at(summary.get("published_at"))
+        summary["published_at"] = _serialize_summary_published_at(published_at)
         metadata = dict(asset.metadata_json or {})
         metadata["structured_summary"] = summary
         asset.metadata_json = metadata
         paper.abstract_raw = summary.get("abstract_cn") or paper.abstract_raw
+        if _paper_text_field_is_empty(paper.authors) and summary["authors"]:
+            paper.authors = summary["authors"]
+        if _paper_text_field_is_empty(paper.doi) and summary["doi"]:
+            paper.doi = summary["doi"]
+        if _paper_text_field_is_empty(paper.source_url) and summary["source_url"]:
+            paper.source_url = summary["source_url"]
+        if paper.published_at is None and published_at is not None:
+            paper.published_at = published_at
         paper.status = "completed"
         paper.updated_at = datetime.now(timezone.utc)
         job.status = "completed"

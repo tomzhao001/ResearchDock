@@ -29,8 +29,13 @@ SUMMARY_USER_TEMPLATE = """
 - method: 方法
 - findings: 主要发现
 - limitations: 局限性
+- authors: 作者，单个字符串；未知时返回空字符串
+- doi: DOI 字符串；未知时返回空字符串
+- source_url: 论文来源链接；未知时返回空字符串
+- published_at: 发布时间，使用 ISO 8601 日期或日期时间字符串；未知时返回空字符串
 
 如果信息不足，请返回空字符串或空数组，不要编造。
+只能使用论文文本中明确出现的信息，不要根据常识补全作者、DOI、链接或发布时间。
 
 论文文本：
 {paper_text}
@@ -383,11 +388,16 @@ def summarize_paper_text(raw_text: str) -> dict:
         ]
     )
     parsed = _extract_json_object(content)
+    key_points = parsed.get("key_points")
     return {
         "abstract_cn": parsed.get("abstract_cn") or "",
-        "key_points": parsed.get("key_points") or [],
+        "key_points": [str(item).strip() for item in key_points if str(item).strip()] if isinstance(key_points, list) else [],
         "research_question": parsed.get("research_question") or "",
         "method": parsed.get("method") or "",
         "findings": parsed.get("findings") or "",
         "limitations": parsed.get("limitations") or "",
+        "authors": parsed.get("authors") or "",
+        "doi": parsed.get("doi") or "",
+        "source_url": parsed.get("source_url") or "",
+        "published_at": parsed.get("published_at") or "",
     }
