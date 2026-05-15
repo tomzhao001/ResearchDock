@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { FilePenLine, LoaderCircle, RefreshCw, ScanText, Trash2, Upload } from "lucide-react";
+import { ArrowUpDown, CalendarDays, FilePenLine, LoaderCircle, RefreshCw, ScanText, TextCursorInput, Trash2, Upload } from "lucide-react";
 
 import { PaperMetadataDialog } from "@/components/paper-metadata-dialog";
 import { PaperUploadDialog } from "@/components/paper-upload-dialog";
@@ -26,6 +26,8 @@ import {
 } from "@/lib/papers";
 
 const ACTIVE_STATUSES = new Set(["queued", "processing"]);
+type PaperSortMode = "alphabet" | "publishedAt";
+type PaperSortDirection = "asc" | "desc";
 
 function statusLabel(status: string | null): string {
   if (status === "queued") return "排队中";
@@ -112,18 +114,61 @@ function PhaseBadge({
   );
 }
 
-function sortPapers(items: PaperListItem[]): PaperListItem[] {
+function getPaperAlphabetKey(paper: PaperListItem): string {
+  return (paper.title || paper.original_filename || "").trim().toLocaleLowerCase("zh-CN");
+}
+
+function comparePaperAlphabet(left: PaperListItem, right: PaperListItem): number {
+  const leftKey = getPaperAlphabetKey(left);
+  const rightKey = getPaperAlphabetKey(right);
+  const nameComparison = leftKey.localeCompare(rightKey, "zh-CN");
+  if (nameComparison !== 0) {
+    return nameComparison;
+  }
+  return left.id - right.id;
+}
+
+function comparePaperPublishedAt(left: PaperListItem, right: PaperListItem): number {
+  const timeDifference = new Date(left.published_at!).getTime() - new Date(right.published_at!).getTime();
+  if (timeDifference !== 0) {
+    return timeDifference;
+  }
+  return comparePaperAlphabet(left, right);
+}
+
+function sortPapersForDisplay(
+  items: PaperListItem[],
+  sortMode: PaperSortMode,
+  sortDirection: PaperSortDirection
+): PaperListItem[] {
   return [...items].sort((left, right) => {
-    const timeDifference = new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime();
-    if (timeDifference !== 0) {
-      return timeDifference;
+    if (sortMode === "alphabet") {
+      const comparison = comparePaperAlphabet(left, right);
+      return sortDirection === "asc" ? comparison : -comparison;
     }
-    return right.id - left.id;
+
+    if (!left.published_at && !right.published_at) {
+      const comparison = comparePaperAlphabet(left, right);
+      return sortDirection === "asc" ? comparison : -comparison;
+    }
+    if (!left.published_at) {
+      return 1;
+    }
+    if (!right.published_at) {
+      return -1;
+    }
+
+    const comparison = comparePaperPublishedAt(left, right);
+    return sortDirection === "asc" ? comparison : -comparison;
   });
 }
 
 function upsertPaper(currentPapers: PaperListItem[], nextPaper: PaperListItem): PaperListItem[] {
-  return sortPapers([nextPaper, ...currentPapers.filter((paper) => paper.id !== nextPaper.id)]);
+  const existingPaper = currentPapers.find((paper) => paper.id === nextPaper.id);
+  if (!existingPaper) {
+    return [nextPaper, ...currentPapers];
+  }
+  return currentPapers.map((paper) => (paper.id === nextPaper.id ? nextPaper : paper));
 }
 
 type PaperWorkbenchProps = {
@@ -148,6 +193,8 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
   const [previewTab, setPreviewTab] = useState<"summary" | "ocr">("summary");
   const [actionLoading, setActionLoading] = useState<"rerun-ocr" | "regenerate-summary" | "delete" | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [sortMode, setSortMode] = useState<PaperSortMode>("publishedAt");
+  const [sortDirection, setSortDirection] = useState<PaperSortDirection>("desc");
 
   const loadPapers = useCallback(
     async (preferredPaperId?: number | null, options?: { silent?: boolean }) => {
@@ -253,6 +300,11 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
     return ACTIVE_STATUSES.has(paperDetail.ocr_status ?? "") || ACTIVE_STATUSES.has(paperDetail.summary_status ?? "");
   }, [paperDetail]);
 
+  const sortedPapers = useMemo(
+    () => sortPapersForDisplay(papers, sortMode, sortDirection),
+    [papers, sortDirection, sortMode]
+  );
+
   const isBusy = loadingList || loadingDetail || actionLoading !== null;
 
   async function handleDeletePaper() {
@@ -265,7 +317,7 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
     try {
       const deletedPaperId = paperDetail.id;
       const remaining = papers.filter((paper) => paper.id !== deletedPaperId);
-      const nextPaperId = remaining[0]?.id ?? null;
+      const nextPaperId = sortPapersForDisplay(remaining, sortMode, sortDirection)[0]?.id ?? null;
 
       await deletePaper(deletedPaperId);
       setDeleteConfirmOpen(false);
@@ -468,29 +520,73 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
       <div className="grid h-full min-h-0 gap-6 xl:grid-cols-[minmax(320px,420px)_minmax(0,1fr)]">
         <Card className="min-h-0 border-none bg-white/80 shadow-sm ring-1 ring-slate-200 backdrop-blur">
           <CardHeader className="gap-3">
-            <div className="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <CardTitle>论文列表</CardTitle>
-                <CardDescription>按更新时间倒序展示，点击左侧条目后在右侧查看摘要、展示名和 OCR 预览。</CardDescription>
+            <div className="grid gap-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0 flex-1">
+                  <CardTitle>论文列表</CardTitle>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <Tooltip
+                    content={sortMode === "alphabet" ? "当前按字母排序，点击切换到论文时间" : "当前按论文时间排序，点击切换到字母"}
+                    side="bottom"
+                  >
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon-sm"
+                      aria-label={sortMode === "alphabet" ? "当前按字母排序，点击切换到论文时间" : "当前按论文时间排序，点击切换到字母"}
+                      onClick={() => setSortMode((current) => (current === "alphabet" ? "publishedAt" : "alphabet"))}
+                      disabled={isBusy}
+                    >
+                      {sortMode === "alphabet" ? <TextCursorInput className="size-3.5" /> : <CalendarDays className="size-3.5" />}
+                    </Button>
+                  </Tooltip>
+                  <Tooltip
+                    content={sortDirection === "asc" ? "当前正序，点击切换到倒序" : "当前倒序，点击切换到正序"}
+                    side="bottom"
+                  >
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon-sm"
+                      aria-label={sortDirection === "asc" ? "当前正序，点击切换到倒序" : "当前倒序，点击切换到正序"}
+                      onClick={() => setSortDirection((current) => (current === "asc" ? "desc" : "asc"))}
+                      disabled={isBusy}
+                    >
+                      <ArrowUpDown className={cn("size-3.5 transition-transform", sortDirection === "desc" ? "rotate-180" : "")} />
+                    </Button>
+                  </Tooltip>
+                </div>
               </div>
-              <div className="flex flex-wrap items-center gap-2">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="gap-2"
-                  onClick={() => void handleManualRefresh()}
-                  disabled={manualRefreshing || isBusy}
-                >
-                  <RefreshCw className={cn("size-4", manualRefreshing ? "animate-spin" : "")} />
-                  刷新状态
-                </Button>
-                {canWritePapers ? (
-                  <Button type="button" size="sm" className="gap-2" onClick={() => setUploadDialogOpen(true)} disabled={isBusy}>
-                    <Upload className="size-4" />
-                    上传 PDF
+              <div className="grid gap-3">
+                <CardDescription>
+                  支持按字母或论文时间在前端排序，点击左侧条目后在右侧查看摘要、展示名和 OCR 预览。
+                </CardDescription>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="gap-2"
+                    onClick={() => void handleManualRefresh()}
+                    disabled={manualRefreshing || isBusy}
+                  >
+                    <RefreshCw className={cn("size-4", manualRefreshing ? "animate-spin" : "")} />
+                    刷新状态
                   </Button>
-                ) : null}
+                  {canWritePapers ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      className="gap-2"
+                      onClick={() => setUploadDialogOpen(true)}
+                      disabled={isBusy}
+                    >
+                      <Upload className="size-4" />
+                      上传 PDF
+                    </Button>
+                  ) : null}
+                </div>
               </div>
             </div>
           </CardHeader>
@@ -510,7 +606,7 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
               </div>
             ) : null}
 
-            {papers.map((paper) => (
+            {sortedPapers.map((paper) => (
               <button
                 key={paper.id}
                 type="button"
@@ -528,6 +624,9 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                     <p className="font-medium leading-6">{paper.title || `未命名论文 #${paper.id}`}</p>
                     <p className={cn("mt-1 text-xs", selectedPaperId === paper.id ? "text-slate-600" : "text-slate-500")}>
                       原始文件名：{paper.original_filename || "-"}
+                    </p>
+                    <p className={cn("mt-1 text-xs", selectedPaperId === paper.id ? "text-slate-600" : "text-slate-500")}>
+                      论文时间：{paper.published_at ? formatTime(paper.published_at) : "-"}
                     </p>
                     <p className={cn("mt-1 text-xs", selectedPaperId === paper.id ? "text-slate-600" : "text-slate-500")}>
                       更新于 {formatTime(paper.updated_at)}

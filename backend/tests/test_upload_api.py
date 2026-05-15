@@ -235,6 +235,8 @@ def test_paper_list_and_detail_return_preview_data(
     assert len(items) == 1
     assert items[0]["id"] == body["paper_id"]
     assert items[0]["abstract_raw"] == "这是一段中文摘要。"
+    assert "published_at" in items[0]
+    assert items[0]["published_at"] is None
     assert items[0]["ocr_status"] == "completed"
     assert items[0]["summary_status"] == "completed"
 

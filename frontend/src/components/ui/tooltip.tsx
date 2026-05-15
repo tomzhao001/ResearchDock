@@ -5,9 +5,10 @@ import { useState, type ReactNode } from "react";
 type TooltipProps = {
   content: ReactNode;
   children: ReactNode;
+  side?: "top" | "bottom";
 };
 
-export function Tooltip({ content, children }: TooltipProps) {
+export function Tooltip({ content, children, side = "top" }: TooltipProps) {
   const [open, setOpen] = useState(false);
 
   return (
@@ -22,7 +23,9 @@ export function Tooltip({ content, children }: TooltipProps) {
       {open ? (
         <span
           role="tooltip"
-          className="pointer-events-none absolute bottom-[calc(100%+8px)] left-1/2 z-20 -translate-x-1/2 rounded-md bg-slate-950 px-2 py-1 text-[11px] whitespace-nowrap text-white shadow-lg"
+          className={`pointer-events-none absolute left-1/2 z-50 -translate-x-1/2 rounded-md bg-slate-950 px-2 py-1 text-[11px] whitespace-nowrap text-white shadow-lg ${
+            side === "bottom" ? "top-[calc(100%+8px)]" : "bottom-[calc(100%+8px)]"
+          }`}
         >
           {content}
         </span>

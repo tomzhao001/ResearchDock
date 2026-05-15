@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -60,11 +60,12 @@ describe("UploadPanel", () => {
 
     const input = screen.getByLabelText("选择 PDF");
     await user.upload(input, new File(["pdf"], "paper.pdf", { type: "application/pdf" }));
-    await user.click(screen.getByRole("button", { name: "上传 PDF" }));
+    await user.click(screen.getByRole("button", { name: "批量上传 PDF" }));
 
     await waitFor(() => expect(uploadPaper).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(fetchJob).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(screen.getByText(/当前上传已创建任务 #9，状态为 处理中/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/当前批次已提交 1 \/ 1 个文件/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/最近创建的任务 #9 状态为 处理中/)).toBeInTheDocument());
     expect(subscribeTaskStatusEvents).toHaveBeenCalledTimes(1);
 
     handleTaskEvent({
@@ -81,20 +82,75 @@ describe("UploadPanel", () => {
       },
     });
 
-    await waitFor(() => expect(screen.getByText(/当前上传已创建任务 #9，状态为 已完成/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/最近创建的任务 #9 状态为 已完成/)).toBeInTheDocument());
   });
 
-  it("上传失败时显示错误", async () => {
+  it("批量上传时会按选择顺序依次调用接口", async () => {
     const user = userEvent.setup();
-    vi.mocked(uploadPaper).mockRejectedValue(new Error("Only PDF files are supported"));
+    vi.mocked(uploadPaper)
+      .mockResolvedValueOnce({
+        paper_id: 1,
+        job_id: 9,
+        filename: "a.pdf",
+        status: "queued",
+      })
+      .mockResolvedValueOnce({
+        paper_id: 2,
+        job_id: 10,
+        filename: "b.pdf",
+        status: "queued",
+      });
+    vi.mocked(fetchJob)
+      .mockResolvedValueOnce({
+        id: 9,
+        job_type: "pdf_ingest",
+        paper_id: 1,
+        status: "queued",
+        error_message: null,
+        retry_count: 0,
+        started_at: null,
+        finished_at: null,
+        created_at: "2026-05-06T05:00:00Z",
+      })
+      .mockResolvedValueOnce({
+        id: 10,
+        job_type: "pdf_ingest",
+        paper_id: 2,
+        status: "queued",
+        error_message: null,
+        retry_count: 0,
+        started_at: null,
+        finished_at: null,
+        created_at: "2026-05-06T05:01:00Z",
+      });
 
     render(<UploadPanel />);
 
     const input = screen.getByLabelText("选择 PDF");
-    await user.upload(input, new File(["oops"], "bad.pdf", { type: "application/pdf" }));
-    await user.click(screen.getByRole("button", { name: "上传 PDF" }));
+    await user.upload(input, [
+      new File(["first"], "a.pdf", { type: "application/pdf" }),
+      new File(["second"], "b.pdf", { type: "application/pdf" }),
+    ]);
+    await user.click(screen.getByRole("button", { name: "批量上传 PDF" }));
 
-    expect(await screen.findByText("Only PDF files are supported")).toBeInTheDocument();
+    await waitFor(() => expect(uploadPaper).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(uploadPaper).mock.calls[0]?.[0]).toMatchObject({ name: "a.pdf" });
+    expect(vi.mocked(uploadPaper).mock.calls[1]?.[0]).toMatchObject({ name: "b.pdf" });
+    expect(screen.getByText("当前文件顺序：a.pdf -> b.pdf")).toBeInTheDocument();
+  });
+
+  it("选择了非 PDF 文件时会提示错误", async () => {
+    render(<UploadPanel />);
+
+    const input = screen.getByLabelText("选择 PDF");
+    fireEvent.change(input, {
+      target: {
+        files: [new File(["oops"], "bad.txt", { type: "text/plain" })],
+      },
+    });
+
+    expect(screen.getByText("仅支持上传 PDF 文件，请重新选择。")).toBeInTheDocument();
+    expect(uploadPaper).not.toHaveBeenCalled();
   });
 
   it("遇到同名文件时提示是否覆盖上传", async () => {
@@ -111,7 +167,7 @@ describe("UploadPanel", () => {
 
     const input = screen.getByLabelText("选择 PDF");
     await user.upload(input, new File(["pdf"], "paper.pdf", { type: "application/pdf" }));
-    await user.click(screen.getByRole("button", { name: "上传 PDF" }));
+    await user.click(screen.getByRole("button", { name: "批量上传 PDF" }));
 
     expect(await screen.findByText("已有相同原始文件名的文档：paper.pdf。")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "确认覆盖上传" })).toBeInTheDocument();

@@ -145,7 +145,6 @@ def _post_json(
         },
         json=payload,
         timeout=timeout_val,
-        verify=verify_ssl,
     )
     response.raise_for_status()
     return response.json()

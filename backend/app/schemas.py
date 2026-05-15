@@ -75,6 +75,7 @@ class PaperListItem(BaseModel):
     title: str | None
     original_filename: str | None = None
     abstract_raw: str | None
+    published_at: datetime | None = None
     status: str | None
     ocr_status: str | None = None
     summary_status: str | None = None

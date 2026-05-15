@@ -89,6 +89,7 @@ def get_papers(
                 title=item.title,
                 original_filename=original_filename,
                 abstract_raw=item.abstract_raw,
+                published_at=item.published_at,
                 status=item.status,
                 ocr_status=get_job_phase_status(detail.latest_ocr_job) if detail else None,
                 summary_status=get_job_phase_status(detail.latest_summary_job) if detail else None,

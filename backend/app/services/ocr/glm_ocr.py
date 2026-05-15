@@ -57,7 +57,11 @@ class GlmOcrAdapter:
             "Content-Type": "application/json",
         }
         owned_client = self.client is None
-        client = self.client or httpx.Client(timeout=self.timeout_seconds, verify=self.verify_ssl)
+        client = self.client or httpx.Client(
+            http2=True,
+            timeout=self.timeout_seconds,
+            verify=self.verify_ssl,
+        )
         try:
             for attempt in range(self.max_retries + 1):
                 response = client.post(self.api_url, headers=headers, json=payload)
