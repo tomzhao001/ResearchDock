@@ -4,6 +4,7 @@ import pytest
 
 from app.models import Paper, PaperChunk
 from app.services.document_preprocess import preprocess_document
+from app.services.ocr.text_normalization import normalize_ocr_text
 from app.services.pdf_extraction import DocumentExtractionResult, PageExtractionResult
 from app.services.rag import (
     RetrievalResult,
@@ -49,6 +50,39 @@ def test_preprocess_document_keeps_page_level_blocks() -> None:
         "paragraph",
     ]
     assert all(block["section_title"] == "Abstract" for block in preanalysis["blocks"])
+
+
+def test_preprocess_document_marks_normalized_ocr_pages() -> None:
+    normalized_text = normalize_ocr_text(
+        "\uff21\uff42\uff53\uff54\uff52\uff41\uff43\uff54\n"
+        "\uff34\uff41\uff42\uff4c\uff45\u3000\uff11\u3000\uff33\uff54\uff49\uff4d\uff55\uff4c\uff41\uff54\uff49\uff4f\uff4e\u3000\uff50\uff0d\uff56\uff41\uff4c\uff55\uff45\u3000\uff10\uff0e\uff10\uff12\uff18"
+    )
+    page = PageExtractionResult(
+        page_number=1,
+        char_count=len(normalized_text.text),
+        alpha_ratio=0.9,
+        continuous_line_ratio=0.8,
+        image_count=0,
+        suspected_double_column=False,
+        needs_ocr=True,
+        used_ocr=True,
+        reasons=["low_text_volume"],
+        ocr_metadata={"text_quality": normalized_text.to_metadata()},
+        blocks=None,
+        text=normalized_text.text,
+    )
+    document = DocumentExtractionResult(
+        raw_text=normalized_text.text,
+        metadata={"pages": []},
+        pages=[page],
+    )
+
+    preanalysis = preprocess_document(document)
+
+    assert "ocr_text_normalized" in preanalysis["document_tags"]
+    assert preanalysis["pages"][0]["ocr_text_normalized"] is True
+    assert [block["block_type"] for block in preanalysis["blocks"]] == ["table_caption"]
+    assert preanalysis["blocks"][0]["text"] == "Table 1 Stimulation p-value 0.028"
 
 
 def test_preprocess_document_marks_table_body_like_blocks() -> None:
@@ -201,6 +235,18 @@ def test_extract_exact_match_terms_prefers_table_and_hyphenated_terms() -> None:
     assert "Table 1" in terms
     assert "Stimulation" in terms
     assert "p-value" in terms
+
+
+def test_extract_exact_match_terms_works_after_ocr_normalization() -> None:
+    normalized_text = normalize_ocr_text(
+        "\uff34\uff41\uff42\uff4c\uff45\u3000\uff11\u3000\u4e2d\u3000\uff21\uff24\uff28\uff24\uff0d\uff32\uff33\u3000\u7684\u3000\uff30\uff24\uff26\u3000\u662f\u4ec0\u4e48\uff1f"
+    )
+
+    terms = _extract_exact_match_terms(normalized_text.text)
+
+    assert "Table 1" in terms
+    assert "ADHD-RS" in terms
+    assert "PDF" in terms
 
 
 def test_build_crosslingual_query_plan_creates_bilingual_variants(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -12,7 +12,7 @@ from app.services.pdf_extraction import PDFTextExtractor
 class MockOcrAdapter:
     def recognize_page(self, *, image_bytes: bytes, page_number: int, hints: dict | None = None) -> OcrRecognitionResult:
         return OcrRecognitionResult(
-            text="ocr recovered text",
+            text="\uff34\uff41\uff42\uff4c\uff45\u3000\uff11\uff1a\u3000\uff21\uff24\uff28\uff24\uff0d\uff32\uff33\u3000\uff30\uff24\uff26",
             metadata={
                 "provider": "glm_ocr",
                 "page_number": page_number,
@@ -60,12 +60,15 @@ def test_worker_persists_ocr_fallback_result(
     assert job is not None
     assert job.status == "completed"
     assert asset is not None
-    assert asset.raw_text == "ocr recovered text"
+    assert asset.raw_text == "Table 1: ADHD-RS PDF"
     assert asset.metadata_json is not None
     assert asset.metadata_json["extraction"]["used_ocr_pages"] == [1]
     assert asset.metadata_json["extraction"]["pages"][0]["ocr_metadata"]["provider"] == "glm_ocr"
+    assert asset.metadata_json["extraction"]["pages"][0]["ocr_metadata"]["text_quality"]["normalization_applied"] is True
+    assert asset.metadata_json["extraction"]["text_quality"]["normalization_applied"] is True
+    assert asset.metadata_json["extraction"]["text_quality"]["normalized_ocr_pages"] == [1]
     assert len(chunks) == 1
-    assert "ocr recovered text" in chunks[0].content
+    assert "Table 1: ADHD-RS PDF" in chunks[0].content
 
 
 def test_worker_marks_job_failed_when_glm_ocr_errors(

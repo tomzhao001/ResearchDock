@@ -65,6 +65,7 @@ def _build_page_records(document: DocumentExtractionResult) -> list[dict[str, An
                     "char_count": page.char_count,
                     "suspected_double_column": page.suspected_double_column,
                     "used_ocr": page.used_ocr,
+                    "ocr_metadata": page.ocr_metadata,
                     "text": page.text,
                     "blocks": page.blocks or [],
                 }
@@ -80,6 +81,7 @@ def _build_page_records(document: DocumentExtractionResult) -> list[dict[str, An
                 "char_count": int(page.get("char_count") or 0),
                 "suspected_double_column": bool(page.get("suspected_double_column")),
                 "used_ocr": bool(page.get("used_ocr")),
+                "ocr_metadata": page.get("ocr_metadata") if isinstance(page.get("ocr_metadata"), dict) else None,
                 "text": "",
                 "blocks": [],
             }
@@ -96,6 +98,7 @@ def _build_page_records(document: DocumentExtractionResult) -> list[dict[str, An
             "char_count": len((document.raw_text or "").strip()),
             "suspected_double_column": False,
             "used_ocr": False,
+            "ocr_metadata": None,
             "text": document.raw_text or "",
             "blocks": [],
         }
@@ -270,6 +273,17 @@ def preprocess_document(document: DocumentExtractionResult) -> dict[str, Any]:
         document_tags.add("suspected_double_column")
     if any(bool(page.get("used_ocr")) for page in pages):
         document_tags.add("contains_ocr")
+    if any(
+        bool(
+            (
+                page.get("ocr_metadata", {}).get("text_quality", {})
+                if isinstance(page.get("ocr_metadata"), dict)
+                else {}
+            ).get("normalization_applied")
+        )
+        for page in pages
+    ):
+        document_tags.add("ocr_text_normalized")
     if len(pages) > 1:
         document_tags.add("multi_page")
 
@@ -380,6 +394,13 @@ def preprocess_document(document: DocumentExtractionResult) -> dict[str, Any]:
                 "char_count": int(page.get("char_count") or 0),
                 "suspected_double_column": bool(page.get("suspected_double_column")),
                 "used_ocr": bool(page.get("used_ocr")),
+                "ocr_text_normalized": bool(
+                    (
+                        page.get("ocr_metadata", {}).get("text_quality", {})
+                        if isinstance(page.get("ocr_metadata"), dict)
+                        else {}
+                    ).get("normalization_applied")
+                ),
                 "block_count": sum(1 for block in blocks if int(block["page_number"]) == int(page.get("page_number") or 0)),
             }
             for page in pages

@@ -6,6 +6,7 @@ import fitz
 from app.config import settings
 from app.services.ocr import build_ocr_adapter
 from app.services.ocr.base import OcrAdapter
+from app.services.ocr.text_normalization import normalize_ocr_text
 
 
 @dataclass
@@ -60,6 +61,9 @@ class PDFTextExtractor:
                 for page in pages
             ],
         }
+        text_quality = self._summarize_ocr_text_quality(pages)
+        if text_quality is not None:
+            metadata["text_quality"] = text_quality
         return DocumentExtractionResult(raw_text=combined_text, metadata=metadata, pages=pages)
 
     def _extract_page(self, page: fitz.Page, page_number: int) -> PageExtractionResult:
@@ -126,7 +130,10 @@ class PDFTextExtractor:
                 "image_count": result.image_count,
             },
         )
-        ocr_text = recognition.text.strip()
+        normalized = normalize_ocr_text(recognition.text)
+        ocr_text = normalized.text.strip()
+        ocr_metadata = dict(recognition.metadata or {})
+        ocr_metadata["text_quality"] = normalized.to_metadata()
         return PageExtractionResult(
             page_number=result.page_number,
             char_count=len(ocr_text),
@@ -137,10 +144,44 @@ class PDFTextExtractor:
             needs_ocr=result.needs_ocr,
             used_ocr=True,
             reasons=result.reasons,
-            ocr_metadata=recognition.metadata,
+            ocr_metadata=ocr_metadata,
             blocks=[{"x0": 0.0, "y0": 0.0, "x1": 0.0, "y1": 0.0, "text": ocr_text}] if ocr_text else [],
             text=ocr_text,
         )
+
+    def _summarize_ocr_text_quality(self, pages: list[PageExtractionResult]) -> dict | None:
+        used_ocr_pages = [page for page in pages if page.used_ocr]
+        if not used_ocr_pages:
+            return None
+
+        normalized_ocr_pages: list[int] = []
+        summary = {
+            "normalization_applied": False,
+            "normalization_strategy": "fullwidth_ascii_fold",
+            "fullwidth_ascii_count": 0,
+            "fullwidth_latin_count": 0,
+            "fullwidth_digit_count": 0,
+            "fullwidth_ascii_punctuation_count": 0,
+            "fullwidth_space_count": 0,
+            "normalized_ocr_pages": normalized_ocr_pages,
+        }
+        for page in used_ocr_pages:
+            metadata = page.ocr_metadata if isinstance(page.ocr_metadata, dict) else {}
+            text_quality = metadata.get("text_quality") if isinstance(metadata.get("text_quality"), dict) else {}
+            if text_quality.get("normalization_applied"):
+                normalized_ocr_pages.append(page.page_number)
+                summary["normalization_applied"] = True
+            for field in (
+                "fullwidth_ascii_count",
+                "fullwidth_latin_count",
+                "fullwidth_digit_count",
+                "fullwidth_ascii_punctuation_count",
+                "fullwidth_space_count",
+            ):
+                summary[field] += int(text_quality.get(field) or 0)
+        if not summary["normalization_applied"]:
+            summary["normalization_strategy"] = None
+        return summary
 
     def _join_blocks(self, blocks: list[tuple], page_width: float) -> str:
         if not blocks:
