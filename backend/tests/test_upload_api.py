@@ -4,10 +4,10 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.models import Job, Paper, PaperAsset, PaperChunk
+from app.models import Job, OrganizationSettings, Paper, PaperAsset, PaperChunk
 from app.services import llm
 from app.routers import papers as papers_router
-from app.services.papers import run_paper_summary_job, run_pdf_ingest_job
+from app.services.papers import run_paper_question_set_job, run_paper_summary_job, run_pdf_ingest_job
 from app.services.pdf_extraction import DocumentExtractionResult, PDFTextExtractor
 
 
@@ -35,6 +35,22 @@ def make_summary_payload(
         "doi": doi,
         "source_url": source_url,
         "published_at": published_at,
+    }
+
+
+def make_question_set_payload(
+    *,
+    questions: list[dict[str, str]] | None = None,
+    model_name: str = "test-question-set-model",
+) -> dict:
+    return {
+        "generated_at": "2026-05-16T00:00:00Z",
+        "model_name": model_name,
+        "questions": questions
+        or [
+            {"id": "q1", "question": "这篇论文研究了什么？", "answer": "研究了一个测试问题。"},
+            {"id": "q2", "question": "方法是什么？", "answer": "使用测试方法。"},
+        ],
     }
 
 
@@ -81,6 +97,16 @@ def login_as(client, *, username: str, password: str) -> None:
     assert response.status_code == 200
 
 
+def set_org_question_set(db_session: Session, *, organization_id: int, questions: list[dict[str, str]]) -> None:
+    settings = db_session.scalar(select(OrganizationSettings).where(OrganizationSettings.organization_id == organization_id))
+    if settings is None:
+        settings = OrganizationSettings(organization_id=organization_id, auto_extraction_questions_json=questions)
+        db_session.add(settings)
+    else:
+        settings.auto_extraction_questions_json = questions
+    db_session.commit()
+
+
 def make_eager_upload_delay(
     session_factory: sessionmaker,
     *,
@@ -95,7 +121,9 @@ def make_eager_upload_delay(
                 extractor=extractor or SuccessfulTextExtractor(),
             )
             if summary_job_id is not None:
-                run_paper_summary_job(summary_job_id, session_factory=session_factory)
+                question_set_job_id = run_paper_summary_job(summary_job_id, session_factory=session_factory)
+                if question_set_job_id is not None:
+                    run_paper_question_set_job(question_set_job_id, session_factory=session_factory)
         except Exception:
             if not swallow_errors:
                 raise
@@ -107,7 +135,21 @@ def make_eager_upload_delay(
 def make_eager_summary_delay(session_factory: sessionmaker, *, swallow_errors: bool = True):
     def eager_delay(job_id: int):
         try:
-            run_paper_summary_job(job_id, session_factory=session_factory)
+            question_set_job_id = run_paper_summary_job(job_id, session_factory=session_factory)
+            if question_set_job_id is not None:
+                run_paper_question_set_job(question_set_job_id, session_factory=session_factory)
+        except Exception:
+            if not swallow_errors:
+                raise
+        return None
+
+    return eager_delay
+
+
+def make_eager_question_set_delay(session_factory: sessionmaker, *, swallow_errors: bool = True):
+    def eager_delay(job_id: int):
+        try:
+            run_paper_question_set_job(job_id, session_factory=session_factory)
         except Exception:
             if not swallow_errors:
                 raise
@@ -127,6 +169,21 @@ def mock_summary(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(llm, "summarize_paper_text", fake_summary)
     monkeypatch.setattr("app.services.papers.summarize_paper_text", fake_summary)
+
+    def fake_question_set(_: str, *, structured_summary: dict | None, questions: list[dict[str, str]]) -> dict:
+        question_payload = []
+        for item in questions:
+            question_payload.append(
+                {
+                    "id": item["id"],
+                    "question": item["question"],
+                    "answer": f"回答：{item['question']}",
+                }
+            )
+        return make_question_set_payload(questions=question_payload)
+
+    monkeypatch.setattr(llm, "answer_question_set_questions", fake_question_set)
+    monkeypatch.setattr("app.services.papers.answer_question_set_questions", fake_question_set)
 
     def fake_embeddings(texts: list[str]) -> list[list[float]]:
         return [[float(len(text)), float(len(text.split()))] for text in texts]
@@ -158,12 +215,21 @@ def test_upload_rejects_non_pdf(client, user) -> None:
 def test_upload_creates_records_and_completes_job(
     client,
     user,
+    organization,
     db_session: Session,
     monkeypatch: pytest.MonkeyPatch,
     session_factory: sessionmaker,
 ) -> None:
     login(client)
     monkeypatch.setattr("app.config.settings.openai_api_key", "test-key")
+    set_org_question_set(
+        db_session,
+        organization_id=organization.id,
+        questions=[
+            {"id": "q1", "question": "这篇论文研究了什么？"},
+            {"id": "q2", "question": "方法是什么？"},
+        ],
+    )
 
     original_delay = papers_router.process_uploaded_pdf.delay
     monkeypatch.setattr(
@@ -210,6 +276,7 @@ def test_upload_creates_records_and_completes_job(
     assert asset.metadata_json["preanalysis"]["schema_version"] == 1
     assert asset.metadata_json["preanalysis"]["chunking_hints"]["block_count"] >= 1
     assert asset.metadata_json["structured_summary"]["doi"] == "10.1000/researchdock"
+    assert asset.metadata_json["question_set_extraction"]["questions"][0]["id"] == "q1"
     assert len(chunks) > 0
     assert chunks[0].content
     assert chunks[0].page_from == 1
@@ -225,11 +292,17 @@ def test_upload_creates_records_and_completes_job(
 def test_paper_list_and_detail_return_preview_data(
     client,
     user,
+    organization,
     db_session: Session,
     monkeypatch: pytest.MonkeyPatch,
     session_factory: sessionmaker,
 ) -> None:
     login(client)
+    set_org_question_set(
+        db_session,
+        organization_id=organization.id,
+        questions=[{"id": "q1", "question": "这篇论文研究了什么？"}],
+    )
 
     original_delay = papers_router.process_uploaded_pdf.delay
     monkeypatch.setattr("app.config.settings.openai_api_key", "test-key")
@@ -266,6 +339,7 @@ def test_paper_list_and_detail_return_preview_data(
     assert items[0]["published_at"].startswith("2024-05-01")
     assert items[0]["ocr_status"] == "completed"
     assert items[0]["summary_status"] == "completed"
+    assert items[0]["question_set_status"] == "completed"
 
     detail_response = client.get(f"/api/papers/{body['paper_id']}")
     assert detail_response.status_code == 200
@@ -280,8 +354,11 @@ def test_paper_list_and_detail_return_preview_data(
     assert detail["published_at"].startswith("2024-05-01")
     assert detail["ocr_status"] == "completed"
     assert detail["summary_status"] == "completed"
+    assert detail["question_set_status"] == "completed"
     assert detail["latest_ocr_job"]["job_type"] == "pdf_ingest"
     assert detail["latest_summary_job"]["job_type"] == "paper_summary"
+    assert detail["latest_question_set_job"]["job_type"] == "paper_question_set"
+    assert detail["question_set_extraction"]["questions"][0]["id"] == "q1"
 
 
 def test_summary_timeout_keeps_ocr_result_and_marks_only_summary_failed(
@@ -323,6 +400,7 @@ def test_summary_timeout_keeps_ocr_result_and_marks_only_summary_failed(
     assert "embedded text layer" in detail["preview_text"]
     assert detail["ocr_status"] == "completed"
     assert detail["summary_status"] == "failed"
+    assert detail["question_set_status"] is None
     assert detail["latest_ocr_job"]["status"] == "completed"
     assert detail["latest_summary_job"]["status"] == "failed"
     assert "timed out" in (detail["latest_summary_job"]["error_message"] or "")
@@ -740,11 +818,18 @@ def test_rerun_ocr_creates_new_job(
 def test_regenerate_summary_creates_summary_job_without_clearing_ocr_text(
     client,
     user,
+    organization,
+    db_session: Session,
     monkeypatch: pytest.MonkeyPatch,
     session_factory: sessionmaker,
 ) -> None:
     login(client)
     monkeypatch.setattr("app.config.settings.openai_api_key", "test-key")
+    set_org_question_set(
+        db_session,
+        organization_id=organization.id,
+        questions=[{"id": "q1", "question": "摘要重跑后仍要回答的问题"}],
+    )
 
     original_upload_delay = papers_router.process_uploaded_pdf.delay
     original_summary_delay = papers_router.process_paper_summary.delay
@@ -802,9 +887,120 @@ def test_regenerate_summary_creates_summary_job_without_clearing_ocr_text(
     assert body["structured_summary"]["method"] == "新方法"
     assert body["authors"] == "Alice Example; Bob Example"
     assert body["doi"] == "10.1000/researchdock"
-    assert body["latest_job"]["job_type"] == "paper_summary"
+    assert body["latest_job"]["job_type"] == "paper_question_set"
     assert body["ocr_status"] == "completed"
     assert body["summary_status"] == "completed"
+    assert body["question_set_status"] == "completed"
+
+
+def test_updating_org_question_set_does_not_change_existing_paper_results(
+    client,
+    user,
+    organization,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    session_factory: sessionmaker,
+) -> None:
+    login(client)
+    monkeypatch.setattr("app.config.settings.openai_api_key", "test-key")
+    set_org_question_set(
+        db_session,
+        organization_id=organization.id,
+        questions=[{"id": "q1", "question": "旧问题"}],
+    )
+
+    original_delay = papers_router.process_uploaded_pdf.delay
+    monkeypatch.setattr(
+        papers_router.process_uploaded_pdf,
+        "delay",
+        make_eager_upload_delay(session_factory, extractor=SuccessfulTextExtractor()),
+    )
+
+    try:
+        upload_response = client.post(
+            "/api/papers/upload",
+            files={"file": ("question-set-stable.pdf", make_pdf_bytes("paper body"), "application/pdf")},
+        )
+    finally:
+        monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", original_delay)
+
+    assert upload_response.status_code == 202
+    paper_id = upload_response.json()["paper_id"]
+
+    set_org_question_set(
+        db_session,
+        organization_id=organization.id,
+        questions=[{"id": "q2", "question": "新问题"}],
+    )
+
+    detail_response = client.get(f"/api/papers/{paper_id}")
+    assert detail_response.status_code == 200
+    body = detail_response.json()
+    assert [item["id"] for item in body["question_set_extraction"]["questions"]] == ["q1"]
+
+
+def test_regenerate_question_set_uses_latest_organization_questions(
+    client,
+    user,
+    organization,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    session_factory: sessionmaker,
+) -> None:
+    login(client)
+    monkeypatch.setattr("app.config.settings.openai_api_key", "test-key")
+    set_org_question_set(
+        db_session,
+        organization_id=organization.id,
+        questions=[{"id": "q1", "question": "旧问题"}],
+    )
+
+    original_upload_delay = papers_router.process_uploaded_pdf.delay
+    original_question_set_delay = papers_router.process_paper_question_set.delay
+    monkeypatch.setattr(
+        papers_router.process_uploaded_pdf,
+        "delay",
+        make_eager_upload_delay(session_factory, extractor=SuccessfulTextExtractor()),
+    )
+
+    try:
+        upload_response = client.post(
+            "/api/papers/upload",
+            files={"file": ("question-set-rerun.pdf", make_pdf_bytes("paper body"), "application/pdf")},
+        )
+        assert upload_response.status_code == 202
+        paper_id = upload_response.json()["paper_id"]
+    finally:
+        monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", original_upload_delay)
+
+    before_detail = client.get(f"/api/papers/{paper_id}")
+    assert before_detail.status_code == 200
+    assert [item["id"] for item in before_detail.json()["question_set_extraction"]["questions"]] == ["q1"]
+
+    set_org_question_set(
+        db_session,
+        organization_id=organization.id,
+        questions=[{"id": "q2", "question": "新问题"}],
+    )
+
+    monkeypatch.setattr(
+        papers_router.process_paper_question_set,
+        "delay",
+        make_eager_question_set_delay(session_factory),
+    )
+
+    try:
+        regenerate_response = client.post(f"/api/papers/{paper_id}/regenerate-question-set")
+    finally:
+        monkeypatch.setattr(papers_router.process_paper_question_set, "delay", original_question_set_delay)
+
+    assert regenerate_response.status_code == 202
+    detail_response = client.get(f"/api/papers/{paper_id}")
+    assert detail_response.status_code == 200
+    body = detail_response.json()
+    assert [item["id"] for item in body["question_set_extraction"]["questions"]] == ["q2"]
+    assert body["question_set_status"] == "completed"
+    assert body["latest_question_set_job"]["job_type"] == "paper_question_set"
 
 
 def test_summary_invalid_metadata_keeps_paper_fields_empty(

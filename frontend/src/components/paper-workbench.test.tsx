@@ -28,6 +28,7 @@ vi.mock("@/lib/session", () => ({
 const fetchPapers = vi.fn();
 const fetchPaper = vi.fn();
 const deletePaper = vi.fn();
+const regeneratePaperQuestionSet = vi.fn();
 const regeneratePaperSummary = vi.fn();
 const rerunPaperOcr = vi.fn();
 const subscribeTaskStatusEvents = vi.fn(() => vi.fn());
@@ -36,6 +37,7 @@ vi.mock("@/lib/papers", () => ({
   deletePaper: (...args: unknown[]) => deletePaper(...args),
   fetchPaper: (...args: unknown[]) => fetchPaper(...args),
   fetchPapers: (...args: unknown[]) => fetchPapers(...args),
+  regeneratePaperQuestionSet: (...args: unknown[]) => regeneratePaperQuestionSet(...args),
   regeneratePaperSummary: (...args: unknown[]) => regeneratePaperSummary(...args),
   rerunPaperOcr: (...args: unknown[]) => rerunPaperOcr(...args),
   subscribeTaskStatusEvents: (...args: unknown[]) => subscribeTaskStatusEvents(...args),
@@ -59,6 +61,7 @@ function makePaperListItem({
     status: "completed",
     ocr_status: "completed",
     summary_status: "completed",
+    question_set_status: "completed",
     created_at: "2026-05-10T00:00:00Z",
     updated_at: "2026-05-11T00:00:00Z",
   };
@@ -77,15 +80,18 @@ function makePaperDetail(id: number, title: string) {
     status: "completed",
     ocr_status: "completed",
     summary_status: "completed",
+    question_set_status: "completed",
     created_at: "2026-05-10T00:00:00Z",
     updated_at: "2026-05-11T00:00:00Z",
     original_filename: `${title}.pdf`,
     preview_text: `${title} preview`,
     extraction_metadata: null,
     structured_summary: null,
+    question_set_extraction: null,
     latest_job: null,
     latest_ocr_job: null,
     latest_summary_job: null,
+    latest_question_set_job: null,
   };
 }
 
@@ -169,5 +175,44 @@ describe("PaperWorkbench", () => {
 
     expect(screen.getAllByText("来源：摘要自动提取")).toHaveLength(3);
     expect(screen.getByText("来源：手动编辑")).toBeInTheDocument();
+  });
+
+  it("展示问题集阶段和结果标签页", async () => {
+    const papers = [makePaperListItem({ id: 1, title: "Alpha", publishedAt: "2024-05-01T00:00:00Z" })];
+
+    fetchPapers.mockResolvedValue(papers);
+    fetchPaper.mockResolvedValue({
+      ...makePaperDetail(1, "Alpha"),
+      question_set_extraction: {
+        generated_at: "2026-05-16T00:00:00Z",
+        model_name: "test-model",
+        questions: [{ id: "q1", question: "这篇论文研究了什么？", answer: "回答内容" }],
+      },
+      latest_question_set_job: {
+        id: 3,
+        job_type: "paper_question_set",
+        paper_id: 1,
+        status: "completed",
+        error_message: null,
+        retry_count: 0,
+        started_at: null,
+        finished_at: null,
+        created_at: "2026-05-16T00:00:00Z",
+      },
+    });
+
+    function Harness() {
+      const [selectedPaperId, setSelectedPaperId] = useState<number | null>(1);
+      return <PaperWorkbench selectedPaperId={selectedPaperId} onSelectedPaperChange={setSelectedPaperId} />;
+    }
+
+    render(<Harness />);
+
+    await waitFor(() => expect(fetchPaper).toHaveBeenCalledWith(1));
+    expect(screen.getAllByText(/问题集/).length).toBeGreaterThan(0);
+
+    await userEvent.setup().click(screen.getByRole("button", { name: "问题集结果" }));
+    expect(screen.getByText("这篇论文研究了什么？")).toBeInTheDocument();
+    expect(screen.getByText("回答内容")).toBeInTheDocument();
   });
 });

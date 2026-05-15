@@ -69,6 +69,33 @@ class JobListResponse(BaseModel):
     items: list[JobPublic]
 
 
+class OrganizationQuestionItem(BaseModel):
+    id: str
+    question: str
+
+
+class OrganizationQuestionSetResponse(BaseModel):
+    organization_id: int
+    questions: list[OrganizationQuestionItem]
+    updated_at: datetime | None = None
+
+
+class OrganizationQuestionSetUpdateRequest(BaseModel):
+    questions: list[OrganizationQuestionItem]
+
+
+class QuestionSetAnswerItem(BaseModel):
+    id: str
+    question: str
+    answer: str
+
+
+class QuestionSetExtractionPublic(BaseModel):
+    generated_at: datetime | None = None
+    model_name: str | None = None
+    questions: list[QuestionSetAnswerItem]
+
+
 class PaperListItem(BaseModel):
     id: int
     organization_id: int
@@ -79,6 +106,7 @@ class PaperListItem(BaseModel):
     status: str | None
     ocr_status: str | None = None
     summary_status: str | None = None
+    question_set_status: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -102,15 +130,18 @@ class PaperDetailResponse(BaseModel):
     status: str | None
     ocr_status: str | None
     summary_status: str | None
+    question_set_status: str | None = None
     created_at: datetime
     updated_at: datetime
     original_filename: str | None
     preview_text: str | None
     extraction_metadata: dict | None
     structured_summary: dict | None
+    question_set_extraction: QuestionSetExtractionPublic | None = None
     latest_job: JobPublic | None
     latest_ocr_job: JobPublic | None
     latest_summary_job: JobPublic | None
+    latest_question_set_job: JobPublic | None = None
 
 
 class TaskStatusEvent(BaseModel):
@@ -122,6 +153,7 @@ class TaskStatusEvent(BaseModel):
     paper_status: str | None
     ocr_status: str | None
     summary_status: str | None
+    question_set_status: str | None = None
     error_message: str | None
     updated_at: datetime
     job: JobPublic | None

@@ -2,9 +2,10 @@
 
 import { useEffect, useState, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
-import { FileText, MessagesSquare } from "lucide-react";
+import { FileQuestion, FileText, MessagesSquare } from "lucide-react";
 
 import { ChatPanel } from "@/components/chat-panel";
+import { OrgQuestionSetPanel } from "@/components/org-question-set-panel";
 import { PaperWorkbench } from "@/components/paper-workbench";
 import { TaskListPopover } from "@/components/task-list-popover";
 import { Button } from "@/components/ui/button";
@@ -16,7 +17,7 @@ export default function Home() {
   const router = useRouter();
   const [me, setMe] = useState<SessionUser | null>(null);
   const [phase, setPhase] = useState<"loading" | "ready" | "redirect">("loading");
-  const [activeTab, setActiveTab] = useState<"papers" | "chat">("papers");
+  const [activeTab, setActiveTab] = useState<"papers" | "chat" | "question-set">("papers");
   const [selectedPaperId, setSelectedPaperId] = useState<number | null>(null);
 
   useEffect(() => {
@@ -49,7 +50,17 @@ export default function Home() {
 
   const canReadPapers = me.permissions.includes("papers:read");
   const canReadJobs = me.permissions.includes("jobs:read");
-  const resolvedTab = activeTab === "papers" && !canReadPapers ? "chat" : activeTab;
+  const canReadOrgSettings = me.permissions.includes("org_settings:read");
+  const resolvedTab =
+    activeTab === "papers" && !canReadPapers
+      ? canReadOrgSettings
+        ? "question-set"
+        : "chat"
+      : activeTab === "question-set" && !canReadOrgSettings
+        ? canReadPapers
+          ? "papers"
+          : "chat"
+        : activeTab;
 
   return (
     <SessionProvider value={me}>
@@ -92,6 +103,11 @@ export default function Home() {
                 论文
               </TabButton>
             ) : null}
+            {canReadOrgSettings ? (
+              <TabButton active={resolvedTab === "question-set"} onClick={() => setActiveTab("question-set")} icon={<FileQuestion className="size-4" />}>
+                问题集
+              </TabButton>
+            ) : null}
             <TabButton active={resolvedTab === "chat"} onClick={() => setActiveTab("chat")} icon={<MessagesSquare className="size-4" />}>
               对话
             </TabButton>
@@ -100,6 +116,8 @@ export default function Home() {
           <div className="min-h-0 flex-1 overflow-hidden">
             {resolvedTab === "papers" ? (
               <PaperWorkbench selectedPaperId={selectedPaperId} onSelectedPaperChange={setSelectedPaperId} />
+            ) : resolvedTab === "question-set" ? (
+              <OrgQuestionSetPanel />
             ) : (
               <ChatPanel />
             )}

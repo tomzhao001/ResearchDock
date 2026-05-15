@@ -4,6 +4,7 @@ import json
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import httpx
 
@@ -36,6 +37,25 @@ SUMMARY_USER_TEMPLATE = """
 
 如果信息不足，请返回空字符串或空数组，不要编造。
 只能使用论文文本中明确出现的信息，不要根据常识补全作者、DOI、链接或发布时间。
+
+论文文本：
+{paper_text}
+""".strip()
+
+QUESTION_SET_USER_TEMPLATE = """
+请基于给定论文摘要和论文文本，回答问题集，并输出一个 JSON 对象，字段必须严格包含：
+- answers: 数组，每个元素都是一个对象，且必须包含 id、question、answer
+
+要求：
+- answers 必须与输入问题逐一对应，保持相同顺序
+- answer 只能使用论文文本或摘要中明确出现的信息
+- 如果信息不足，请返回空字符串，不要编造
+
+问题集：
+{question_set}
+
+论文摘要（JSON）：
+{summary_json}
 
 论文文本：
 {paper_text}
@@ -400,4 +420,68 @@ def summarize_paper_text(raw_text: str) -> dict:
         "doi": parsed.get("doi") or "",
         "source_url": parsed.get("source_url") or "",
         "published_at": parsed.get("published_at") or "",
+    }
+
+
+def answer_question_set_questions(
+    raw_text: str,
+    *,
+    structured_summary: dict | None,
+    questions: Sequence[dict[str, str]],
+) -> dict:
+    text = (raw_text or "").strip()
+    if not text:
+        raise RuntimeError("论文文本为空，无法生成问题集结果")
+    if not questions:
+        raise RuntimeError("问题集为空，无法生成问题集结果")
+
+    normalized_questions = [
+        {
+            "id": str(item.get("id") or "").strip(),
+            "question": str(item.get("question") or "").strip(),
+        }
+        for item in questions
+        if str(item.get("id") or "").strip() and str(item.get("question") or "").strip()
+    ]
+    if not normalized_questions:
+        raise RuntimeError("问题集为空，无法生成问题集结果")
+
+    content, model_name = _request_chat_completion(
+        [
+            {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": QUESTION_SET_USER_TEMPLATE.format(
+                    question_set=json.dumps(normalized_questions, ensure_ascii=False),
+                    summary_json=json.dumps(structured_summary or {}, ensure_ascii=False),
+                    paper_text=text[:12000],
+                ),
+            },
+        ],
+        temperature=0.1,
+    )
+    parsed = _extract_json_object(content)
+    raw_answers = parsed.get("answers")
+    answer_by_id: dict[str, str] = {}
+    if isinstance(raw_answers, list):
+        for item in raw_answers:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id") or "").strip()
+            if not item_id:
+                continue
+            answer_by_id[item_id] = str(item.get("answer") or "").strip()
+
+    answers = [
+        {
+            "id": item["id"],
+            "question": item["question"],
+            "answer": answer_by_id.get(item["id"], ""),
+        }
+        for item in normalized_questions
+    ]
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "model_name": model_name or "",
+        "questions": answers,
     }

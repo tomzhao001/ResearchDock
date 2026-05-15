@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import Job
-from app.schemas import JobPublic, PaperDetailResponse, PaperListItem, TaskStatusEvent
+from app.schemas import JobPublic, PaperDetailResponse, PaperListItem, QuestionSetExtractionPublic, TaskStatusEvent
 
 TASK_STATUS_CHANNEL = "researchdock:task-status"
 
@@ -33,13 +33,18 @@ def _build_paper_detail_response(detail) -> PaperDetailResponse:
     metadata = detail.asset.metadata_json if detail.asset else None
     extraction_metadata = None
     structured_summary = None
+    question_set_extraction = None
     if isinstance(metadata, dict):
         extraction_metadata = metadata.get("extraction")
         structured_summary = metadata.get("structured_summary")
+        raw_question_set_extraction = metadata.get("question_set_extraction")
+        if isinstance(raw_question_set_extraction, dict):
+            question_set_extraction = QuestionSetExtractionPublic.model_validate(raw_question_set_extraction)
 
     latest_job = JobPublic.model_validate(detail.latest_job) if detail.latest_job else None
     latest_ocr_job = JobPublic.model_validate(detail.latest_ocr_job) if detail.latest_ocr_job else None
     latest_summary_job = JobPublic.model_validate(detail.latest_summary_job) if detail.latest_summary_job else None
+    latest_question_set_job = JobPublic.model_validate(detail.latest_question_set_job) if detail.latest_question_set_job else None
     return PaperDetailResponse(
         id=detail.paper.id,
         organization_id=detail.paper.organization_id,
@@ -53,15 +58,18 @@ def _build_paper_detail_response(detail) -> PaperDetailResponse:
         status=detail.paper.status,
         ocr_status=get_job_phase_status(detail.latest_ocr_job),
         summary_status=get_job_phase_status(detail.latest_summary_job),
+        question_set_status=get_job_phase_status(detail.latest_question_set_job),
         created_at=detail.paper.created_at,
         updated_at=detail.paper.updated_at,
         original_filename=get_original_filename(detail.asset),
         preview_text=detail.asset.raw_text if detail.asset else None,
         extraction_metadata=extraction_metadata if isinstance(extraction_metadata, dict) else None,
         structured_summary=structured_summary if isinstance(structured_summary, dict) else None,
+        question_set_extraction=question_set_extraction,
         latest_job=latest_job,
         latest_ocr_job=latest_ocr_job,
         latest_summary_job=latest_summary_job,
+        latest_question_set_job=latest_question_set_job,
     )
 
 
@@ -77,6 +85,7 @@ def _build_paper_list_item(detail) -> PaperListItem:
         status=detail.paper.status,
         ocr_status=get_job_phase_status(detail.latest_ocr_job),
         summary_status=get_job_phase_status(detail.latest_summary_job),
+        question_set_status=get_job_phase_status(detail.latest_question_set_job),
         created_at=detail.paper.created_at,
         updated_at=detail.paper.updated_at,
     )
@@ -104,6 +113,7 @@ def build_task_status_event(db: Session, *, paper_id: int, job_id: int | None = 
         paper_status=detail.paper.status,
         ocr_status=detail_response.ocr_status,
         summary_status=detail_response.summary_status,
+        question_set_status=detail_response.question_set_status,
         error_message=job.error_message if job else None,
         updated_at=detail.paper.updated_at,
         job=JobPublic.model_validate(job) if job else None,

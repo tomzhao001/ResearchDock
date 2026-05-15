@@ -11,6 +11,7 @@ from app.schemas import (
     MessageResponse,
     PaperDetailResponse,
     PaperListItem,
+    QuestionSetExtractionPublic,
     PaperListResponse,
     PaperUpdateRequest,
     UploadAcceptedResponse,
@@ -19,6 +20,7 @@ from app.services.papers import (
     DuplicateFilenameError,
     create_upload_artifacts,
     delete_paper,
+    enqueue_paper_question_set_regeneration,
     enqueue_paper_ocr_rerun,
     enqueue_paper_summary_regeneration,
     get_job_phase_status,
@@ -27,7 +29,7 @@ from app.services.papers import (
     list_papers,
     update_paper_metadata,
 )
-from app.tasks.paper_ingest import process_paper_summary, process_uploaded_pdf
+from app.tasks.paper_ingest import process_paper_question_set, process_paper_summary, process_uploaded_pdf
 
 router = APIRouter(prefix="/api/papers", tags=["papers"])
 
@@ -41,13 +43,18 @@ def build_paper_detail_response(detail) -> PaperDetailResponse:
     metadata = detail.asset.metadata_json if detail.asset else None
     extraction_metadata = None
     structured_summary = None
+    question_set_extraction = None
     if isinstance(metadata, dict):
         extraction_metadata = metadata.get("extraction")
         structured_summary = metadata.get("structured_summary")
+        raw_question_set_extraction = metadata.get("question_set_extraction")
+        if isinstance(raw_question_set_extraction, dict):
+            question_set_extraction = QuestionSetExtractionPublic.model_validate(raw_question_set_extraction)
 
     latest_job = JobPublic.model_validate(detail.latest_job) if detail.latest_job else None
     latest_ocr_job = JobPublic.model_validate(detail.latest_ocr_job) if detail.latest_ocr_job else None
     latest_summary_job = JobPublic.model_validate(detail.latest_summary_job) if detail.latest_summary_job else None
+    latest_question_set_job = JobPublic.model_validate(detail.latest_question_set_job) if detail.latest_question_set_job else None
     return PaperDetailResponse(
         id=detail.paper.id,
         organization_id=detail.paper.organization_id,
@@ -61,15 +68,18 @@ def build_paper_detail_response(detail) -> PaperDetailResponse:
         status=detail.paper.status,
         ocr_status=get_job_phase_status(detail.latest_ocr_job),
         summary_status=get_job_phase_status(detail.latest_summary_job),
+        question_set_status=get_job_phase_status(detail.latest_question_set_job),
         created_at=detail.paper.created_at,
         updated_at=detail.paper.updated_at,
         original_filename=get_original_filename(detail.asset),
         preview_text=detail.asset.raw_text if detail.asset else None,
         extraction_metadata=extraction_metadata if isinstance(extraction_metadata, dict) else None,
         structured_summary=structured_summary if isinstance(structured_summary, dict) else None,
+        question_set_extraction=question_set_extraction,
         latest_job=latest_job,
         latest_ocr_job=latest_ocr_job,
         latest_summary_job=latest_summary_job,
+        latest_question_set_job=latest_question_set_job,
     )
 
 
@@ -93,6 +103,7 @@ def get_papers(
                 status=item.status,
                 ocr_status=get_job_phase_status(detail.latest_ocr_job) if detail else None,
                 summary_status=get_job_phase_status(detail.latest_summary_job) if detail else None,
+                question_set_status=get_job_phase_status(detail.latest_question_set_job) if detail else None,
                 created_at=item.created_at,
                 updated_at=item.updated_at,
             )
@@ -192,6 +203,29 @@ def regenerate_paper_summary(
         paper_id=paper_id,
         job_id=job.id,
         job_type=job.job_type or "paper_summary",
+        status=job.status or "queued",
+    )
+
+
+@router.post("/{paper_id}/regenerate-question-set", response_model=JobAcceptedResponse, status_code=status.HTTP_202_ACCEPTED)
+def regenerate_paper_question_set(
+    paper_id: int,
+    db: Annotated[Session, Depends(get_db)],
+    context: Annotated[AuthContext, Depends(require_permission("papers:write"))],
+):
+    try:
+        job = enqueue_paper_question_set_regeneration(db, paper_id, organization_id=context.organization.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Paper not found")
+
+    process_paper_question_set.delay(job.id)
+    return JobAcceptedResponse(
+        paper_id=paper_id,
+        job_id=job.id,
+        job_type=job.job_type or "paper_question_set",
         status=job.status or "queued",
     )
 

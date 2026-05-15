@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.db_migrations import run_startup_migrations
-from app.routers import auth_routes, chat, health, jobs, papers, ws
+from app.routers import auth_routes, chat, health, jobs, org_settings, papers, ws
 from app.services.http_clients import close_shared_http_clients
 
 
@@ -31,6 +31,7 @@ app.add_middleware(
 
 app.include_router(health.router)
 app.include_router(auth_routes.router)
+app.include_router(org_settings.router)
 app.include_router(papers.router)
 app.include_router(jobs.router)
 app.include_router(chat.router)

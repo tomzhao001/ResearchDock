@@ -16,6 +16,7 @@ import {
   deletePaper,
   fetchPaper,
   fetchPapers,
+  regeneratePaperQuestionSet,
   regeneratePaperSummary,
   rerunPaperOcr,
   subscribeTaskStatusEvents,
@@ -219,9 +220,9 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
   const [uploadDialogOpen, setUploadDialogOpen] = useState(false);
   const [metadataDialogOpen, setMetadataDialogOpen] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
-  const [confirmAction, setConfirmAction] = useState<"rerun-ocr" | "regenerate-summary" | null>(null);
-  const [previewTab, setPreviewTab] = useState<"summary" | "ocr">("summary");
-  const [actionLoading, setActionLoading] = useState<"rerun-ocr" | "regenerate-summary" | "delete" | null>(null);
+  const [confirmAction, setConfirmAction] = useState<"rerun-ocr" | "regenerate-summary" | "regenerate-question-set" | null>(null);
+  const [previewTab, setPreviewTab] = useState<"summary" | "ocr" | "questionSet">("summary");
+  const [actionLoading, setActionLoading] = useState<"rerun-ocr" | "regenerate-summary" | "regenerate-question-set" | "delete" | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [sortMode, setSortMode] = useState<PaperSortMode>("publishedAt");
   const [sortDirection, setSortDirection] = useState<PaperSortDirection>("desc");
@@ -327,7 +328,11 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
     if (!paperDetail) {
       return false;
     }
-    return ACTIVE_STATUSES.has(paperDetail.ocr_status ?? "") || ACTIVE_STATUSES.has(paperDetail.summary_status ?? "");
+    return (
+      ACTIVE_STATUSES.has(paperDetail.ocr_status ?? "") ||
+      ACTIVE_STATUSES.has(paperDetail.summary_status ?? "") ||
+      ACTIVE_STATUSES.has(paperDetail.question_set_status ?? "")
+    );
   }, [paperDetail]);
 
   const sortedPapers = useMemo(
@@ -406,6 +411,26 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
     }
   }
 
+  async function handleRegenerateQuestionSet() {
+    if (!paperDetail) {
+      return;
+    }
+
+    setConfirmAction(null);
+    setActionLoading("regenerate-question-set");
+    setActionError(null);
+    try {
+      await regeneratePaperQuestionSet(paperDetail.id);
+      await loadPapers(paperDetail.id);
+      await loadDetail(paperDetail.id);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "重新提取问题集失败";
+      setActionError(message);
+    } finally {
+      setActionLoading(null);
+    }
+  }
+
   async function handleManualRefresh() {
     setManualRefreshing(true);
     try {
@@ -429,6 +454,12 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
             description: "系统会基于当前 OCR 文本重新生成摘要和结构化信息。",
             buttonLabel: "确认重新生成摘要",
           }
+        : confirmAction === "regenerate-question-set"
+          ? {
+              title: "确认重新提取问题集",
+              description: "系统会基于当前摘要、OCR 文本和组织级问题集重新提取问题结果。",
+              buttonLabel: "确认重新提取问题集",
+            }
         : null;
 
   return (
@@ -527,6 +558,10 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                 }
                 if (confirmAction === "regenerate-summary") {
                   void handleRegenerateSummary();
+                  return;
+                }
+                if (confirmAction === "regenerate-question-set") {
+                  void handleRegenerateQuestionSet();
                 }
               }}
               disabled={confirmAction !== null && actionLoading === confirmAction}
@@ -673,6 +708,11 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                       status={paper.summary_status}
                       className={selectedPaperId === paper.id ? "bg-white/80 text-slate-700 ring-slate-300" : undefined}
                     />
+                    <PhaseBadge
+                      label="问题集"
+                      status={paper.question_set_status}
+                      className={selectedPaperId === paper.id ? "bg-white/80 text-slate-700 ring-slate-300" : undefined}
+                    />
                   </div>
                 </div>
                 <p className={cn("text-sm leading-6", selectedPaperId === paper.id ? "text-slate-700" : "text-slate-600")}>
@@ -698,6 +738,7 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                 items={[
                   { value: "summary", label: "摘要和文档信息" },
                   { value: "ocr", label: "OCR 文本预览" },
+                  { value: "questionSet", label: "问题集结果" },
                 ]}
               />
             </div>
@@ -792,6 +833,21 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                               : undefined
                           }
                         />
+                        <PhaseBadge
+                          label="问题集"
+                          status={paperDetail.question_set_status}
+                          action={
+                            canWritePapers
+                              ? {
+                                  tooltip: "重新提取问题集",
+                                  ariaLabel: "重新提取问题集",
+                                  disabled: hasActiveJob || isBusy,
+                                  loading: actionLoading === "regenerate-question-set",
+                                  onClick: () => setConfirmAction("regenerate-question-set"),
+                                }
+                              : undefined
+                          }
+                        />
                       </div>
                     </div>
 
@@ -876,6 +932,34 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                     <pre className="overflow-x-auto whitespace-pre-wrap break-words">
                       {paperDetail.preview_text || "当前还没有可预览的文本，任务完成后会在这里显示。"}
                     </pre>
+                  </div>
+                </TabPanel>
+
+                <TabPanel active={previewTab === "questionSet"} className="grid gap-3">
+                  <div className="rounded-2xl border border-slate-200 bg-slate-50/80 p-5">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <h3 className="text-sm font-medium text-slate-700">问题集抽取结果</h3>
+                        <p className="text-xs text-slate-500">
+                          状态：{phaseStatusLabel(paperDetail.question_set_status)} | 最近任务：
+                          {paperDetail.latest_question_set_job?.created_at ? ` ${formatTime(paperDetail.latest_question_set_job.created_at)}` : " -"}
+                        </p>
+                      </div>
+                    </div>
+                    {paperDetail.question_set_extraction ? (
+                      <div className="mt-4 grid gap-3">
+                        {paperDetail.question_set_extraction.questions.map((item) => (
+                          <div key={item.id} className="rounded-2xl bg-white px-4 py-4 shadow-sm ring-1 ring-slate-200">
+                            <h4 className="text-sm font-medium text-slate-800">{item.question}</h4>
+                            <p className="mt-2 text-sm leading-6 text-slate-600">{item.answer || "暂无结果"}</p>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="mt-4 rounded-2xl border border-dashed border-slate-200 bg-white px-4 py-8 text-sm text-slate-500">
+                        当前还没有问题集抽取结果。请先确认组织已配置问题集，并等待摘要完成后自动执行，或手动点击重跑。
+                      </div>
+                    )}
                   </div>
                 </TabPanel>
               </div>

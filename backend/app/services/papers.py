@@ -15,7 +15,8 @@ from app.config import settings
 from app.database import SessionLocal
 from app.models import Job, Paper, PaperAsset, PaperChunk
 from app.services.document_preprocess import preprocess_document
-from app.services.llm import is_chat_llm_configured, summarize_paper_text
+from app.services.llm import answer_question_set_questions, is_chat_llm_configured, summarize_paper_text
+from app.services.org_settings import get_organization_question_items
 from app.services.pdf_extraction import PDFTextExtractor
 from app.services.rag import rebuild_paper_index
 from app.services.task_events import publish_task_status_event
@@ -35,6 +36,7 @@ class PaperDetailData:
     latest_job: Job | None
     latest_ocr_job: Job | None
     latest_summary_job: Job | None
+    latest_question_set_job: Job | None
 
 
 class DuplicateFilenameError(RuntimeError):
@@ -136,6 +138,38 @@ def _queue_summary_job_if_needed(db: Session, paper: Paper, asset: PaperAsset) -
     db.refresh(summary_job)
     publish_task_status_event(db, paper_id=paper.id, job_id=summary_job.id)
     return summary_job.id
+
+
+def _extract_structured_summary_from_asset(asset: PaperAsset | None) -> dict | None:
+    metadata = asset.metadata_json if asset else None
+    if not isinstance(metadata, dict):
+        return None
+    structured_summary = metadata.get("structured_summary")
+    return structured_summary if isinstance(structured_summary, dict) else None
+
+
+def _queue_question_set_job_if_needed(db: Session, paper: Paper, asset: PaperAsset) -> int | None:
+    if not is_chat_llm_configured():
+        return None
+    if not (asset.raw_text or "").strip():
+        return None
+    if _extract_structured_summary_from_asset(asset) is None:
+        return None
+    if not get_organization_question_items(db, organization_id=paper.organization_id):
+        return None
+
+    latest_question_set_job = _get_latest_job_for_paper(db, paper.id, "paper_question_set")
+    if latest_question_set_job is not None and latest_question_set_job.status in ACTIVE_JOB_STATUSES:
+        return latest_question_set_job.id
+
+    paper.status = "queued"
+    paper.updated_at = datetime.now(timezone.utc)
+    question_set_job = Job(job_type="paper_question_set", paper_id=paper.id, status="queued")
+    db.add(question_set_job)
+    db.commit()
+    db.refresh(question_set_job)
+    publish_task_status_event(db, paper_id=paper.id, job_id=question_set_job.id)
+    return question_set_job.id
 
 
 def get_job_phase_status(job: Job | None) -> str | None:
@@ -274,6 +308,7 @@ def get_paper_detail(db: Session, paper_id: int, *, organization_id: int | None 
     asset = _get_original_pdf_asset(db, paper_id)
     latest_ocr_job = _get_latest_job_for_paper(db, paper_id, "pdf_ingest")
     latest_summary_job = _get_latest_job_for_paper(db, paper_id, "paper_summary")
+    latest_question_set_job = _get_latest_job_for_paper(db, paper_id, "paper_question_set")
     latest_job = db.scalar(
         select(Job).where(Job.paper_id == paper_id).order_by(Job.id.desc()).limit(1)
     )
@@ -283,6 +318,7 @@ def get_paper_detail(db: Session, paper_id: int, *, organization_id: int | None 
         latest_job=latest_job,
         latest_ocr_job=latest_ocr_job,
         latest_summary_job=latest_summary_job,
+        latest_question_set_job=latest_question_set_job,
     )
 
 
@@ -416,6 +452,35 @@ def enqueue_paper_summary_regeneration(db: Session, paper_id: int, *, organizati
     return job
 
 
+def enqueue_paper_question_set_regeneration(db: Session, paper_id: int, *, organization_id: int) -> Job | None:
+    paper = _get_scoped_paper(db, paper_id, organization_id=organization_id)
+    if paper is None:
+        return None
+    asset = _get_original_pdf_asset(db, paper_id)
+    if asset is None:
+        raise ValueError("Original PDF not found")
+    if not (asset.raw_text or "").strip():
+        raise ValueError("No OCR text available")
+    if _extract_structured_summary_from_asset(asset) is None:
+        raise ValueError("No structured summary available")
+    if not is_chat_llm_configured():
+        raise ValueError("LLM is not configured for question set extraction")
+    if not get_organization_question_items(db, organization_id=organization_id):
+        raise ValueError("No organization question set configured")
+    if _get_active_job_for_paper(db, paper_id) is not None:
+        raise ValueError("Paper already has an active job")
+
+    now = datetime.now(timezone.utc)
+    paper.status = "queued"
+    paper.updated_at = now
+    job = Job(job_type="paper_question_set", paper_id=paper_id, status="queued")
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    publish_task_status_event(db, paper_id=paper_id, job_id=job.id)
+    return job
+
+
 def run_pdf_ingest_job(
     job_id: int,
     *,
@@ -488,12 +553,12 @@ def run_paper_summary_job(
     job_id: int,
     *,
     session_factory: Callable[[], Session] = SessionLocal,
-) -> None:
+) -> int | None:
     db = session_factory()
     try:
         job = db.get(Job, job_id)
         if not job:
-            return
+            return None
 
         paper = db.get(Paper, job.paper_id) if job.paper_id is not None else None
         asset = _get_original_pdf_asset(db, job.paper_id) if job.paper_id is not None else None
@@ -530,6 +595,74 @@ def run_paper_summary_job(
             paper.source_url = summary["source_url"]
         if paper.published_at is None and published_at is not None:
             paper.published_at = published_at
+        paper.status = "completed"
+        paper.updated_at = datetime.now(timezone.utc)
+        job.status = "completed"
+        job.error_message = None
+        job.finished_at = datetime.now(timezone.utc)
+        db.commit()
+        publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
+        return _queue_question_set_job_if_needed(db, paper, asset)
+    except Exception as exc:
+        if "job" in locals() and job is not None:
+            job.status = "failed"
+            job.error_message = str(exc)
+            job.finished_at = datetime.now(timezone.utc)
+        if "paper" in locals() and paper is not None:
+            paper.status = "failed"
+            paper.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        if "paper" in locals() and paper is not None:
+            publish_task_status_event(db, paper_id=paper.id, job_id=job.id if "job" in locals() and job is not None else None)
+        raise
+    finally:
+        db.close()
+
+
+def run_paper_question_set_job(
+    job_id: int,
+    *,
+    session_factory: Callable[[], Session] = SessionLocal,
+) -> None:
+    db = session_factory()
+    try:
+        job = db.get(Job, job_id)
+        if not job:
+            return
+
+        paper = db.get(Paper, job.paper_id) if job.paper_id is not None else None
+        asset = _get_original_pdf_asset(db, job.paper_id) if job.paper_id is not None else None
+        if paper is None or paper.deleted_at is not None or asset is None:
+            raise RuntimeError("Missing paper or upload asset for question set job")
+        if not is_chat_llm_configured():
+            raise RuntimeError("LLM is not configured for question set extraction")
+        if not (asset.raw_text or "").strip():
+            raise RuntimeError("No OCR text available")
+
+        structured_summary = _extract_structured_summary_from_asset(asset)
+        if structured_summary is None:
+            raise RuntimeError("No structured summary available")
+
+        questions = get_organization_question_items(db, organization_id=paper.organization_id)
+        if not questions:
+            raise RuntimeError("No organization question set configured")
+
+        now = datetime.now(timezone.utc)
+        job.status = "processing"
+        job.started_at = now
+        paper.status = "processing"
+        paper.updated_at = now
+        db.commit()
+        publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
+
+        result = answer_question_set_questions(
+            asset.raw_text,
+            structured_summary=structured_summary,
+            questions=questions,
+        )
+        metadata = dict(asset.metadata_json or {})
+        metadata["question_set_extraction"] = result
+        asset.metadata_json = metadata
         paper.status = "completed"
         paper.updated_at = datetime.now(timezone.utc)
         job.status = "completed"
