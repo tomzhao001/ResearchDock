@@ -85,6 +85,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 - `OCR_PROVIDER=glm_ocr`
 - `LLM_OCR_API_KEY=your-api-key`
 - `LLM_OCR_MODEL=glm-ocr`
+- `OCR_FORCE_FULL_DOCUMENT=false`
 - `OPENAI_API_KEY=your-api-key`
 - `OPENAI_MODEL=your-model`
 
@@ -99,6 +100,7 @@ export CELERY_RESULT_BACKEND=redis://localhost:6379/1
 export OCR_PROVIDER=glm_ocr
 export LLM_OCR_API_KEY=your-api-key
 export LLM_OCR_MODEL=glm-ocr
+export OCR_FORCE_FULL_DOCUMENT=false
 celery -A app.celery_app.celery_app worker --loglevel=info
 ```
 
@@ -113,6 +115,7 @@ $env:CELERY_RESULT_BACKEND = "redis://localhost:6379/1"
 $env:OCR_PROVIDER = "glm_ocr"
 $env:LLM_OCR_API_KEY = "your-api-key"
 $env:LLM_OCR_MODEL = "glm-ocr"
+$env:OCR_FORCE_FULL_DOCUMENT = "false"
 celery -A app.celery_app.celery_app worker --loglevel=info
 ```
 
@@ -120,6 +123,7 @@ celery -A app.celery_app.celery_app worker --loglevel=info
 
 - 上传 PDF 后，后端 API 只负责入队；真正的文本提取与 OCR 在 worker 中执行。
 - 当前实现优先读取 PDF 文本层；只有页级文本质量不足时才会触发 OCR fallback。
+- 若设置 `OCR_FORCE_FULL_DOCUMENT=true`，则会跳过 PDF 文本层判断，整篇文档直接逐页走 OCR。
 - 当前 OCR fallback 通过智谱官方 `GLM-OCR` 接口完成，不再依赖本地 `tesseract`。
 - 本机运行 worker 时，请确认 `redis-server` 已启动，且 `.env` 中已配置 `LLM_OCR_API_KEY`。
 - 若已配置 `OPENAI_*` 环境变量，worker 会在文本提取完成后继续生成中文摘要与结构化信息。
@@ -387,5 +391,6 @@ docker compose logs -f frontend
 - `OCR_PROVIDER`：当前默认 `glm_ocr`，通过 adapter 统一接入 OCR 服务。
 - `LLM_OCR_API_KEY`：智谱 GLM-OCR 的 API key；worker 触发 OCR fallback 时必填。
 - `LLM_OCR_BASE_URL` / `LLM_OCR_MODEL`：默认分别为智谱官方 `layout_parsing` 接口与 `glm-ocr` 模型。
+- `OCR_FORCE_FULL_DOCUMENT`：默认 `false`。设为 `true` 时，跳过 MuPDF 文本层提取判定，整篇 PDF 直接走 OCR。
 - 生产环境若走 HTTPS，请将 `COOKIE_SECURE` 设为 `true`。
 

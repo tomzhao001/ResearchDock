@@ -105,6 +105,7 @@ class Settings(BaseSettings):
     llm_ocr_max_retries: int = 2
     llm_ocr_retry_backoff_seconds: float = 0.5
     llm_ocr_verify_ssl: bool = True
+    ocr_force_full_document: bool = False
     ocr_min_chars_per_page: int = 300
     ocr_min_alpha_ratio: float = 0.6
     ocr_max_empty_page_ratio: float = 0.4

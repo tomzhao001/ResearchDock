@@ -33,16 +33,22 @@ class DocumentExtractionResult:
 
 
 class PDFTextExtractor:
-    def __init__(self, ocr_backend: OcrAdapter | None = None):
+    def __init__(self, ocr_backend: OcrAdapter | None = None, *, force_full_document_ocr: bool | None = None):
         self.ocr_backend = ocr_backend or build_ocr_adapter()
+        self.force_full_document_ocr = (
+            settings.ocr_force_full_document if force_full_document_ocr is None else force_full_document_ocr
+        )
 
     def extract(self, pdf_path: Path) -> DocumentExtractionResult:
         doc = fitz.open(pdf_path)
         pages: list[PageExtractionResult] = []
         try:
             for index, page in enumerate(doc, start=1):
-                page_result = self._extract_page(page, index)
-                if page_result.needs_ocr:
+                if self.force_full_document_ocr:
+                    page_result = self._ocr_page(page, self._build_forced_ocr_result(page, index))
+                else:
+                    page_result = self._extract_page(page, index)
+                if not self.force_full_document_ocr and page_result.needs_ocr:
                     page_result = self._ocr_page(page, page_result)
                 pages.append(page_result)
         finally:
@@ -64,6 +70,7 @@ class PDFTextExtractor:
         text_quality = self._summarize_ocr_text_quality(pages)
         if text_quality is not None:
             metadata["text_quality"] = text_quality
+        metadata["force_full_document_ocr"] = self.force_full_document_ocr
         return DocumentExtractionResult(raw_text=combined_text, metadata=metadata, pages=pages)
 
     def _extract_page(self, page: fitz.Page, page_number: int) -> PageExtractionResult:
@@ -147,6 +154,22 @@ class PDFTextExtractor:
             ocr_metadata=ocr_metadata,
             blocks=[{"x0": 0.0, "y0": 0.0, "x1": 0.0, "y1": 0.0, "text": ocr_text}] if ocr_text else [],
             text=ocr_text,
+        )
+
+    def _build_forced_ocr_result(self, page: fitz.Page, page_number: int) -> PageExtractionResult:
+        return PageExtractionResult(
+            page_number=page_number,
+            char_count=0,
+            alpha_ratio=0.0,
+            continuous_line_ratio=0.0,
+            image_count=len(page.get_images(full=True)),
+            suspected_double_column=False,
+            needs_ocr=True,
+            used_ocr=False,
+            reasons=["full_document_ocr_enabled"],
+            ocr_metadata=None,
+            blocks=[],
+            text="",
         )
 
     def _summarize_ocr_text_quality(self, pages: list[PageExtractionResult]) -> dict | None:
