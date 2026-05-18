@@ -80,6 +80,7 @@ def _build_paper_list_item(detail) -> PaperListItem:
         id=detail.paper.id,
         organization_id=detail.paper.organization_id,
         title=detail.paper.title,
+        authors=detail.paper.authors,
         original_filename=get_original_filename(detail.asset),
         abstract_raw=detail.paper.abstract_raw,
         status=detail.paper.status,

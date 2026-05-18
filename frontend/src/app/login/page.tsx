@@ -82,7 +82,6 @@ export default function LoginPage() {
             <Button type="submit" disabled={loading}>
               {loading ? "登录中…" : "登录"}
             </Button>
-            <p className="text-muted-foreground text-xs">不提供自助注册；初始测试账号见项目 README。</p>
           </form>
         </CardContent>
       </Card>

@@ -97,6 +97,7 @@ def get_papers(
                 id=item.id,
                 organization_id=item.organization_id,
                 title=item.title,
+                authors=item.authors,
                 original_filename=original_filename,
                 abstract_raw=item.abstract_raw,
                 published_at=item.published_at,

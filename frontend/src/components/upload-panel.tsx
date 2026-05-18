@@ -159,7 +159,7 @@ export function UploadPanel({ onUploadAccepted, onJobUpdate, onCloseAfterUpload 
               setError(invalidFiles.length > 0 ? "仅支持上传 PDF 文件，请重新选择。" : null);
             }}
           />
-          <p className="text-muted-foreground text-xs">支持一次选择多个 PDF。上传后会按选择顺序依次入队，并自动继续做文本提取与 OCR fallback。</p>
+          <p className="text-muted-foreground text-xs">支持一次选择多个 PDF，系统会按选择顺序依次处理。</p>
         </div>
         {error ? <p className="text-sm text-destructive">{error}</p> : null}
         <div className="flex flex-wrap items-center gap-3">

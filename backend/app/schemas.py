@@ -100,6 +100,7 @@ class PaperListItem(BaseModel):
     id: int
     organization_id: int
     title: str | None
+    authors: str | None = None
     original_filename: str | None = None
     abstract_raw: str | None
     published_at: datetime | None = None

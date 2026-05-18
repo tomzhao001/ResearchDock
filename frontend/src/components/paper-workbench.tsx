@@ -1,12 +1,12 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ArrowUpDown, CalendarDays, FilePenLine, LoaderCircle, RefreshCw, ScanText, TextCursorInput, Trash2, Upload } from "lucide-react";
+import { ArrowUpDown, CalendarDays, FilePenLine, LoaderCircle, RefreshCw, TextCursorInput, Trash2, Upload } from "lucide-react";
 
 import { PaperMetadataDialog } from "@/components/paper-metadata-dialog";
 import { PaperUploadDialog } from "@/components/paper-upload-dialog";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
 import { TabPanel, Tabs } from "@/components/ui/tabs";
 import { useHasPermission } from "@/lib/session";
@@ -29,6 +29,7 @@ import {
 const ACTIVE_STATUSES = new Set(["queued", "processing"]);
 type PaperSortMode = "alphabet" | "publishedAt";
 type PaperSortDirection = "asc" | "desc";
+type PreviewTab = "metadata" | "ocr" | "summary" | "questionSet";
 
 function statusLabel(status: string | null): string {
   if (status === "queued") return "排队中";
@@ -90,12 +91,6 @@ function getStatusClassName(status: string | null): string {
 function getPhaseStatusClassName(status: string | null): string {
   if (!status) return "bg-slate-200/80 text-slate-600 ring-slate-300";
   return getStatusClassName(status);
-}
-
-function excerpt(value: string | null, maxLength = 96): string {
-  const text = (value || "").trim();
-  if (!text) return "尚未生成摘要";
-  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 }
 
 function PhaseBadge({
@@ -221,7 +216,7 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
   const [metadataDialogOpen, setMetadataDialogOpen] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [confirmAction, setConfirmAction] = useState<"rerun-ocr" | "regenerate-summary" | "regenerate-question-set" | null>(null);
-  const [previewTab, setPreviewTab] = useState<"summary" | "ocr" | "questionSet">("summary");
+  const [previewTab, setPreviewTab] = useState<PreviewTab>("metadata");
   const [actionLoading, setActionLoading] = useState<"rerun-ocr" | "regenerate-summary" | "regenerate-question-set" | "delete" | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [sortMode, setSortMode] = useState<PaperSortMode>("publishedAt");
@@ -339,6 +334,15 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
     () => sortPapersForDisplay(papers, sortMode, sortDirection),
     [papers, sortDirection, sortMode]
   );
+  const selectedPaperListItem = useMemo(
+    () => papers.find((paper) => paper.id === selectedPaperId) ?? null,
+    [papers, selectedPaperId]
+  );
+  const previewTitle = selectedPaperId
+    ? paperDetail?.id === selectedPaperId
+      ? paperDetail.title || selectedPaperListItem?.title || `未命名论文 #${selectedPaperId}`
+      : selectedPaperListItem?.title || `未命名论文 #${selectedPaperId}`
+    : "论文详情";
 
   const isBusy = loadingList || loadingDetail || actionLoading !== null;
 
@@ -588,7 +592,10 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
             <div className="grid gap-3">
               <div className="flex items-center justify-between gap-3">
                 <div className="min-w-0 flex-1">
-                  <CardTitle>论文列表</CardTitle>
+                  <CardTitle className="flex items-center gap-2">
+                    <span>论文列表</span>
+                    {loadingList ? <LoaderCircle className="size-4 animate-spin text-slate-400" aria-hidden="true" /> : null}
+                  </CardTitle>
                 </div>
                 <div className="flex items-center gap-1.5">
                   <Tooltip
@@ -623,46 +630,34 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                   </Tooltip>
                 </div>
               </div>
-              <div className="grid gap-3">
-                <CardDescription>
-                  支持按字母或论文时间在前端排序，点击左侧条目后在右侧查看摘要、展示名和 OCR 预览。
-                </CardDescription>
-                <div className="flex flex-wrap items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="gap-2"
+                  onClick={() => void handleManualRefresh()}
+                  disabled={manualRefreshing || isBusy}
+                >
+                  <RefreshCw className={cn("size-4", manualRefreshing ? "animate-spin" : "")} />
+                  刷新状态
+                </Button>
+                {canWritePapers ? (
                   <Button
                     type="button"
-                    variant="outline"
                     size="sm"
                     className="gap-2"
-                    onClick={() => void handleManualRefresh()}
-                    disabled={manualRefreshing || isBusy}
+                    onClick={() => setUploadDialogOpen(true)}
+                    disabled={isBusy}
                   >
-                    <RefreshCw className={cn("size-4", manualRefreshing ? "animate-spin" : "")} />
-                    刷新状态
+                    <Upload className="size-4" />
+                    上传 PDF
                   </Button>
-                  {canWritePapers ? (
-                    <Button
-                      type="button"
-                      size="sm"
-                      className="gap-2"
-                      onClick={() => setUploadDialogOpen(true)}
-                      disabled={isBusy}
-                    >
-                      <Upload className="size-4" />
-                      上传 PDF
-                    </Button>
-                  ) : null}
-                </div>
+                ) : null}
               </div>
             </div>
           </CardHeader>
           <CardContent className="grid min-h-0 gap-3 overflow-y-auto">
-            {loadingList ? (
-              <div className="flex items-center gap-2 rounded-xl border border-dashed border-slate-200 px-4 py-6 text-sm text-slate-500">
-                <LoaderCircle className="size-4 animate-spin" />
-                正在加载论文列表...
-              </div>
-            ) : null}
-
             {listError ? <p className="text-sm text-destructive">{listError}</p> : null}
 
             {!loadingList && papers.length === 0 ? (
@@ -680,44 +675,35 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                 className={cn(
                   "grid gap-3 rounded-2xl border px-4 py-4 text-left transition disabled:cursor-not-allowed disabled:opacity-70",
                   selectedPaperId === paper.id
-                    ? "border-slate-400 bg-slate-200 text-slate-900 shadow-sm"
-                    : "border-slate-200 bg-slate-100 text-slate-900 hover:border-slate-300 hover:bg-slate-50"
+                    ? "border-slate-500 bg-slate-200 text-slate-900 shadow-sm ring-1 ring-inset ring-slate-500"
+                    : "border-slate-200 bg-white text-slate-900 hover:border-slate-300 hover:bg-slate-50"
                 )}
               >
                 <div className="flex items-start justify-between gap-3">
                   <div>
                     <p className="font-medium leading-6">{paper.title || `未命名论文 #${paper.id}`}</p>
                     <p className={cn("mt-1 text-xs", selectedPaperId === paper.id ? "text-slate-600" : "text-slate-500")}>
-                      原始文件名：{paper.original_filename || "-"}
-                    </p>
-                    <p className={cn("mt-1 text-xs", selectedPaperId === paper.id ? "text-slate-600" : "text-slate-500")}>
                       论文时间：{paper.published_at ? formatTime(paper.published_at) : "-"}
                     </p>
                     <p className={cn("mt-1 text-xs", selectedPaperId === paper.id ? "text-slate-600" : "text-slate-500")}>
-                      更新于 {formatTime(paper.updated_at)}
+                      作者：{paper.authors || "-"}
                     </p>
                   </div>
                   <div className="flex shrink-0 flex-col items-end gap-1.5">
                     <PhaseBadge
                       label="OCR"
                       status={paper.ocr_status}
-                      className={selectedPaperId === paper.id ? "bg-white/80 text-slate-700 ring-slate-300" : undefined}
                     />
                     <PhaseBadge
                       label="摘要"
                       status={paper.summary_status}
-                      className={selectedPaperId === paper.id ? "bg-white/80 text-slate-700 ring-slate-300" : undefined}
                     />
                     <PhaseBadge
                       label="问题集"
                       status={paper.question_set_status}
-                      className={selectedPaperId === paper.id ? "bg-white/80 text-slate-700 ring-slate-300" : undefined}
                     />
                   </div>
                 </div>
-                <p className={cn("text-sm leading-6", selectedPaperId === paper.id ? "text-slate-700" : "text-slate-600")}>
-                  {excerpt(paper.abstract_raw)}
-                </p>
               </button>
             ))}
           </CardContent>
@@ -726,18 +712,15 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
           <CardHeader className="gap-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
-                <CardTitle className="flex items-center gap-2 text-lg">
-                  <ScanText className="size-4" />
-                  OCR / 摘要预览
-                </CardTitle>
-                <CardDescription>查看当前选中论文的展示名、原始文件名、摘要信息和 OCR 文本内容。</CardDescription>
+                <CardTitle className="text-lg">{previewTitle}</CardTitle>
               </div>
               <Tabs
                 value={previewTab}
                 onValueChange={setPreviewTab}
                 items={[
-                  { value: "summary", label: "摘要和文档信息" },
-                  { value: "ocr", label: "OCR 文本预览" },
+                  { value: "metadata", label: "文档信息" },
+                  { value: "ocr", label: "OCR文本" },
+                  { value: "summary", label: "摘要" },
                   { value: "questionSet", label: "问题集结果" },
                 ]}
               />
@@ -755,7 +738,7 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
 
             {!selectedPaperId && !loadingDetail ? (
               <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 px-6 py-12 text-center text-sm text-slate-500">
-                从左侧选择一篇论文，即可查看 OCR 预览和摘要结果。
+                从左侧选择一篇论文。
               </div>
             ) : null}
 
@@ -769,15 +752,13 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                     </div>
                   </div>
                 ) : null}
-                <TabPanel active={previewTab === "summary"} className="grid gap-5">
+                <TabPanel active={previewTab === "metadata"} className="grid gap-5">
                   <div className="grid gap-4 rounded-2xl border border-slate-200 bg-slate-50/80 p-5">
                     <div className="flex items-start justify-between gap-4">
                       <div className="grid min-w-0 flex-1 gap-3">
-                        <div>
-                          <h2 className="text-xl font-semibold text-slate-950">{paperDetail.title || `未命名论文 #${paperDetail.id}`}</h2>
-                          <p className="mt-1 text-sm text-slate-500">
-                            原始文件名：{paperDetail.original_filename || "-"} | 更新时间：{formatTime(paperDetail.updated_at)}
-                          </p>
+                        <div className="grid gap-1 text-sm text-slate-500">
+                          <p>原始文件名：{paperDetail.original_filename || "-"}</p>
+                          <p>更新时间：{formatTime(paperDetail.updated_at)}</p>
                         </div>
                         <div className="flex flex-wrap gap-3">
                           {canWritePapers ? (
@@ -886,11 +867,32 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                         })}
                       />
                     </section>
+                  </div>
+                </TabPanel>
 
+                <TabPanel active={previewTab === "ocr"} className="grid gap-3">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <h3 className="text-sm font-medium text-slate-700">OCR文本</h3>
+                      <p className="text-xs text-slate-500">
+                        总页数：{paperDetail.extraction_metadata?.page_count ?? "-"}，OCR 页：{" "}
+                        {(paperDetail.extraction_metadata?.used_ocr_pages || []).join(", ") || "-"}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="min-h-[420px] rounded-2xl border border-slate-200 bg-slate-950 px-5 py-5 font-mono text-sm leading-7 text-slate-200 shadow-inner">
+                    <pre className="overflow-x-auto whitespace-pre-wrap break-words">
+                      {paperDetail.preview_text || "当前还没有 OCR 文本。"}
+                    </pre>
+                  </div>
+                </TabPanel>
+
+                <TabPanel active={previewTab === "summary"} className="grid gap-5">
+                  <div className="grid gap-4 rounded-2xl border border-slate-200 bg-slate-50/80 p-5">
                     <section className="grid gap-2">
                       <h3 className="text-sm font-medium text-slate-700">中文摘要</h3>
                       <p className="rounded-2xl bg-white px-4 py-4 leading-7 text-slate-700 shadow-sm ring-1 ring-slate-200">
-                        {paperDetail.abstract_raw || "当前还没有生成摘要，可先检查模型配置是否已完成。"}
+                        {paperDetail.abstract_raw || "当前还没有摘要。"}
                       </p>
                     </section>
 
@@ -918,23 +920,6 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                   </div>
                 </TabPanel>
 
-                <TabPanel active={previewTab === "ocr"} className="grid gap-3">
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <div>
-                      <h3 className="text-sm font-medium text-slate-700">文本 / OCR 预览</h3>
-                      <p className="text-xs text-slate-500">
-                        总页数：{paperDetail.extraction_metadata?.page_count ?? "-"}，OCR 页：{" "}
-                        {(paperDetail.extraction_metadata?.used_ocr_pages || []).join(", ") || "-"}
-                      </p>
-                    </div>
-                  </div>
-                  <div className="min-h-[420px] rounded-2xl border border-slate-200 bg-slate-950 px-5 py-5 font-mono text-sm leading-7 text-slate-200 shadow-inner">
-                    <pre className="overflow-x-auto whitespace-pre-wrap break-words">
-                      {paperDetail.preview_text || "当前还没有可预览的文本，任务完成后会在这里显示。"}
-                    </pre>
-                  </div>
-                </TabPanel>
-
                 <TabPanel active={previewTab === "questionSet"} className="grid gap-3">
                   <div className="rounded-2xl border border-slate-200 bg-slate-50/80 p-5">
                     <div className="flex flex-wrap items-center justify-between gap-3">
@@ -957,7 +942,7 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                       </div>
                     ) : (
                       <div className="mt-4 rounded-2xl border border-dashed border-slate-200 bg-white px-4 py-8 text-sm text-slate-500">
-                        当前还没有问题集抽取结果。请先确认组织已配置问题集，并等待摘要完成后自动执行，或手动点击重跑。
+                        当前还没有问题集结果。
                       </div>
                     )}
                   </div>

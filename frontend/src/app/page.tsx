@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
-import { FileQuestion, FileText, MessagesSquare } from "lucide-react";
+import { ChevronDown, FileQuestion, FileText, MessagesSquare } from "lucide-react";
 
 import { ChatPanel } from "@/components/chat-panel";
 import { OrgQuestionSetPanel } from "@/components/org-question-set-panel";
@@ -67,16 +67,8 @@ export default function Home() {
       <div className="h-dvh overflow-hidden bg-[radial-gradient(circle_at_top,rgba(148,163,184,0.18),transparent_34%),linear-gradient(180deg,#f8fafc_0%,#eef2ff_45%,#f8fafc_100%)]">
         <div className="mx-auto flex h-full min-h-0 max-w-7xl flex-col gap-6 px-6 py-6 lg:px-10">
           <header className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
-            <div className="grid gap-3">
-              <div className="inline-flex w-fit items-center rounded-full border border-slate-200 bg-white/80 px-3 py-1 text-xs font-medium text-slate-600 shadow-sm backdrop-blur">
-                Milestone 4 Knowledge Base
-              </div>
-              <div>
-                <h1 className="text-3xl font-semibold tracking-tight text-slate-950">ResearchDock</h1>
-                <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-600">
-                  首页直接进入论文归档工作台与知识库对话页，支持围绕论文归档进行带引用问答、话题上下文保存，以及右上角任务追踪。
-                </p>
-              </div>
+            <div>
+              <h1 className="text-3xl font-semibold tracking-tight text-slate-950">ResearchDock</h1>
             </div>
 
             <div className="flex flex-wrap items-center gap-3">
@@ -88,12 +80,7 @@ export default function Home() {
                   }}
                 />
               ) : null}
-              <div className="rounded-full border border-slate-200 bg-white/80 px-3 py-1.5 text-sm text-slate-600 shadow-sm backdrop-blur">
-                已登录：{me.username} / {me.organization.name}
-              </div>
-              <Button variant="outline" size="sm" onClick={() => void logout()}>
-                退出
-              </Button>
+              <AccountMenu username={me.username} onLogout={() => void logout()} />
             </div>
           </header>
 
@@ -125,6 +112,53 @@ export default function Home() {
         </div>
       </div>
     </SessionProvider>
+  );
+}
+
+function AccountMenu({
+  username,
+  onLogout,
+}: {
+  username: string;
+  onLogout: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+
+    function handlePointerDown(event: MouseEvent) {
+      if (!rootRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    }
+
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => document.removeEventListener("mousedown", handlePointerDown);
+  }, [open]);
+
+  return (
+    <div ref={rootRef} className="relative">
+      <Button type="button" variant="outline" size="sm" onClick={() => setOpen((value) => !value)} className="gap-2">
+        {username}
+        <ChevronDown className={cn("size-4 transition-transform", open ? "rotate-180" : "")} />
+      </Button>
+      {open ? (
+        <div className="absolute right-0 top-11 z-20 min-w-[160px] rounded-2xl border border-slate-200 bg-white/95 p-2 shadow-xl backdrop-blur">
+          <button
+            type="button"
+            onClick={() => {
+              setOpen(false);
+              onLogout();
+            }}
+            className="flex w-full items-center rounded-xl px-3 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-100 hover:text-slate-950"
+          >
+            退出登录
+          </button>
+        </div>
+      ) : null}
+    </div>
   );
 }
 

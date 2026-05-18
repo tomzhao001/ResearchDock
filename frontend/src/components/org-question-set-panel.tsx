@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { FileQuestion, PencilLine, Plus, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import {
@@ -187,7 +187,7 @@ export function OrgQuestionSetPanel() {
         </div>
       </Dialog>
 
-      <Card className="h-full border-none bg-white/85 shadow-sm ring-1 ring-slate-200 backdrop-blur">
+      <Card className="h-full min-h-0 border-none bg-white/85 shadow-sm ring-1 ring-slate-200 backdrop-blur">
         <CardHeader className="gap-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="grid gap-2">
@@ -195,9 +195,6 @@ export function OrgQuestionSetPanel() {
                 <FileQuestion className="size-4" />
                 组织级问题集
               </CardTitle>
-              <CardDescription>
-                问题集会在论文摘要之后作为独立步骤执行。修改问题集不会自动回刷历史论文；新上传或手动重跑时会使用最新配置。
-              </CardDescription>
               <p className="text-xs text-slate-500">最近更新：{formatTime(updatedAt)}</p>
             </div>
             {canWrite ? (
@@ -208,12 +205,12 @@ export function OrgQuestionSetPanel() {
             ) : null}
           </div>
         </CardHeader>
-        <CardContent className="grid gap-4">
+        <CardContent className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto">
           {loading ? <p className="text-sm text-slate-500">正在加载组织问题集...</p> : null}
           {error ? <p className="text-sm text-destructive">{error}</p> : null}
           {!loading && questions.length === 0 ? (
             <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 px-4 py-10 text-sm text-slate-500">
-              当前组织还没有配置问题集。新增后，后续摘要完成的论文会进入问题集抽取阶段。
+              当前组织还没有配置问题集。
             </div>
           ) : null}
           {questions.map((item, index) => (

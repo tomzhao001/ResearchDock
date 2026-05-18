@@ -46,15 +46,18 @@ vi.mock("@/lib/papers", () => ({
 function makePaperListItem({
   id,
   title,
+  authors = null,
   publishedAt,
 }: {
   id: number;
   title: string;
+  authors?: string | null;
   publishedAt: string | null;
 }) {
   return {
     id,
     title,
+    authors,
     original_filename: `${title}.pdf`,
     abstract_raw: `${title} abstract`,
     published_at: publishedAt,
@@ -98,7 +101,7 @@ function makePaperDetail(id: number, title: string) {
 function expectPaperOrder(expectedTitles: string[]) {
   const paperButtons = screen
     .getAllByRole("button")
-    .filter((button) => button.textContent?.includes("原始文件名："));
+    .filter((button) => button.textContent?.includes("作者："));
 
   expect(paperButtons).toHaveLength(expectedTitles.length);
   expect(paperButtons.map((button) => button.textContent || "")).toEqual(
@@ -175,6 +178,33 @@ describe("PaperWorkbench", () => {
 
     expect(screen.getAllByText("来源：摘要自动提取")).toHaveLength(3);
     expect(screen.getByText("来源：手动编辑")).toBeInTheDocument();
+  });
+
+  it("按新的顺序展示详情标签页并移除旧说明文案", async () => {
+    const papers = [makePaperListItem({ id: 1, title: "Alpha", authors: "Alice Example", publishedAt: "2024-05-01T00:00:00Z" })];
+
+    fetchPapers.mockResolvedValue(papers);
+    fetchPaper.mockResolvedValue(makePaperDetail(1, "Alpha"));
+
+    function Harness() {
+      const [selectedPaperId, setSelectedPaperId] = useState<number | null>(1);
+      return <PaperWorkbench selectedPaperId={selectedPaperId} onSelectedPaperChange={setSelectedPaperId} />;
+    }
+
+    render(<Harness />);
+
+    await waitFor(() => expect(fetchPaper).toHaveBeenCalledWith(1));
+
+    expect(screen.getByRole("button", { name: "文档信息" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "OCR文本" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "摘要" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "问题集结果" })).toBeInTheDocument();
+    expect(screen.queryByText("OCR / 摘要预览")).not.toBeInTheDocument();
+    expect(screen.queryByText("摘要和文档信息")).not.toBeInTheDocument();
+    expect(screen.queryByText("查看当前选中论文的展示名、原始文件名、摘要信息和 OCR 文本内容。")).not.toBeInTheDocument();
+    expect(screen.getAllByText("原始文件名：Alpha.pdf").length).toBeGreaterThan(0);
+    expect(screen.getByText("作者：Alice Example")).toBeInTheDocument();
+    expect(screen.queryByText(/Alpha abstract/)).not.toBeInTheDocument();
   });
 
   it("展示问题集阶段和结果标签页", async () => {
