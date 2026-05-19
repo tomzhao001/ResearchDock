@@ -12,6 +12,8 @@ python-multipart==0.0.17
 celery==5.6.2
 redis==6.4.0
 PyMuPDF==1.27.2.3
+# Docling OCR 引擎为可选依赖；默认 DOCLING_OCR_ENGINE=easyocr 需安装 [easyocr] extra
+docling[easyocr]==2.94.0
 pytest==9.0.2
 httpx[http2]==0.28.1
 alembic==1.18.4

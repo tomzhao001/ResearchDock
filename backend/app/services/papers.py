@@ -13,13 +13,14 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import SessionLocal
-from app.models import Job, Paper, PaperAsset, PaperChunk
-from app.services.document_preprocess import preprocess_document
+from app.models import Job, Paper, PaperAsset, PaperChunk, PaperDocumentBlock, PaperDocumentPage, PaperDocumentPicture, PaperDocumentTable
+from app.services.docling_extraction import build_document_extractor
+from app.services.document_extraction import DocumentExtractor, ExtractedDocument, ExtractedPicture
 from app.services.llm import answer_question_set_questions, is_chat_llm_configured, summarize_paper_text
 from app.services.org_settings import get_organization_question_items
-from app.services.pdf_extraction import PDFTextExtractor
-from app.services.rag import rebuild_paper_index
+from app.services.rag import rebuild_paper_index_from_document_structure
 from app.services.task_events import publish_task_status_event
+from app.services.vision import PictureDescriptionAdapter, PictureDescriptionRequest, build_picture_description_adapter
 
 
 @dataclass
@@ -407,7 +408,7 @@ def delete_paper(db: Session, paper_id: int, *, organization_id: int) -> bool:
     return True
 
 
-def enqueue_paper_ocr_rerun(db: Session, paper_id: int, *, organization_id: int) -> Job | None:
+def enqueue_paper_reparse(db: Session, paper_id: int, *, organization_id: int) -> Job | None:
     paper = _get_scoped_paper(db, paper_id, organization_id=organization_id)
     if paper is None:
         return None
@@ -427,6 +428,114 @@ def enqueue_paper_ocr_rerun(db: Session, paper_id: int, *, organization_id: int)
     return job
 
 
+def _clear_document_structure(db: Session, paper_id: int) -> None:
+    db.execute(delete(PaperDocumentPicture).where(PaperDocumentPicture.paper_id == paper_id))
+    db.execute(delete(PaperDocumentTable).where(PaperDocumentTable.paper_id == paper_id))
+    db.execute(delete(PaperDocumentBlock).where(PaperDocumentBlock.paper_id == paper_id))
+    db.execute(delete(PaperDocumentPage).where(PaperDocumentPage.paper_id == paper_id))
+
+
+def _picture_context(document: ExtractedDocument, picture: ExtractedPicture) -> str | None:
+    if picture.page_number is None:
+        return None
+    nearby = [
+        block.text.strip()
+        for block in document.blocks
+        if block.page_number == picture.page_number and block.text.strip()
+    ][:5]
+    return "\n".join(nearby) or None
+
+
+def _describe_pictures(document: ExtractedDocument, adapter: PictureDescriptionAdapter) -> None:
+    for picture in document.pictures:
+        result = adapter.describe(
+            PictureDescriptionRequest(
+                image_bytes=picture.image_bytes,
+                caption=picture.caption,
+                page_number=picture.page_number,
+                bbox=picture.bbox,
+                context=_picture_context(document, picture),
+            )
+        )
+        if result.description:
+            picture.description = result.description
+        picture.description_model = result.model_name
+        picture.description_prompt_version = result.prompt_version
+        metadata = dict(picture.metadata or {})
+        metadata["description"] = {
+            "usage": result.usage,
+            "error": result.error,
+        }
+        if result.raw_response is not None:
+            metadata["description"]["raw_response"] = result.raw_response
+        picture.metadata = metadata
+
+
+def _persist_document_structure(db: Session, *, paper_id: int, asset_id: int, document: ExtractedDocument) -> None:
+    page_id_by_number: dict[int, int] = {}
+    for page in document.pages:
+        record = PaperDocumentPage(
+            paper_id=paper_id,
+            asset_id=asset_id,
+            page_number=page.page_number,
+            text=page.text or None,
+            width=int(page.width) if page.width is not None else None,
+            height=int(page.height) if page.height is not None else None,
+            metadata_json=page.metadata,
+        )
+        db.add(record)
+        db.flush()
+        page_id_by_number[page.page_number] = record.id
+
+    for block in document.blocks:
+        db.add(
+            PaperDocumentBlock(
+                paper_id=paper_id,
+                page_id=page_id_by_number.get(block.page_number or 0),
+                block_index=block.block_index,
+                block_type=block.block_type or "paragraph",
+                docling_label=block.docling_label,
+                heading_level=block.heading_level,
+                section_path=block.section_path,
+                text=block.text,
+                bbox_json=block.bbox,
+                provenance_json=block.provenance,
+                metadata_json=block.metadata,
+            )
+        )
+
+    for table in document.tables:
+        db.add(
+            PaperDocumentTable(
+                paper_id=paper_id,
+                page_from=table.page_from,
+                page_to=table.page_to,
+                table_index=table.table_index,
+                caption=table.caption,
+                markdown=table.markdown,
+                data_json=table.data,
+                bbox_json=table.bbox,
+                metadata_json=table.metadata,
+            )
+        )
+
+    for picture in document.pictures:
+        db.add(
+            PaperDocumentPicture(
+                paper_id=paper_id,
+                page_number=picture.page_number,
+                picture_index=picture.picture_index,
+                caption=picture.caption,
+                description=picture.description,
+                description_model=picture.description_model,
+                description_prompt_version=picture.description_prompt_version,
+                bbox_json=picture.bbox,
+                image_asset_path=picture.image_asset_path,
+                metadata_json=picture.metadata,
+            )
+        )
+
+
 def enqueue_paper_summary_regeneration(db: Session, paper_id: int, *, organization_id: int) -> Job | None:
     paper = _get_scoped_paper(db, paper_id, organization_id=organization_id)
     if paper is None:
@@ -435,7 +544,7 @@ def enqueue_paper_summary_regeneration(db: Session, paper_id: int, *, organizati
     if asset is None:
         raise ValueError("Original PDF not found")
     if not (asset.raw_text or "").strip():
-        raise ValueError("No OCR text available")
+        raise ValueError("No parsed text available")
     if not is_chat_llm_configured():
         raise ValueError("LLM is not configured for summarization")
     if _get_active_job_for_paper(db, paper_id) is not None:
@@ -460,7 +569,7 @@ def enqueue_paper_question_set_regeneration(db: Session, paper_id: int, *, organ
     if asset is None:
         raise ValueError("Original PDF not found")
     if not (asset.raw_text or "").strip():
-        raise ValueError("No OCR text available")
+        raise ValueError("No parsed text available")
     if _extract_structured_summary_from_asset(asset) is None:
         raise ValueError("No structured summary available")
     if not is_chat_llm_configured():
@@ -485,7 +594,8 @@ def run_pdf_ingest_job(
     job_id: int,
     *,
     session_factory: Callable[[], Session] = SessionLocal,
-    extractor: PDFTextExtractor | None = None,
+    extractor: DocumentExtractor | None = None,
+    picture_adapter: PictureDescriptionAdapter | None = None,
 ) -> int | None:
     db = session_factory()
     try:
@@ -511,18 +621,27 @@ def run_pdf_ingest_job(
         db.commit()
         publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
 
-        document = (extractor or PDFTextExtractor()).extract(Path(asset.storage_path))
-        preanalysis = preprocess_document(document)
+        document = (extractor or build_document_extractor()).extract(Path(asset.storage_path))
+        _describe_pictures(document, picture_adapter or build_picture_description_adapter())
+        _clear_document_structure(db, paper.id)
+        db.execute(delete(PaperChunk).where(PaperChunk.paper_id == paper.id))
+        _persist_document_structure(db, paper_id=paper.id, asset_id=asset.id, document=document)
+        db.flush()
         metadata = dict(asset.metadata_json or {})
-        metadata["extraction"] = document.metadata
-        metadata["preanalysis"] = preanalysis
+        metadata["extraction"] = {
+            **document.extraction_metadata(),
+            "picture_vlm": {
+                "provider": settings.picture_vlm_provider,
+                "model": settings.picture_vlm_model,
+                "prompt_version": settings.picture_vlm_prompt_version,
+            },
+        }
         asset.metadata_json = metadata
-        asset.raw_text = document.raw_text
-        rebuild_paper_index(
+        asset.raw_text = document.markdown_text
+        rebuild_paper_index_from_document_structure(
             db,
             paper_id=paper.id,
-            raw_text=document.raw_text,
-            preanalysis=preanalysis,
+            raw_text=document.markdown_text,
             paper_title=paper.title,
         )
         paper.status = "completed"
@@ -567,7 +686,7 @@ def run_paper_summary_job(
         if not is_chat_llm_configured():
             raise RuntimeError("LLM is not configured for summarization")
         if not (asset.raw_text or "").strip():
-            raise RuntimeError("No OCR text available")
+            raise RuntimeError("No parsed text available")
 
         now = datetime.now(timezone.utc)
         job.status = "processing"
@@ -637,7 +756,7 @@ def run_paper_question_set_job(
         if not is_chat_llm_configured():
             raise RuntimeError("LLM is not configured for question set extraction")
         if not (asset.raw_text or "").strip():
-            raise RuntimeError("No OCR text available")
+            raise RuntimeError("No parsed text available")
 
         structured_summary = _extract_structured_summary_from_asset(asset)
         if structured_summary is None:

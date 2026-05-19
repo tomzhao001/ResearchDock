@@ -155,6 +155,71 @@ class PaperAsset(Base):
     )
 
 
+class PaperDocumentPage(Base):
+    __tablename__ = "paper_document_pages"
+
+    id: Mapped[int] = mapped_column(bigint_sqlite, primary_key=True, autoincrement=True)
+    paper_id: Mapped[int] = mapped_column(bigint_sqlite, ForeignKey("papers.id", ondelete="CASCADE"), nullable=False)
+    asset_id: Mapped[int] = mapped_column(bigint_sqlite, ForeignKey("paper_assets.id", ondelete="CASCADE"), nullable=False)
+    page_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    text: Mapped[str | None] = mapped_column(Text)
+    width: Mapped[int | None] = mapped_column(Integer)
+    height: Mapped[int | None] = mapped_column(Integer)
+    metadata_json: Mapped[dict | None] = mapped_column(json_field)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class PaperDocumentBlock(Base):
+    __tablename__ = "paper_document_blocks"
+
+    id: Mapped[int] = mapped_column(bigint_sqlite, primary_key=True, autoincrement=True)
+    paper_id: Mapped[int] = mapped_column(bigint_sqlite, ForeignKey("papers.id", ondelete="CASCADE"), nullable=False)
+    page_id: Mapped[int | None] = mapped_column(bigint_sqlite, ForeignKey("paper_document_pages.id", ondelete="CASCADE"))
+    block_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    block_type: Mapped[str] = mapped_column(String(64), nullable=False, default="paragraph", server_default="paragraph")
+    docling_label: Mapped[str | None] = mapped_column(String(128))
+    heading_level: Mapped[int | None] = mapped_column(Integer)
+    section_path: Mapped[str | None] = mapped_column(Text)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    bbox_json: Mapped[dict | None] = mapped_column(json_field)
+    provenance_json: Mapped[dict | None] = mapped_column(json_field)
+    metadata_json: Mapped[dict | None] = mapped_column(json_field)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class PaperDocumentTable(Base):
+    __tablename__ = "paper_document_tables"
+
+    id: Mapped[int] = mapped_column(bigint_sqlite, primary_key=True, autoincrement=True)
+    paper_id: Mapped[int] = mapped_column(bigint_sqlite, ForeignKey("papers.id", ondelete="CASCADE"), nullable=False)
+    page_from: Mapped[int | None] = mapped_column(Integer)
+    page_to: Mapped[int | None] = mapped_column(Integer)
+    table_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    caption: Mapped[str | None] = mapped_column(Text)
+    markdown: Mapped[str | None] = mapped_column(Text)
+    data_json: Mapped[dict | list | None] = mapped_column(json_field)
+    bbox_json: Mapped[dict | None] = mapped_column(json_field)
+    metadata_json: Mapped[dict | None] = mapped_column(json_field)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class PaperDocumentPicture(Base):
+    __tablename__ = "paper_document_pictures"
+
+    id: Mapped[int] = mapped_column(bigint_sqlite, primary_key=True, autoincrement=True)
+    paper_id: Mapped[int] = mapped_column(bigint_sqlite, ForeignKey("papers.id", ondelete="CASCADE"), nullable=False)
+    page_number: Mapped[int | None] = mapped_column(Integer)
+    picture_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    caption: Mapped[str | None] = mapped_column(Text)
+    description: Mapped[str | None] = mapped_column(Text)
+    description_model: Mapped[str | None] = mapped_column(String(255))
+    description_prompt_version: Mapped[str | None] = mapped_column(String(64))
+    bbox_json: Mapped[dict | None] = mapped_column(json_field)
+    image_asset_path: Mapped[str | None] = mapped_column(Text)
+    metadata_json: Mapped[dict | None] = mapped_column(json_field)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
 class PaperSummary(Base):
     __tablename__ = "paper_summaries"
 
@@ -254,6 +319,11 @@ class ChatMessage(Base):
 
 Index("idx_paper_chunks_paper_id", PaperChunk.paper_id)
 Index("idx_paper_chunks_paper_chunk", PaperChunk.paper_id, PaperChunk.chunk_index)
+Index("idx_paper_document_pages_paper_page", PaperDocumentPage.paper_id, PaperDocumentPage.page_number)
+Index("idx_paper_document_blocks_paper_block", PaperDocumentBlock.paper_id, PaperDocumentBlock.block_index)
+Index("idx_paper_document_blocks_paper_type", PaperDocumentBlock.paper_id, PaperDocumentBlock.block_type)
+Index("idx_paper_document_tables_paper_table", PaperDocumentTable.paper_id, PaperDocumentTable.table_index)
+Index("idx_paper_document_pictures_paper_picture", PaperDocumentPicture.paper_id, PaperDocumentPicture.picture_index)
 Index("idx_paper_chunks_search_vector", PaperChunk.search_vector, postgresql_using="gin")
 Index(
     "idx_paper_chunks_embedding_cosine",

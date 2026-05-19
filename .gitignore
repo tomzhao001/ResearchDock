@@ -225,6 +225,8 @@ __marimo__/
 # Local file storage (MVP)
 /data/files/
 data/files/
+/data/models/
+data/models/
 
 # Benchmark / eval generated reports (regenerate: backend/ → python -m scripts.sample_data_eval --output reports/...)
 backend/reports/

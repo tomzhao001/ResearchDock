@@ -18,9 +18,9 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.auth import pwd_context
 from app.models import Organization, Paper, PaperChunk, User
 from app.permissions import ROLE_ORG_OWNER
+from app.services.document_extraction import DocumentExtractor
 from app.services.llm import chat_with_messages
 from app.services.papers import create_upload_artifacts, run_pdf_ingest_job
-from app.services.pdf_extraction import PDFTextExtractor
 from app.services.rag import _search_chunks, create_topic, send_topic_message
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -420,7 +420,7 @@ def ingest_sample_data_papers(
     db: Session,
     *,
     session_factory: sessionmaker,
-    extractor: PDFTextExtractor | None = None,
+    extractor: DocumentExtractor | None = None,
     data_dir: Path | None = None,
 ) -> dict[str, Paper]:
     papers_by_key: dict[str, Paper] = {}
@@ -982,7 +982,7 @@ def run_sample_data_evaluation(
     subset: str = "full",
     judge_mode: str = "heuristic",
     question_id: str | None = None,
-    extractor: PDFTextExtractor | None = None,
+    extractor: DocumentExtractor | None = None,
     data_dir: Path | None = None,
 ) -> dict[str, Any]:
     db = session_factory()

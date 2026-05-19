@@ -1,49 +1,91 @@
-import fitz
+from pathlib import Path
+
 import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.models import Job, PaperAsset, PaperChunk
-from app.services.ocr.base import OcrRecognitionResult
+from app.models import Job, PaperAsset, PaperChunk, PaperDocumentBlock, PaperDocumentPage, PaperDocumentPicture, PaperDocumentTable
+from app.services.document_extraction import ExtractedBlock, ExtractedDocument, ExtractedPage, ExtractedPicture, ExtractedTable
 from app.services.papers import create_upload_artifacts, run_pdf_ingest_job
-from app.services.pdf_extraction import PDFTextExtractor
+from app.services.vision.base import PictureDescriptionRequest, PictureDescriptionResult
 
 
-class MockOcrAdapter:
-    def recognize_page(self, *, image_bytes: bytes, page_number: int, hints: dict | None = None) -> OcrRecognitionResult:
-        return OcrRecognitionResult(
-            text="\uff34\uff41\uff42\uff4c\uff45\u3000\uff11\uff1a\u3000\uff21\uff24\uff28\uff24\uff0d\uff32\uff33\u3000\uff30\uff24\uff26",
+class FakeDoclingExtractor:
+    def __init__(self, *, title: str = "Abstract"):
+        self.title = title
+
+    def extract(self, pdf_path: Path) -> ExtractedDocument:
+        return ExtractedDocument(
+            markdown_text=f"# {self.title}\n\nThis is Docling markdown text.",
             metadata={
-                "provider": "glm_ocr",
-                "page_number": page_number,
-                "hints": hints or {},
+                "engine": "docling",
+                "docling_do_ocr": True,
+                "docling_do_table_structure": True,
             },
+            pages=[ExtractedPage(page_number=1, text="This is page text.", width=612, height=792)],
+            blocks=[
+                ExtractedBlock(
+                    block_index=0,
+                    text="This is Docling markdown text.",
+                    block_type="paragraph",
+                    page_number=1,
+                    docling_label="text",
+                    heading_level=1,
+                    section_path=self.title,
+                )
+            ],
+            tables=[
+                ExtractedTable(
+                    table_index=0,
+                    caption="Table 1. Accuracy",
+                    markdown="| Group | Score |\n| --- | --- |\n| A | 0.92 |",
+                    page_from=1,
+                    page_to=1,
+                )
+            ],
+            pictures=[
+                ExtractedPicture(
+                    picture_index=0,
+                    caption="Figure 1. Trend",
+                    page_number=1,
+                    image_bytes=b"fake-png",
+                )
+            ],
         )
 
 
-class FailingOcrAdapter:
-    def recognize_page(self, *, image_bytes: bytes, page_number: int, hints: dict | None = None) -> OcrRecognitionResult:
-        raise RuntimeError("GLM-OCR request failed")
+class SecondFakeDoclingExtractor(FakeDoclingExtractor):
+    def extract(self, pdf_path: Path) -> ExtractedDocument:
+        document = super().extract(pdf_path)
+        document.markdown_text = "# Results\n\nReplacement parse."
+        document.blocks[0].text = "Replacement parse."
+        document.blocks[0].section_path = "Results"
+        document.tables = []
+        document.pictures = []
+        return document
 
 
-def make_blank_pdf() -> bytes:
-    doc = fitz.open()
-    doc.new_page()
-    payload = doc.tobytes()
-    doc.close()
-    return payload
+class FailingDoclingExtractor:
+    def extract(self, pdf_path: Path) -> ExtractedDocument:
+        raise RuntimeError("Docling conversion failed")
 
 
-def make_text_pdf(text: str) -> bytes:
-    doc = fitz.open()
-    page = doc.new_page()
-    page.insert_text((72, 72), text)
-    payload = doc.tobytes()
-    doc.close()
-    return payload
+class FakePictureAdapter:
+    def describe(self, request: PictureDescriptionRequest) -> PictureDescriptionResult:
+        assert request.caption == "Figure 1. Trend"
+        return PictureDescriptionResult(
+            description="图表显示 A 组分数随时间上升。",
+            model_name="glm-4.6v",
+            prompt_version="test-picture-prompt",
+            usage={"total_tokens": 10},
+        )
 
 
-def test_worker_persists_ocr_fallback_result(
+def make_pdf_payload() -> bytes:
+    return b"%PDF-1.7\n% fake test payload\n"
+
+
+def test_worker_persists_docling_structure_and_picture_descriptions(
     db_session: Session,
     session_factory: sessionmaker,
     organization,
@@ -51,68 +93,92 @@ def test_worker_persists_ocr_fallback_result(
     artifacts = create_upload_artifacts(
         db_session,
         organization_id=organization.id,
-        filename="scan.pdf",
+        filename="docling.pdf",
         content_type="application/pdf",
-        payload=make_blank_pdf(),
+        payload=make_pdf_payload(),
     )
 
     run_pdf_ingest_job(
         artifacts.job_id,
         session_factory=session_factory,
-        extractor=PDFTextExtractor(ocr_backend=MockOcrAdapter()),
+        extractor=FakeDoclingExtractor(),
+        picture_adapter=FakePictureAdapter(),
     )
 
     job = db_session.get(Job, artifacts.job_id)
     asset = db_session.scalar(select(PaperAsset).where(PaperAsset.paper_id == artifacts.paper_id))
     chunks = db_session.scalars(select(PaperChunk).where(PaperChunk.paper_id == artifacts.paper_id)).all()
+    pages = db_session.scalars(select(PaperDocumentPage).where(PaperDocumentPage.paper_id == artifacts.paper_id)).all()
+    blocks = db_session.scalars(select(PaperDocumentBlock).where(PaperDocumentBlock.paper_id == artifacts.paper_id)).all()
+    tables = db_session.scalars(select(PaperDocumentTable).where(PaperDocumentTable.paper_id == artifacts.paper_id)).all()
+    pictures = db_session.scalars(select(PaperDocumentPicture).where(PaperDocumentPicture.paper_id == artifacts.paper_id)).all()
 
     assert job is not None
     assert job.status == "completed"
     assert asset is not None
-    assert asset.raw_text == "Table 1: ADHD-RS PDF"
+    assert asset.raw_text == "# Abstract\n\nThis is Docling markdown text."
     assert asset.metadata_json is not None
-    assert asset.metadata_json["extraction"]["used_ocr_pages"] == [1]
-    assert asset.metadata_json["extraction"]["pages"][0]["ocr_metadata"]["provider"] == "glm_ocr"
-    assert asset.metadata_json["extraction"]["pages"][0]["ocr_metadata"]["text_quality"]["normalization_applied"] is True
-    assert asset.metadata_json["extraction"]["text_quality"]["normalization_applied"] is True
-    assert asset.metadata_json["extraction"]["text_quality"]["normalized_ocr_pages"] == [1]
-    assert len(chunks) == 1
-    assert "Table 1: ADHD-RS PDF" in chunks[0].content
+    assert asset.metadata_json["extraction"]["engine"] == "docling"
+    assert asset.metadata_json["extraction"]["page_count"] == 1
+    assert asset.metadata_json["extraction"]["block_count"] == 1
+    assert asset.metadata_json["extraction"]["table_count"] == 1
+    assert asset.metadata_json["extraction"]["picture_count"] == 1
+    assert len(pages) == 1
+    assert len(blocks) == 1
+    assert len(tables) == 1
+    assert len(pictures) == 1
+    assert pictures[0].description == "图表显示 A 组分数随时间上升。"
+    assert pictures[0].description_model == "glm-4.6v"
+    assert chunks
+    assert any("Table 1. Accuracy" in chunk.content for chunk in chunks)
+    assert any("图表显示 A 组分数随时间上升" in chunk.content for chunk in chunks)
 
 
-def test_worker_keeps_existing_text_layer_when_full_document_ocr_disabled(
+def test_worker_reparse_replaces_existing_structure(
     db_session: Session,
     session_factory: sessionmaker,
     organization,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("app.config.settings.ocr_min_chars_per_page", 1)
-    monkeypatch.setattr("app.config.settings.ocr_min_alpha_ratio", 0.0)
-    monkeypatch.setattr("app.config.settings.ocr_min_average_chars_per_page", 1)
     artifacts = create_upload_artifacts(
         db_session,
         organization_id=organization.id,
-        filename="embedded-text.pdf",
+        filename="docling.pdf",
         content_type="application/pdf",
-        payload=make_text_pdf("This embedded text layer should remain preferred when OCR fallback is disabled. " * 6),
+        payload=make_pdf_payload(),
     )
 
     run_pdf_ingest_job(
         artifacts.job_id,
         session_factory=session_factory,
-        extractor=PDFTextExtractor(ocr_backend=MockOcrAdapter(), force_full_document_ocr=False),
+        extractor=FakeDoclingExtractor(),
+        picture_adapter=FakePictureAdapter(),
+    )
+    reparse_job = Job(job_type="pdf_ingest", paper_id=artifacts.paper_id, status="queued")
+    db_session.add(reparse_job)
+    db_session.commit()
+    db_session.refresh(reparse_job)
+
+    run_pdf_ingest_job(
+        reparse_job.id,
+        session_factory=session_factory,
+        extractor=SecondFakeDoclingExtractor(),
+        picture_adapter=FakePictureAdapter(),
     )
 
     asset = db_session.scalar(select(PaperAsset).where(PaperAsset.paper_id == artifacts.paper_id))
+    chunks = db_session.scalars(select(PaperChunk).where(PaperChunk.paper_id == artifacts.paper_id)).all()
+    tables = db_session.scalars(select(PaperDocumentTable).where(PaperDocumentTable.paper_id == artifacts.paper_id)).all()
+    pictures = db_session.scalars(select(PaperDocumentPicture).where(PaperDocumentPicture.paper_id == artifacts.paper_id)).all()
 
     assert asset is not None
-    assert "This embedded text layer should remain preferred" in (asset.raw_text or "")
-    assert asset.metadata_json is not None
-    assert asset.metadata_json["extraction"]["force_full_document_ocr"] is False
-    assert asset.metadata_json["extraction"]["used_ocr_pages"] == []
+    assert asset.raw_text == "# Results\n\nReplacement parse."
+    assert tables == []
+    assert pictures == []
+    assert chunks
+    assert all("Table 1. Accuracy" not in chunk.content for chunk in chunks)
 
 
-def test_worker_marks_job_failed_when_glm_ocr_errors(
+def test_worker_marks_job_failed_when_docling_errors(
     db_session: Session,
     session_factory: sessionmaker,
     organization,
@@ -120,51 +186,20 @@ def test_worker_marks_job_failed_when_glm_ocr_errors(
     artifacts = create_upload_artifacts(
         db_session,
         organization_id=organization.id,
-        filename="scan.pdf",
+        filename="broken.pdf",
         content_type="application/pdf",
-        payload=make_blank_pdf(),
+        payload=make_pdf_payload(),
     )
 
-    with pytest.raises(RuntimeError, match="GLM-OCR request failed"):
+    with pytest.raises(RuntimeError, match="Docling conversion failed"):
         run_pdf_ingest_job(
             artifacts.job_id,
             session_factory=session_factory,
-            extractor=PDFTextExtractor(ocr_backend=FailingOcrAdapter()),
+            extractor=FailingDoclingExtractor(),
+            picture_adapter=FakePictureAdapter(),
         )
 
     job = db_session.get(Job, artifacts.job_id)
     assert job is not None
     assert job.status == "failed"
-    assert job.error_message == "GLM-OCR request failed"
-
-
-def test_worker_force_full_document_ocr_uses_ocr_even_with_embedded_text(
-    db_session: Session,
-    session_factory: sessionmaker,
-    organization,
-) -> None:
-    artifacts = create_upload_artifacts(
-        db_session,
-        organization_id=organization.id,
-        filename="embedded-text.pdf",
-        content_type="application/pdf",
-        payload=make_text_pdf("This text layer would normally be extracted directly."),
-    )
-
-    run_pdf_ingest_job(
-        artifacts.job_id,
-        session_factory=session_factory,
-        extractor=PDFTextExtractor(
-            ocr_backend=MockOcrAdapter(),
-            force_full_document_ocr=True,
-        ),
-    )
-
-    asset = db_session.scalar(select(PaperAsset).where(PaperAsset.paper_id == artifacts.paper_id))
-
-    assert asset is not None
-    assert asset.raw_text == "Table 1: ADHD-RS PDF"
-    assert asset.metadata_json is not None
-    assert asset.metadata_json["extraction"]["force_full_document_ocr"] is True
-    assert asset.metadata_json["extraction"]["used_ocr_pages"] == [1]
-    assert asset.metadata_json["extraction"]["pages"][0]["reasons"] == ["full_document_ocr_enabled"]
+    assert job.error_message == "Docling conversion failed"

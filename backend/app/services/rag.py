@@ -14,7 +14,7 @@ from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import ChatMessage, ChatTopic, Paper, PaperChunk, User
+from app.models import ChatMessage, ChatTopic, Paper, PaperChunk, PaperDocumentBlock, PaperDocumentPicture, PaperDocumentTable, User
 from app.services.llm import chat_with_messages, embed_texts, get_chat_llm_configuration, rerank_documents
 
 logger = logging.getLogger(__name__)
@@ -1331,6 +1331,12 @@ def _make_chunk_record(
             "block_count": len(block_rows),
             "body_text": body_text,
             "supporting_context": supporting_context or None,
+            "source_block_ids": sorted({int(block["source_block_id"]) for block in block_rows if str(block.get("source_block_id") or "").isdigit()}),
+            "source_table_ids": sorted({int(block["source_table_id"]) for block in block_rows if str(block.get("source_table_id") or "").isdigit()}),
+            "source_picture_ids": sorted({int(block["source_picture_id"]) for block in block_rows if str(block.get("source_picture_id") or "").isdigit()}),
+            "docling_labels": sorted({str(block.get("docling_label")) for block in block_rows if str(block.get("docling_label") or "").strip()}),
+            "table_markdown": next((block.get("table_markdown") for block in block_rows if block.get("table_markdown")), None),
+            "picture_description": next((block.get("picture_description") for block in block_rows if block.get("picture_description")), None),
         },
     }
 
@@ -1532,6 +1538,102 @@ def _split_text(
     return chunks
 
 
+def _build_preanalysis_from_document_structure(db: Session, *, paper_id: int) -> dict[str, Any] | None:
+    blocks: list[dict[str, Any]] = []
+    char_cursor = 0
+    db_blocks = db.scalars(
+        select(PaperDocumentBlock)
+        .where(PaperDocumentBlock.paper_id == paper_id)
+        .order_by(PaperDocumentBlock.block_index.asc(), PaperDocumentBlock.id.asc())
+    ).all()
+    for row in db_blocks:
+        text_value = (row.text or "").strip()
+        if not text_value:
+            continue
+        provenance = row.provenance_json if isinstance(row.provenance_json, dict) else {}
+        page_number = int(provenance.get("page_number") or 1)
+        char_start = char_cursor
+        char_end = char_start + len(text_value)
+        char_cursor = char_end + 2
+        blocks.append(
+            {
+                "block_index": len(blocks),
+                "source_block_id": row.id,
+                "page_number": page_number,
+                "section_id": row.section_path or "Document",
+                "section_title": row.section_path or "Document",
+                "section_path": row.section_path or "Document",
+                "heading_level": row.heading_level or 1,
+                "block_type": row.block_type or "paragraph",
+                "docling_label": row.docling_label,
+                "char_start": char_start,
+                "char_end": char_end,
+                "text": text_value,
+            }
+        )
+
+    tables = db.scalars(
+        select(PaperDocumentTable)
+        .where(PaperDocumentTable.paper_id == paper_id)
+        .order_by(PaperDocumentTable.table_index.asc(), PaperDocumentTable.id.asc())
+    ).all()
+    for table in tables:
+        parts = [str(table.caption or "").strip(), str(table.markdown or "").strip()]
+        text_value = "\n\n".join(part for part in parts if part)
+        if not text_value:
+            continue
+        char_start = char_cursor
+        char_end = char_start + len(text_value)
+        char_cursor = char_end + 2
+        blocks.append(
+            {
+                "block_index": len(blocks),
+                "source_table_id": table.id,
+                "page_number": table.page_from or 1,
+                "section_id": "Tables",
+                "section_title": "Tables",
+                "section_path": "Tables",
+                "heading_level": 1,
+                "block_type": "table_like",
+                "char_start": char_start,
+                "char_end": char_end,
+                "text": text_value,
+                "table_markdown": table.markdown,
+            }
+        )
+
+    pictures = db.scalars(
+        select(PaperDocumentPicture)
+        .where(PaperDocumentPicture.paper_id == paper_id)
+        .order_by(PaperDocumentPicture.picture_index.asc(), PaperDocumentPicture.id.asc())
+    ).all()
+    for picture in pictures:
+        parts = [str(picture.caption or "").strip(), str(picture.description or "").strip()]
+        text_value = "\n\n".join(part for part in parts if part)
+        if not text_value:
+            continue
+        char_start = char_cursor
+        char_end = char_start + len(text_value)
+        char_cursor = char_end + 2
+        blocks.append(
+            {
+                "block_index": len(blocks),
+                "source_picture_id": picture.id,
+                "page_number": picture.page_number or 1,
+                "section_id": "Figures",
+                "section_title": "Figures",
+                "section_path": "Figures",
+                "heading_level": 1,
+                "block_type": "figure_caption",
+                "char_start": char_start,
+                "char_end": char_end,
+                "text": text_value,
+                "picture_description": picture.description,
+            }
+        )
+    return {"blocks": blocks} if blocks else None
+
+
 def rebuild_paper_index(
     db: Session,
     *,
@@ -1576,6 +1678,17 @@ def rebuild_paper_index(
         )
         db.commit()
     return len(chunks)
+
+
+def rebuild_paper_index_from_document_structure(
+    db: Session,
+    *,
+    paper_id: int,
+    raw_text: str,
+    paper_title: str | None = None,
+) -> int:
+    preanalysis = _build_preanalysis_from_document_structure(db, paper_id=paper_id)
+    return rebuild_paper_index(db, paper_id=paper_id, raw_text=raw_text, preanalysis=preanalysis, paper_title=paper_title)
 
 
 def _search_chunks(

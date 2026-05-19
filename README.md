@@ -21,7 +21,7 @@
 
 ## 本地开发（命令行启动，推荐调试）
 
-适合在本机改代码、看实时日志。需已安装：**Python 3.12+**、**Node.js 18+**、以及 **PostgreSQL（含 pgvector）** 或通过 Compose **仅启动数据库容器**。若要在本机运行 PDF OCR worker，还需安装 **Redis**，并在 `.env` 中配置可用的 GLM-OCR API key。若要验证 Milestone 3 的摘要生成与首页对话，还需配置 OpenAI 兼容接口信息。
+适合在本机改代码、看实时日志。需已安装：**Python 3.12+**、**Node.js 18+**、以及 **PostgreSQL（含 pgvector）** 或通过 Compose **仅启动数据库容器**。若要在本机运行 PDF 文档解析 worker，还需安装 **Redis**；若要生成图片/图表描述，请在 `.env` 中配置可用的 GLM-4.6V API key。若要验证 Milestone 3 的摘要生成与首页对话，还需配置 OpenAI 兼容接口信息。
 
 ### 1. 环境与数据库
 
@@ -75,17 +75,18 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 健康检查：[http://localhost:8000/health](http://localhost:8000/health)
 
-### 3. 启动 Celery Worker（PDF OCR 异步任务）
+### 3. 启动 Celery Worker（PDF 文档解析异步任务）
 
 本地命令行开发时，`celery worker` 需要**单独启动一个终端**。若使用 `docker compose up -d --build` 启全部服务，则 `celery-worker` 会随 Compose 一起启动，无需再手动执行。
 
 默认依赖：
 
 - `REDIS_URL=redis://localhost:6379/1`
-- `OCR_PROVIDER=glm_ocr`
-- `LLM_OCR_API_KEY=your-api-key`
-- `LLM_OCR_MODEL=glm-ocr`
-- `OCR_FORCE_FULL_DOCUMENT=false`
+- `DOCUMENT_EXTRACTOR=docling`
+- `DOCLING_DO_OCR=true`
+- `DOCLING_DO_TABLE_STRUCTURE=true`
+- `PICTURE_VLM_MODEL=glm-4.6v`
+- `PICTURE_VLM_API_KEY=your-api-key`
 - `OPENAI_API_KEY=your-api-key`
 - `OPENAI_MODEL=your-model`
 
@@ -97,10 +98,11 @@ source .venv/bin/activate
 export REDIS_URL=redis://localhost:6379/1
 export CELERY_BROKER_URL=redis://localhost:6379/1
 export CELERY_RESULT_BACKEND=redis://localhost:6379/1
-export OCR_PROVIDER=glm_ocr
-export LLM_OCR_API_KEY=your-api-key
-export LLM_OCR_MODEL=glm-ocr
-export OCR_FORCE_FULL_DOCUMENT=false
+export DOCUMENT_EXTRACTOR=docling
+export DOCLING_DO_OCR=true
+export DOCLING_DO_TABLE_STRUCTURE=true
+export PICTURE_VLM_MODEL=glm-4.6v
+export PICTURE_VLM_API_KEY=your-api-key
 celery -A app.celery_app.celery_app worker --loglevel=info
 ```
 
@@ -112,20 +114,25 @@ conda activate researchdock
 $env:REDIS_URL = "redis://localhost:6379/1"
 $env:CELERY_BROKER_URL = "redis://localhost:6379/1"
 $env:CELERY_RESULT_BACKEND = "redis://localhost:6379/1"
-$env:OCR_PROVIDER = "glm_ocr"
-$env:LLM_OCR_API_KEY = "your-api-key"
-$env:LLM_OCR_MODEL = "glm-ocr"
-$env:OCR_FORCE_FULL_DOCUMENT = "false"
+$env:DOCUMENT_EXTRACTOR = "docling"
+$env:DOCLING_DO_OCR = "true"
+$env:DOCLING_DO_TABLE_STRUCTURE = "true"
+$env:PICTURE_VLM_MODEL = "glm-4.6v"
+$env:PICTURE_VLM_API_KEY = "your-api-key"
 celery -A app.celery_app.celery_app worker --loglevel=info
 ```
 
 说明：
 
-- 上传 PDF 后，后端 API 只负责入队；真正的文本提取与 OCR 在 worker 中执行。
-- 当前实现优先读取 PDF 文本层；只有页级文本质量不足时才会触发 OCR fallback。
-- 若设置 `OCR_FORCE_FULL_DOCUMENT=true`，则会跳过 PDF 文本层判断，整篇文档直接逐页走 OCR。
-- 当前 OCR fallback 通过智谱官方 `GLM-OCR` 接口完成，不再依赖本地 `tesseract`。
-- 本机运行 worker 时，请确认 `redis-server` 已启动，且 `.env` 中已配置 `LLM_OCR_API_KEY`。
+- 上传 PDF 后，后端 API 只负责入队；真正的 Docling 文档解析、表格结构化与图片/图表描述在 worker 中执行。
+- 当前实现使用 Docling 作为唯一 PDF 抽取管线，并将页、块、表格、图片结构写入数据库。
+- 图片/图表描述默认通过 GLM-4.6V 视觉模型完成；未配置 `PICTURE_VLM_API_KEY` 时不会阻塞整篇文档解析。
+- 本机运行 worker 时，请确认 `redis-server` 已启动。
+- 默认 `DOCLING_OCR_ENGINE=easyocr` 时，`requirements.txt` 使用 `docling[easyocr]` 安装 EasyOCR；若此前只装过 `docling==2.94.0`，需补装：`pip install "docling[easyocr]==2.94.0"` 或 `pip install easyocr`。
+- 若 PDF 自带 text layer 质量很差、会把中文论文解析成整篇乱码，可设置 `DOCLING_FORCE_FULL_PAGE_OCR=true`，强制用整页 OCR 覆盖嵌入文字层。
+- **模型缓存卷**：Compose 下 `celery-worker` 挂载命名卷 `model_cache` → 容器内 `/data/models`。通过 `.env` 配置 `MODEL_CACHE_PATH`、`DOCLING_ARTIFACTS_PATH`、`EASYOCR_MODULE_PATH`、`HF_HOME`（后三项可留空，自动落在根目录子路径）。首次解析仍会下载模型，但会写入该卷，**重建容器后无需重复下载**。
+- 本机开发可在 `.env` 设置 `MODEL_CACHE_PATH=./data/models`，目录已加入 `.gitignore`。
+- 若不想装 EasyOCR，可将 `DOCLING_OCR_ENGINE` 改为 `rapidocr`（需 `pip install rapidocr onnxruntime`）或 `tesseract`（需系统安装 Tesseract）。
 - 若已配置 `OPENAI_*` 环境变量，worker 会在文本提取完成后继续生成中文摘要与结构化信息。
 
 ### 4. 启动前端（Next.js）
@@ -356,7 +363,7 @@ docker compose logs -f frontend
 - `docker compose ps` 中 `frontend`、`backend`、`db`、`n8n`、`celery-worker` 均可正常运行
 - `GET /health` 返回正常
 - 浏览器打开前端，使用 `admin` / `123456` 登录成功并进入论文工作台
-- 上传 PDF 后，首页左侧出现论文记录，右侧可查看摘要与文本 / OCR 预览
+- 上传 PDF 后，首页左侧出现论文记录，右侧可查看摘要与解析文本预览
 - 首页可切换到 `对话` tab，并通过 `OPENAI_*` 配置得到模型回复
 - 右上角任务入口可查看进行中和失败任务
 
@@ -388,9 +395,11 @@ docker compose logs -f frontend
 - `APP_SECRET_KEY`：JWT 签名密钥，生产环境务必更换。
 - `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL`：首页通用对话与论文摘要生成使用的 OpenAI 兼容接口配置。
 - `OPENAI_TIMEOUT_SECONDS` / `OPENAI_VERIFY_SSL`：控制聊天与摘要请求的超时和证书校验。
-- `OCR_PROVIDER`：当前默认 `glm_ocr`，通过 adapter 统一接入 OCR 服务。
-- `LLM_OCR_API_KEY`：智谱 GLM-OCR 的 API key；worker 触发 OCR fallback 时必填。
-- `LLM_OCR_BASE_URL` / `LLM_OCR_MODEL`：默认分别为智谱官方 `layout_parsing` 接口与 `glm-ocr` 模型。
-- `OCR_FORCE_FULL_DOCUMENT`：默认 `false`。设为 `true` 时，跳过 MuPDF 文本层提取判定，整篇 PDF 直接走 OCR。
+- `DOCUMENT_EXTRACTOR`：当前固定为 `docling`，用于 PDF 文档解析。
+- `DOCLING_DO_OCR` / `DOCLING_DO_TABLE_STRUCTURE`：控制 Docling OCR 与表格结构识别步骤。
+- `DOCLING_OCR_ENGINE` / `DOCLING_OCR_LANGUAGES`：控制 Docling 标准管线中的 OCR 引擎与语言；默认 `easyocr` 依赖 `docling[easyocr]`（见 `requirements.txt`），非 `docling` 主包自带。
+- `DOCLING_FORCE_FULL_PAGE_OCR`：是否强制整页 OCR 并覆盖 PDF 原有文字层；对“内嵌 text layer 有毒、默认解析成乱码”的中文 PDF 更有帮助，但会更依赖 OCR 质量。
+- `MODEL_CACHE_PATH` / `DOCLING_ARTIFACTS_PATH` / `EASYOCR_MODULE_PATH` / `HF_HOME`：Docling、EasyOCR、Hugging Face 模型缓存目录；生产建议挂载持久卷（见 `docker-compose.yml` 中 `model_cache`）。
+- `PICTURE_VLM_*`：图片/图表描述模型配置，默认使用 GLM-4.6V；API key 不会写入任务元数据。
 - 生产环境若走 HTTPS，请将 `COOKIE_SECURE` 设为 `true`。
 

@@ -87,6 +87,69 @@ CREATE TABLE paper_assets (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE paper_document_pages (
+    id BIGSERIAL PRIMARY KEY,
+    paper_id BIGINT NOT NULL REFERENCES papers (id) ON DELETE CASCADE,
+    asset_id BIGINT NOT NULL REFERENCES paper_assets (id) ON DELETE CASCADE,
+    page_number INTEGER NOT NULL,
+    text TEXT,
+    width INTEGER,
+    height INTEGER,
+    metadata_json JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE paper_document_blocks (
+    id BIGSERIAL PRIMARY KEY,
+    paper_id BIGINT NOT NULL REFERENCES papers (id) ON DELETE CASCADE,
+    page_id BIGINT REFERENCES paper_document_pages (id) ON DELETE CASCADE,
+    block_index INTEGER NOT NULL,
+    block_type VARCHAR(64) NOT NULL DEFAULT 'paragraph',
+    docling_label VARCHAR(128),
+    heading_level INTEGER,
+    section_path TEXT,
+    text TEXT NOT NULL,
+    bbox_json JSONB,
+    provenance_json JSONB,
+    metadata_json JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE paper_document_tables (
+    id BIGSERIAL PRIMARY KEY,
+    paper_id BIGINT NOT NULL REFERENCES papers (id) ON DELETE CASCADE,
+    page_from INTEGER,
+    page_to INTEGER,
+    table_index INTEGER NOT NULL,
+    caption TEXT,
+    markdown TEXT,
+    data_json JSONB,
+    bbox_json JSONB,
+    metadata_json JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE paper_document_pictures (
+    id BIGSERIAL PRIMARY KEY,
+    paper_id BIGINT NOT NULL REFERENCES papers (id) ON DELETE CASCADE,
+    page_number INTEGER,
+    picture_index INTEGER NOT NULL,
+    caption TEXT,
+    description TEXT,
+    description_model VARCHAR(255),
+    description_prompt_version VARCHAR(64),
+    bbox_json JSONB,
+    image_asset_path TEXT,
+    metadata_json JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_paper_document_pages_paper_page ON paper_document_pages (paper_id, page_number);
+CREATE INDEX idx_paper_document_blocks_paper_block ON paper_document_blocks (paper_id, block_index);
+CREATE INDEX idx_paper_document_blocks_paper_type ON paper_document_blocks (paper_id, block_type);
+CREATE INDEX idx_paper_document_tables_paper_table ON paper_document_tables (paper_id, table_index);
+CREATE INDEX idx_paper_document_pictures_paper_picture ON paper_document_pictures (paper_id, picture_index);
+
 CREATE TABLE paper_summaries (
     id BIGSERIAL PRIMARY KEY,
     paper_id BIGINT NOT NULL REFERENCES papers (id) ON DELETE CASCADE,
@@ -179,5 +242,5 @@ CREATE TABLE IF NOT EXISTS alembic_version (
 );
 
 INSERT INTO alembic_version (version_num)
-VALUES ('20260514_01')
+VALUES ('20260519_02')
 ON CONFLICT (version_num) DO NOTHING;

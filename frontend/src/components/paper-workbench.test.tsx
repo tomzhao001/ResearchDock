@@ -30,7 +30,7 @@ const fetchPaper = vi.fn();
 const deletePaper = vi.fn();
 const regeneratePaperQuestionSet = vi.fn();
 const regeneratePaperSummary = vi.fn();
-const rerunPaperOcr = vi.fn();
+const reparsePaperDocument = vi.fn();
 const subscribeTaskStatusEvents = vi.fn(() => vi.fn());
 
 vi.mock("@/lib/papers", () => ({
@@ -39,7 +39,7 @@ vi.mock("@/lib/papers", () => ({
   fetchPapers: (...args: unknown[]) => fetchPapers(...args),
   regeneratePaperQuestionSet: (...args: unknown[]) => regeneratePaperQuestionSet(...args),
   regeneratePaperSummary: (...args: unknown[]) => regeneratePaperSummary(...args),
-  rerunPaperOcr: (...args: unknown[]) => rerunPaperOcr(...args),
+  reparsePaperDocument: (...args: unknown[]) => reparsePaperDocument(...args),
   subscribeTaskStatusEvents: (...args: unknown[]) => subscribeTaskStatusEvents(...args),
 }));
 
@@ -133,13 +133,13 @@ describe("PaperWorkbench", () => {
 
     await waitFor(() => expect(fetchPapers).toHaveBeenCalled());
     await waitFor(() => expect(screen.getByRole("button", { name: /Alpha/ })).toBeInTheDocument());
-    await waitFor(() => expectPaperOrder(["Beta", "Zebra", "Alpha"]));
+    await waitFor(() => expectPaperOrder(["Alpha", "Beta", "Zebra"]));
 
-    await user.click(screen.getByRole("button", { name: "当前按论文时间排序，点击切换到字母" }));
+    await user.click(screen.getByRole("button", { name: "当前按字母排序，点击切换到论文时间" }));
     await waitFor(() => expectPaperOrder(["Zebra", "Beta", "Alpha"]));
 
-    await user.click(screen.getByRole("button", { name: "当前倒序，点击切换到正序" }));
-    await waitFor(() => expectPaperOrder(["Alpha", "Beta", "Zebra"]));
+    await user.click(screen.getByRole("button", { name: "当前正序，点击切换到倒序" }));
+    await waitFor(() => expectPaperOrder(["Beta", "Zebra", "Alpha"]));
   });
 
   it("为自动提取和手动编辑的元数据显示来源", async () => {
@@ -196,12 +196,12 @@ describe("PaperWorkbench", () => {
     await waitFor(() => expect(fetchPaper).toHaveBeenCalledWith(1));
 
     expect(screen.getByRole("button", { name: "文档信息" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "OCR文本" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "解析文本" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "摘要" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "问题集结果" })).toBeInTheDocument();
     expect(screen.queryByText("OCR / 摘要预览")).not.toBeInTheDocument();
     expect(screen.queryByText("摘要和文档信息")).not.toBeInTheDocument();
-    expect(screen.queryByText("查看当前选中论文的展示名、原始文件名、摘要信息和 OCR 文本内容。")).not.toBeInTheDocument();
+    expect(screen.queryByText("查看当前选中论文的展示名、原始文件名、摘要信息和解析文本内容。")).not.toBeInTheDocument();
     expect(screen.getAllByText("原始文件名：Alpha.pdf").length).toBeGreaterThan(0);
     expect(screen.getByText("作者：Alice Example")).toBeInTheDocument();
     expect(screen.queryByText(/Alpha abstract/)).not.toBeInTheDocument();

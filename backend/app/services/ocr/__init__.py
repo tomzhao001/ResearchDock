@@ -1,10 +1,6 @@
-from app.services.ocr.base import OcrAdapter, OcrRecognitionResult
-from app.services.ocr.factory import build_ocr_adapter
-from app.services.ocr.glm_ocr import GlmOcrAdapter
+from app.services.ocr.text_normalization import OcrTextNormalizationResult, normalize_ocr_text
 
 __all__ = [
-    "GlmOcrAdapter",
-    "OcrAdapter",
-    "OcrRecognitionResult",
-    "build_ocr_adapter",
+    "OcrTextNormalizationResult",
+    "normalize_ocr_text",
 ]

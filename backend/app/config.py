@@ -18,6 +18,7 @@ class Settings(BaseSettings):
         ),
         env_file_encoding="utf-8",
         extra="ignore",
+        protected_namespaces=("settings_",),
     )
 
     app_name: str = "ResearchDock API"
@@ -97,19 +98,26 @@ class Settings(BaseSettings):
     rag_attribution_min_support_score: float = 0.55
     rag_attribution_min_total_support_score: float = 0.9
     rag_attribution_verifier_min_support_score: float = 0.5
-    ocr_provider: str = "glm_ocr"
-    llm_ocr_base_url: str = "https://api.z.ai/api/paas/v4/layout_parsing"
-    llm_ocr_api_key: str = ""
-    llm_ocr_model: str = "glm-ocr"
-    llm_ocr_timeout_seconds: int = 240
-    llm_ocr_max_retries: int = 2
-    llm_ocr_retry_backoff_seconds: float = 0.5
-    llm_ocr_verify_ssl: bool = True
-    ocr_force_full_document: bool = False
-    ocr_min_chars_per_page: int = 300
-    ocr_min_alpha_ratio: float = 0.6
-    ocr_max_empty_page_ratio: float = 0.4
-    ocr_min_average_chars_per_page: int = 800
+    document_extractor: str = "docling"
+    docling_do_ocr: bool = True
+    docling_do_table_structure: bool = True
+    docling_do_picture_description: bool = True
+    docling_ocr_engine: str = "easyocr"
+    docling_ocr_languages: str = "ch_sim,en"
+    docling_force_full_page_ocr: bool = False
+    docling_document_timeout_seconds: int = 240
+    docling_device: str = "auto"
+    model_cache_path: Path = _REPO_ROOT / "data" / "models"
+    docling_artifacts_path: str = ""
+    easyocr_module_path: str = ""
+    hf_home: str = ""
+    picture_vlm_provider: str = "glm_4_6v"
+    picture_vlm_base_url: str = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    picture_vlm_api_key: str = ""
+    picture_vlm_model: str = "glm-4.6v"
+    picture_vlm_timeout_seconds: int = 120
+    picture_vlm_max_retries: int = 2
+    picture_vlm_prompt_version: str = "picture-rag-v1"
 
     @model_validator(mode="after")
     def _resolve_paths_and_queue(self) -> Self:
@@ -117,6 +125,11 @@ class Settings(BaseSettings):
         if not storage_path.is_absolute():
             storage_path = (_REPO_ROOT / storage_path).resolve()
         object.__setattr__(self, "file_storage_path", storage_path)
+
+        model_cache_path = self.model_cache_path
+        if not model_cache_path.is_absolute():
+            model_cache_path = (_REPO_ROOT / model_cache_path).resolve()
+        object.__setattr__(self, "model_cache_path", model_cache_path)
 
         broker = (self.celery_broker_url or "").strip() or self.redis_url
         backend = (self.celery_result_backend or "").strip() or broker

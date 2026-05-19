@@ -21,7 +21,7 @@ from app.services.papers import (
     create_upload_artifacts,
     delete_paper,
     enqueue_paper_question_set_regeneration,
-    enqueue_paper_ocr_rerun,
+    enqueue_paper_reparse,
     enqueue_paper_summary_regeneration,
     get_job_phase_status,
     get_original_filename,
@@ -162,14 +162,14 @@ def delete_paper_item(
     return MessageResponse(message="Paper deleted")
 
 
-@router.post("/{paper_id}/rerun-ocr", response_model=JobAcceptedResponse, status_code=status.HTTP_202_ACCEPTED)
-def rerun_paper_ocr(
+@router.post("/{paper_id}/reparse-document", response_model=JobAcceptedResponse, status_code=status.HTTP_202_ACCEPTED)
+def reparse_paper_document(
     paper_id: int,
     db: Annotated[Session, Depends(get_db)],
     context: Annotated[AuthContext, Depends(require_permission("papers:write"))],
 ):
     try:
-        job = enqueue_paper_ocr_rerun(db, paper_id, organization_id=context.organization.id)
+        job = enqueue_paper_reparse(db, paper_id, organization_id=context.organization.id)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 

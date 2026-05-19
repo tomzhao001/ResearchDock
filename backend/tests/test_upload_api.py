@@ -7,8 +7,9 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.models import Job, OrganizationSettings, Paper, PaperAsset, PaperChunk
 from app.services import llm
 from app.routers import papers as papers_router
+from app.services.document_extraction import ExtractedBlock, ExtractedDocument, ExtractedPage
 from app.services.papers import run_paper_question_set_job, run_paper_summary_job, run_pdf_ingest_job
-from app.services.pdf_extraction import DocumentExtractionResult, PDFTextExtractor
+from app.services.vision.base import NoopPictureDescriptionAdapter
 
 
 def make_summary_payload(
@@ -63,27 +64,24 @@ def make_pdf_bytes(text: str) -> bytes:
     return payload
 
 
-class SuccessfulTextExtractor(PDFTextExtractor):
+class SuccessfulTextExtractor:
     def extract(self, pdf_path):
-        return DocumentExtractionResult(
-            raw_text="This is extracted directly from the embedded text layer.",
+        return ExtractedDocument(
+            markdown_text="This is extracted directly from the embedded text layer.",
             metadata={
+                "engine": "docling",
                 "page_count": 1,
-                "used_ocr_pages": [],
-                "pages": [
-                    {
-                        "page_number": 1,
-                        "char_count": 512,
-                        "alpha_ratio": 0.92,
-                        "continuous_line_ratio": 0.7,
-                        "image_count": 0,
-                        "suspected_double_column": False,
-                        "needs_ocr": False,
-                        "used_ocr": False,
-                        "reasons": [],
-                    }
-                ],
             },
+            pages=[ExtractedPage(page_number=1, text="This is extracted directly from the embedded text layer.")],
+            blocks=[
+                ExtractedBlock(
+                    block_index=0,
+                    text="This is extracted directly from the embedded text layer.",
+                    block_type="paragraph",
+                    page_number=1,
+                    section_path="Document",
+                )
+            ],
         )
 
 
@@ -110,7 +108,7 @@ def set_org_question_set(db_session: Session, *, organization_id: int, questions
 def make_eager_upload_delay(
     session_factory: sessionmaker,
     *,
-    extractor: PDFTextExtractor | None = None,
+    extractor: object | None = None,
     swallow_errors: bool = True,
 ):
     def eager_delay(job_id: int):
@@ -119,6 +117,7 @@ def make_eager_upload_delay(
                 job_id,
                 session_factory=session_factory,
                 extractor=extractor or SuccessfulTextExtractor(),
+                picture_adapter=NoopPictureDescriptionAdapter(),
             )
             if summary_job_id is not None:
                 question_set_job_id = run_paper_summary_job(summary_job_id, session_factory=session_factory)
@@ -273,8 +272,8 @@ def test_upload_creates_records_and_completes_job(
     assert asset is not None
     assert "embedded text layer" in (asset.raw_text or "")
     assert isinstance(asset.metadata_json, dict)
-    assert asset.metadata_json["preanalysis"]["schema_version"] == 1
-    assert asset.metadata_json["preanalysis"]["chunking_hints"]["block_count"] >= 1
+    assert asset.metadata_json["extraction"]["engine"] == "docling"
+    assert asset.metadata_json["extraction"]["block_count"] >= 1
     assert asset.metadata_json["structured_summary"]["doi"] == "10.1000/researchdock"
     assert asset.metadata_json["question_set_extraction"]["questions"][0]["id"] == "q1"
     assert len(chunks) > 0
@@ -798,12 +797,12 @@ def test_rerun_ocr_creates_new_job(
     try:
         upload_response = client.post(
             "/api/papers/upload",
-            files={"file": ("rerun-ocr.pdf", make_pdf_bytes("paper body"), "application/pdf")},
+            files={"file": ("reparse-document.pdf", make_pdf_bytes("paper body"), "application/pdf")},
         )
         assert upload_response.status_code == 202
         paper_id = upload_response.json()["paper_id"]
 
-        rerun_response = client.post(f"/api/papers/{paper_id}/rerun-ocr")
+        rerun_response = client.post(f"/api/papers/{paper_id}/reparse-document")
     finally:
         monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", original_delay)
 

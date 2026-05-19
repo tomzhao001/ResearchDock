@@ -5,6 +5,7 @@ from celery.signals import worker_process_init
 from celery.utils.nodenames import gethostname
 
 from app.config import settings
+from app.services.model_cache import configure_model_cache_env
 
 celery_app = Celery(
     "researchdock",
@@ -30,6 +31,11 @@ if _IS_WINDOWS:
     )
 
 celery_app.conf.update(**celery_config)
+
+
+@worker_process_init.connect
+def _configure_worker_model_cache(**_kwargs) -> None:
+    configure_model_cache_env()
 
 
 @worker_process_init.connect

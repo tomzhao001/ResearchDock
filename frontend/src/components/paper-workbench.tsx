@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUpDown, CalendarDays, FilePenLine, LoaderCircle, RefreshCw, TextCursorInput, Trash2, Upload } from "lucide-react";
 
 import { PaperMetadataDialog } from "@/components/paper-metadata-dialog";
@@ -18,7 +18,7 @@ import {
   fetchPapers,
   regeneratePaperQuestionSet,
   regeneratePaperSummary,
-  rerunPaperOcr,
+  reparsePaperDocument,
   subscribeTaskStatusEvents,
   type JobPublic,
   type PaperDetail,
@@ -29,7 +29,7 @@ import {
 const ACTIVE_STATUSES = new Set(["queued", "processing"]);
 type PaperSortMode = "alphabet" | "publishedAt";
 type PaperSortDirection = "asc" | "desc";
-type PreviewTab = "metadata" | "ocr" | "summary" | "questionSet";
+type PreviewTab = "metadata" | "parsedText" | "summary" | "questionSet";
 
 function statusLabel(status: string | null): string {
   if (status === "queued") return "排队中";
@@ -215,12 +215,19 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
   const [uploadDialogOpen, setUploadDialogOpen] = useState(false);
   const [metadataDialogOpen, setMetadataDialogOpen] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
-  const [confirmAction, setConfirmAction] = useState<"rerun-ocr" | "regenerate-summary" | "regenerate-question-set" | null>(null);
+  const [confirmAction, setConfirmAction] = useState<"reparse-document" | "regenerate-summary" | "regenerate-question-set" | null>(null);
   const [previewTab, setPreviewTab] = useState<PreviewTab>("metadata");
-  const [actionLoading, setActionLoading] = useState<"rerun-ocr" | "regenerate-summary" | "regenerate-question-set" | "delete" | null>(null);
+  const [actionLoading, setActionLoading] = useState<"reparse-document" | "regenerate-summary" | "regenerate-question-set" | "delete" | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [sortMode, setSortMode] = useState<PaperSortMode>("publishedAt");
-  const [sortDirection, setSortDirection] = useState<PaperSortDirection>("desc");
+  const [sortMode, setSortMode] = useState<PaperSortMode>("alphabet");
+  const [sortDirection, setSortDirection] = useState<PaperSortDirection>("asc");
+  const sortModeRef = useRef(sortMode);
+  const sortDirectionRef = useRef(sortDirection);
+
+  useEffect(() => {
+    sortModeRef.current = sortMode;
+    sortDirectionRef.current = sortDirection;
+  }, [sortDirection, sortMode]);
 
   const loadPapers = useCallback(
     async (preferredPaperId?: number | null, options?: { silent?: boolean }) => {
@@ -237,12 +244,13 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
           return;
         }
 
+        const sortedItems = sortPapersForDisplay(items, sortModeRef.current, sortDirectionRef.current);
         const nextId =
           preferredPaperId && items.some((item) => item.id === preferredPaperId)
             ? preferredPaperId
             : selectedPaperId && items.some((item) => item.id === selectedPaperId)
               ? selectedPaperId
-              : items[0].id;
+              : sortedItems[0]?.id ?? null;
         if (nextId !== selectedPaperId) {
           onSelectedPaperChange(nextId);
         }
@@ -375,20 +383,20 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
     }
   }
 
-  async function handleRerunOcr() {
+  async function handleReparseDocument() {
     if (!paperDetail) {
       return;
     }
 
     setConfirmAction(null);
-    setActionLoading("rerun-ocr");
+    setActionLoading("reparse-document");
     setActionError(null);
     try {
-      await rerunPaperOcr(paperDetail.id);
+      await reparsePaperDocument(paperDetail.id);
       await loadPapers(paperDetail.id);
       await loadDetail(paperDetail.id);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "重新 OCR 失败";
+      const message = error instanceof Error ? error.message : "重新解析文档失败";
       setActionError(message);
     } finally {
       setActionLoading(null);
@@ -446,22 +454,22 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
   }
 
   const confirmActionText =
-    confirmAction === "rerun-ocr"
+    confirmAction === "reparse-document"
       ? {
-          title: "确认重新执行 OCR",
-          description: "系统会重新提取当前 PDF 的文本，并在完成后继续同步最新 OCR 结果。",
-          buttonLabel: "确认重新 OCR",
+          title: "确认重新解析文档",
+          description: "系统会重新解析当前 PDF 的文本、表格和图片描述，并在完成后同步最新结果。",
+          buttonLabel: "确认重新解析",
         }
       : confirmAction === "regenerate-summary"
         ? {
             title: "确认重新生成摘要",
-            description: "系统会基于当前 OCR 文本重新生成摘要和结构化信息。",
+            description: "系统会基于当前解析文本重新生成摘要和结构化信息。",
             buttonLabel: "确认重新生成摘要",
           }
         : confirmAction === "regenerate-question-set"
           ? {
               title: "确认重新提取问题集",
-              description: "系统会基于当前摘要、OCR 文本和组织级问题集重新提取问题结果。",
+              description: "系统会基于当前摘要、解析文本和组织级问题集重新提取问题结果。",
               buttonLabel: "确认重新提取问题集",
             }
         : null;
@@ -556,8 +564,8 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
             <Button
               type="button"
               onClick={() => {
-                if (confirmAction === "rerun-ocr") {
-                  void handleRerunOcr();
+                if (confirmAction === "reparse-document") {
+                  void handleReparseDocument();
                   return;
                 }
                 if (confirmAction === "regenerate-summary") {
@@ -691,7 +699,7 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                   </div>
                   <div className="flex shrink-0 flex-col items-end gap-1.5">
                     <PhaseBadge
-                      label="OCR"
+                      label="解析"
                       status={paper.ocr_status}
                     />
                     <PhaseBadge
@@ -719,7 +727,7 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                 onValueChange={setPreviewTab}
                 items={[
                   { value: "metadata", label: "文档信息" },
-                  { value: "ocr", label: "OCR文本" },
+                  { value: "parsedText", label: "解析文本" },
                   { value: "summary", label: "摘要" },
                   { value: "questionSet", label: "问题集结果" },
                 ]}
@@ -785,16 +793,16 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                       </div>
                       <div className="grid shrink-0 gap-2">
                         <PhaseBadge
-                          label="OCR"
+                          label="解析"
                           status={paperDetail.ocr_status}
                           action={
                             canWritePapers
                               ? {
-                                  tooltip: "重新执行 OCR",
-                                  ariaLabel: "重新执行 OCR",
+                                  tooltip: "重新解析文档",
+                                  ariaLabel: "重新解析文档",
                                   disabled: hasActiveJob || isBusy,
-                                  loading: actionLoading === "rerun-ocr",
-                                  onClick: () => setConfirmAction("rerun-ocr"),
+                                  loading: actionLoading === "reparse-document",
+                                  onClick: () => setConfirmAction("reparse-document"),
                                 }
                               : undefined
                           }
@@ -870,19 +878,19 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                   </div>
                 </TabPanel>
 
-                <TabPanel active={previewTab === "ocr"} className="grid gap-3">
+                <TabPanel active={previewTab === "parsedText"} className="grid gap-3">
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div>
-                      <h3 className="text-sm font-medium text-slate-700">OCR文本</h3>
+                      <h3 className="text-sm font-medium text-slate-700">解析文本</h3>
                       <p className="text-xs text-slate-500">
-                        总页数：{paperDetail.extraction_metadata?.page_count ?? "-"}，OCR 页：{" "}
-                        {(paperDetail.extraction_metadata?.used_ocr_pages || []).join(", ") || "-"}
+                        页数：{paperDetail.extraction_metadata?.page_count ?? "-"}，文本块：{paperDetail.extraction_metadata?.block_count ?? "-"}，
+                        表格：{paperDetail.extraction_metadata?.table_count ?? "-"}，图片：{paperDetail.extraction_metadata?.picture_count ?? "-"}
                       </p>
                     </div>
                   </div>
                   <div className="min-h-[420px] rounded-2xl border border-slate-200 bg-slate-950 px-5 py-5 font-mono text-sm leading-7 text-slate-200 shadow-inner">
                     <pre className="overflow-x-auto whitespace-pre-wrap break-words">
-                      {paperDetail.preview_text || "当前还没有 OCR 文本。"}
+                      {paperDetail.preview_text || "当前还没有解析文本。"}
                     </pre>
                   </div>
                 </TabPanel>

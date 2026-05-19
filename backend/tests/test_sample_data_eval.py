@@ -18,7 +18,47 @@ from app.evals.sample_data import (
     resolve_question_gold,
     run_sample_data_evaluation,
 )
+from app.services.document_extraction import ExtractedBlock, ExtractedDocument, ExtractedPage
 from app.services.rag import RetrievalResult
+
+
+class PyMuPdfTestExtractor:
+    def extract(self, pdf_path: Path) -> ExtractedDocument:
+        import fitz
+
+        doc = fitz.open(pdf_path)
+        pages: list[ExtractedPage] = []
+        blocks: list[ExtractedBlock] = []
+        page_texts: list[str] = []
+        try:
+            for page_number, page in enumerate(doc, start=1):
+                text = page.get_text().strip()
+                page_texts.append(text)
+                pages.append(ExtractedPage(page_number=page_number, text=text, width=page.rect.width, height=page.rect.height))
+                for block in page.get_text("blocks"):
+                    if len(block) < 5:
+                        continue
+                    block_text = str(block[4]).strip()
+                    if not block_text:
+                        continue
+                    blocks.append(
+                        ExtractedBlock(
+                            block_index=len(blocks),
+                            text=block_text,
+                            block_type="paragraph",
+                            page_number=page_number,
+                            section_path="Document",
+                            provenance={"page_number": page_number},
+                        )
+                    )
+        finally:
+            doc.close()
+        return ExtractedDocument(
+            markdown_text="\n\n".join(text for text in page_texts if text).strip(),
+            metadata={"engine": "test_pymupdf"},
+            pages=pages,
+            blocks=blocks,
+        )
 
 
 def test_sample_data_benchmark_files_have_expected_shape() -> None:
@@ -41,7 +81,7 @@ def test_sample_data_gold_evidence_resolves_against_ingested_sample_papers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("app.config.settings.openai_api_key", "")
-    papers_by_key = ingest_sample_data_papers(db_session, session_factory=session_factory)
+    papers_by_key = ingest_sample_data_papers(db_session, session_factory=session_factory, extractor=PyMuPdfTestExtractor())
     questions = load_sample_data_questions()
 
     from app.models import PaperChunk
@@ -112,7 +152,13 @@ def test_sample_data_smoke_eval_runs_and_returns_reports(
     monkeypatch.setattr("app.services.rag.embed_texts", fake_embeddings)
     monkeypatch.setattr("app.services.rag.rerank_documents", fake_rerank)
 
-    report = run_sample_data_evaluation(session_factory, mode="both", subset="smoke", judge_mode="heuristic")
+    report = run_sample_data_evaluation(
+        session_factory,
+        mode="both",
+        subset="smoke",
+        judge_mode="heuristic",
+        extractor=PyMuPdfTestExtractor(),
+    )
 
     assert report["retrieval"]["summary"]["count"] == 13
     assert report["retrieval"]["summary"]["skipped_without_gold"] == 1

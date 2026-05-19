@@ -181,7 +181,7 @@ export function UploadPanel({ onUploadAccepted, onJobUpdate, onCloseAfterUpload 
       {conflict ? (
         <div className="grid gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-4 text-sm text-amber-900">
           <p>已有相同原始文件名的文档：{conflict.filename}。</p>
-          <p className="text-amber-800">如果继续覆盖，系统会软删除旧文档并创建新的 OCR 任务。确认后将从当前文件继续，后续文件仍按原顺序处理。</p>
+          <p className="text-amber-800">如果继续覆盖，系统会软删除旧文档并创建新的解析任务。确认后将从当前文件继续，后续文件仍按原顺序处理。</p>
           <div className="flex flex-wrap gap-3">
             <Button
               type="button"
