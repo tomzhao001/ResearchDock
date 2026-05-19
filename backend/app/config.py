@@ -105,6 +105,8 @@ class Settings(BaseSettings):
     docling_ocr_engine: str = "easyocr"
     docling_ocr_languages: str = "ch_sim,en"
     docling_force_full_page_ocr: bool = False
+    docling_generate_picture_images: bool = True
+    docling_images_scale: float = 2.0
     docling_document_timeout_seconds: int = 240
     docling_device: str = "auto"
     model_cache_path: Path = _REPO_ROOT / "data" / "models"

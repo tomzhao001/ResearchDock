@@ -1,4 +1,5 @@
 from pathlib import Path
+from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import select
@@ -68,6 +69,25 @@ class SecondFakeDoclingExtractor(FakeDoclingExtractor):
 class FailingDoclingExtractor:
     def extract(self, pdf_path: Path) -> ExtractedDocument:
         raise RuntimeError("Docling conversion failed")
+
+
+class CancellingDoclingExtractor(FakeDoclingExtractor):
+    def __init__(self, *, session_factory: sessionmaker, job_id: int):
+        super().__init__()
+        self.session_factory = session_factory
+        self.job_id = job_id
+
+    def extract(self, pdf_path: Path) -> ExtractedDocument:
+        db = self.session_factory()
+        try:
+            job = db.get(Job, self.job_id)
+            assert job is not None
+            job.status = "cancel_requested"
+            job.cancel_requested_at = datetime.now(timezone.utc)
+            db.commit()
+        finally:
+            db.close()
+        return super().extract(pdf_path)
 
 
 class FakePictureAdapter:
@@ -203,3 +223,36 @@ def test_worker_marks_job_failed_when_docling_errors(
     assert job is not None
     assert job.status == "failed"
     assert job.error_message == "Docling conversion failed"
+
+
+def test_worker_marks_job_cancelled_when_cancel_requested(
+    db_session: Session,
+    session_factory: sessionmaker,
+    organization,
+) -> None:
+    artifacts = create_upload_artifacts(
+        db_session,
+        organization_id=organization.id,
+        filename="cancelled.pdf",
+        content_type="application/pdf",
+        payload=make_pdf_payload(),
+    )
+
+    result = run_pdf_ingest_job(
+        artifacts.job_id,
+        session_factory=session_factory,
+        extractor=CancellingDoclingExtractor(session_factory=session_factory, job_id=artifacts.job_id),
+        picture_adapter=FakePictureAdapter(),
+    )
+
+    job = db_session.get(Job, artifacts.job_id)
+    asset = db_session.scalar(select(PaperAsset).where(PaperAsset.paper_id == artifacts.paper_id))
+    chunks = db_session.scalars(select(PaperChunk).where(PaperChunk.paper_id == artifacts.paper_id)).all()
+
+    assert result is None
+    assert job is not None
+    assert job.status == "cancelled"
+    assert job.finished_at is not None
+    assert asset is not None
+    assert asset.raw_text is None
+    assert chunks == []

@@ -44,11 +44,14 @@ describe("UploadPanel", () => {
         id: 9,
         job_type: "pdf_ingest",
         paper_id: 1,
+        celery_task_id: null,
         status: "processing",
         error_message: null,
         retry_count: 0,
+        cancel_requested_at: null,
         started_at: "2026-05-06T05:00:00Z",
         finished_at: null,
+        deleted_at: null,
         created_at: "2026-05-06T05:00:00Z",
       });
     vi.mocked(subscribeTaskStatusEvents).mockImplementation(({ onEvent }) => {
@@ -73,16 +76,19 @@ describe("UploadPanel", () => {
         id: 9,
         job_type: "pdf_ingest",
         paper_id: 1,
-        status: "completed",
+        celery_task_id: null,
+        status: "cancel_requested",
         error_message: null,
         retry_count: 0,
+        cancel_requested_at: "2026-05-06T05:00:10Z",
         started_at: "2026-05-06T05:00:00Z",
-        finished_at: "2026-05-06T05:01:00Z",
+        finished_at: null,
+        deleted_at: null,
         created_at: "2026-05-06T05:00:00Z",
       },
     });
 
-    await waitFor(() => expect(screen.getByText(/最近创建的任务 #9 状态为 已完成/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/最近创建的任务 #9 状态为 取消中/)).toBeInTheDocument());
   });
 
   it("批量上传时会按选择顺序依次调用接口", async () => {
@@ -105,22 +111,28 @@ describe("UploadPanel", () => {
         id: 9,
         job_type: "pdf_ingest",
         paper_id: 1,
+        celery_task_id: null,
         status: "queued",
         error_message: null,
         retry_count: 0,
+        cancel_requested_at: null,
         started_at: null,
         finished_at: null,
+        deleted_at: null,
         created_at: "2026-05-06T05:00:00Z",
       })
       .mockResolvedValueOnce({
         id: 10,
         job_type: "pdf_ingest",
         paper_id: 2,
+        celery_task_id: null,
         status: "queued",
         error_message: null,
         retry_count: 0,
+        cancel_requested_at: null,
         started_at: null,
         finished_at: null,
+        deleted_at: null,
         created_at: "2026-05-06T05:01:00Z",
       });
 

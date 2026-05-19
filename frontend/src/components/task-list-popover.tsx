@@ -1,36 +1,25 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { CheckCircle2, Clock3, LoaderCircle, Trash2, TriangleAlert } from "lucide-react";
+import { CheckCircle2, Clock3, LoaderCircle, Square, Trash2, TriangleAlert } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import {
+  getJobStatusClassName,
+  getJobStatusLabel,
+  isActiveJobStatus,
+  isDeletableJobStatus,
+  isHiddenTaskListJobStatus,
+  isStoppableJobStatus,
+} from "@/lib/job-status";
 import { useHasPermission } from "@/lib/session";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
-import { deleteJob, fetchJobs, subscribeTaskStatusEvents, type JobPublic } from "@/lib/papers";
-
-const ACTIVE_STATUSES = new Set(["queued", "processing"]);
-const NON_DELETABLE_STATUSES = new Set(["processing"]);
-
-function statusLabel(status: string | null): string {
-  if (status === "queued") return "排队中";
-  if (status === "processing") return "处理中";
-  if (status === "completed") return "已完成";
-  if (status === "failed") return "失败";
-  return "未知";
-}
+import { cancelJob, deleteJob, fetchJobs, subscribeTaskStatusEvents, type JobPublic } from "@/lib/papers";
 
 function formatTime(value: string | null): string {
   if (!value) return "-";
   return new Date(value).toLocaleString("zh-CN");
-}
-
-function getStatusClassName(status: string | null): string {
-  if (status === "completed") return "bg-emerald-500/10 text-emerald-700 ring-emerald-500/20";
-  if (status === "failed") return "bg-rose-500/10 text-rose-700 ring-rose-500/20";
-  if (status === "processing") return "bg-amber-500/10 text-amber-700 ring-amber-500/20";
-  if (status === "queued") return "bg-sky-500/10 text-sky-700 ring-sky-500/20";
-  return "bg-muted text-muted-foreground ring-border";
 }
 
 type TaskListPopoverProps = {
@@ -49,6 +38,7 @@ export function TaskListPopover({ onOpenPaper }: TaskListPopoverProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [deletingJobId, setDeletingJobId] = useState<number | null>(null);
+  const [cancellingJobId, setCancellingJobId] = useState<number | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
 
   async function loadJobs() {
@@ -98,12 +88,13 @@ export function TaskListPopover({ onOpenPaper }: TaskListPopoverProps) {
     }
   }, [open]);
 
-  const activeJobs = useMemo(() => jobs.filter((job) => ACTIVE_STATUSES.has(job.status ?? "")), [jobs]);
+  const activeJobs = useMemo(() => jobs.filter((job) => isActiveJobStatus(job.status)), [jobs]);
   const failedJobs = useMemo(() => jobs.filter((job) => job.status === "failed"), [jobs]);
+  const displayJobs = useMemo(() => jobs.filter((job) => !isHiddenTaskListJobStatus(job.status)), [jobs]);
 
   async function handleDeleteJob(job: JobPublic) {
-    if (NON_DELETABLE_STATUSES.has(job.status ?? "")) {
-      setError("处理中的任务暂不支持删除");
+    if (!isDeletableJobStatus(job.status)) {
+      setError("仅已结束的任务支持删除");
       return;
     }
 
@@ -117,6 +108,24 @@ export function TaskListPopover({ onOpenPaper }: TaskListPopoverProps) {
       setError(message);
     } finally {
       setDeletingJobId(null);
+    }
+  }
+
+  async function handleCancelJob(job: JobPublic) {
+    if (!isStoppableJobStatus(job.status)) {
+      return;
+    }
+
+    setCancellingJobId(job.id);
+    setError(null);
+    try {
+      const updatedJob = await cancelJob(job.id);
+      setJobs((current) => mergeJobs(current, updatedJob));
+    } catch (cancelError) {
+      const message = cancelError instanceof Error ? cancelError.message : "停止任务失败";
+      setError(message);
+    } finally {
+      setCancellingJobId(null);
     }
   }
 
@@ -153,12 +162,14 @@ export function TaskListPopover({ onOpenPaper }: TaskListPopoverProps) {
               </div>
             ) : null}
             {error ? <p className="text-sm text-destructive">{error}</p> : null}
-            {!loading && jobs.length === 0 ? (
+            {!loading && displayJobs.length === 0 ? (
               <p className="text-sm text-slate-500">还没有任务记录。</p>
             ) : null}
-            {jobs.map((job) => {
-              const isActive = ACTIVE_STATUSES.has(job.status ?? "");
-              const isNonDeletable = NON_DELETABLE_STATUSES.has(job.status ?? "");
+            {displayJobs.map((job) => {
+              const isActive = isActiveJobStatus(job.status);
+              const isDeletable = isDeletableJobStatus(job.status);
+              const isStoppable = isStoppableJobStatus(job.status);
+              const isCancelling = cancellingJobId === job.id || job.status === "cancel_requested";
               const isDeleting = deletingJobId === job.id;
 
               return (
@@ -180,21 +191,40 @@ export function TaskListPopover({ onOpenPaper }: TaskListPopoverProps) {
                       </div>
                     </button>
                     <div className="flex items-center gap-2">
-                      <span className={cn("rounded-full px-2.5 py-1 text-xs font-medium ring-1", getStatusClassName(job.status))}>
-                        {statusLabel(job.status)}
+                      <span className={cn("rounded-full px-2.5 py-1 text-xs font-medium ring-1", getJobStatusClassName(job.status))}>
+                        {getJobStatusLabel(job.status)}
                       </span>
                       {canManageJobs ? (
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon-sm"
-                          aria-label={`删除任务 ${job.id}`}
-                          onClick={() => void handleDeleteJob(job)}
-                          disabled={isNonDeletable || isDeleting}
-                          title={isNonDeletable ? "处理中的任务暂不支持删除" : "删除任务"}
-                        >
-                          {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
-                        </Button>
+                        <>
+                          {(isStoppable || job.status === "cancel_requested") && (
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              className="gap-1.5"
+                              aria-label={`停止任务 ${job.id}`}
+                              onClick={() => void handleCancelJob(job)}
+                              disabled={!isStoppable || isCancelling}
+                              title={job.status === "cancel_requested" ? "任务正在取消中" : "停止任务"}
+                            >
+                              {isCancelling ? <LoaderCircle className="size-4 animate-spin" /> : <Square className="size-4" />}
+                              停止
+                            </Button>
+                          )}
+                          {isDeletable ? (
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon-sm"
+                              aria-label={`删除任务 ${job.id}`}
+                              onClick={() => void handleDeleteJob(job)}
+                              disabled={isDeleting}
+                              title="删除任务"
+                            >
+                              {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+                            </Button>
+                          ) : null}
+                        </>
                       ) : null}
                     </div>
                   </div>
@@ -205,7 +235,7 @@ export function TaskListPopover({ onOpenPaper }: TaskListPopoverProps) {
                     <p>开始：{formatTime(job.started_at)}</p>
                     <p>结束：{formatTime(job.finished_at)}</p>
                     {job.error_message ? <p className="text-rose-600">错误：{job.error_message}</p> : null}
-                    {isActive ? <p>{isNonDeletable ? "处理中任务不可删除。" : "排队中的任务支持直接删除。"}</p> : null}
+                    {isActive ? <p>{job.status === "cancel_requested" ? "任务正在等待工作线程优雅取消。" : "任务运行中，可点击停止请求取消。"}</p> : null}
                   </div>
                 </div>
               );
@@ -220,6 +250,8 @@ export function TaskListPopover({ onOpenPaper }: TaskListPopoverProps) {
 function StatusIcon({ status }: { status: string | null }) {
   if (status === "completed") return <CheckCircle2 className="size-4 text-emerald-600" />;
   if (status === "failed") return <TriangleAlert className="size-4 text-rose-600" />;
+  if (status === "cancel_requested") return <LoaderCircle className="size-4 animate-spin text-amber-600" />;
+  if (status === "cancelled") return <Clock3 className="size-4 text-slate-500" />;
   if (status === "processing") return <LoaderCircle className="size-4 animate-spin text-amber-600" />;
   return <Clock3 className="size-4 text-sky-600" />;
 }

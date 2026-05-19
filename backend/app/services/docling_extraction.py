@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import time
 from pathlib import Path
 from typing import Any
@@ -90,6 +91,26 @@ def _extract_caption(item: Any, doc: Any) -> str | None:
     return str(caption).strip() if caption else None
 
 
+def _picture_image_bytes(item: Any, doc: Any) -> bytes | None:
+    get_image = getattr(item, "get_image", None)
+    if not callable(get_image):
+        return None
+    try:
+        image = get_image(doc=doc)
+    except TypeError:
+        image = get_image(doc)
+    except Exception:
+        return None
+    if image is None:
+        return None
+    buffer = io.BytesIO()
+    try:
+        image.save(buffer, format="PNG")
+        return buffer.getvalue()
+    except Exception:
+        return None
+
+
 class DoclingDocumentExtractor:
     def extract(self, pdf_path: Path) -> ExtractedDocument:
         started = time.monotonic()
@@ -106,6 +127,8 @@ class DoclingDocumentExtractor:
             pipeline_options.artifacts_path = str(cache_paths.docling)
         pipeline_options.do_ocr = settings.docling_do_ocr
         pipeline_options.do_table_structure = settings.docling_do_table_structure
+        pipeline_options.generate_picture_images = settings.docling_generate_picture_images
+        pipeline_options.images_scale = float(settings.docling_images_scale)
         if settings.docling_document_timeout_seconds > 0:
             pipeline_options.document_timeout = float(settings.docling_document_timeout_seconds)
 
@@ -149,6 +172,8 @@ class DoclingDocumentExtractor:
             "docling_ocr_engine": settings.docling_ocr_engine,
             "docling_ocr_languages": languages,
             "docling_force_full_page_ocr": settings.docling_force_full_page_ocr,
+            "docling_generate_picture_images": settings.docling_generate_picture_images,
+            "docling_images_scale": settings.docling_images_scale,
             "elapsed_ms": elapsed_ms,
             "model_cache": model_cache_metadata(),
         }
@@ -259,6 +284,7 @@ class DoclingDocumentExtractor:
                     caption=_extract_caption(picture, doc),
                     page_number=_page_number(picture),
                     bbox=_bbox(picture),
+                    image_bytes=_picture_image_bytes(picture, doc),
                     metadata={"docling_label": _label_name(picture), "provenance": _provenance(picture)},
                 )
             )

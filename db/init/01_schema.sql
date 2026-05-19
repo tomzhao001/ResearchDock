@@ -214,11 +214,14 @@ CREATE TABLE jobs (
     job_type VARCHAR(64),
     source_id BIGINT REFERENCES sources (id) ON DELETE SET NULL,
     paper_id BIGINT REFERENCES papers (id) ON DELETE SET NULL,
+    celery_task_id VARCHAR(255),
     status VARCHAR(32),
     error_message TEXT,
     retry_count INTEGER NOT NULL DEFAULT 0,
+    cancel_requested_at TIMESTAMPTZ,
     started_at TIMESTAMPTZ,
     finished_at TIMESTAMPTZ,
+    deleted_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -242,5 +245,5 @@ CREATE TABLE IF NOT EXISTS alembic_version (
 );
 
 INSERT INTO alembic_version (version_num)
-VALUES ('20260519_02')
+VALUES ('20260519_03')
 ON CONFLICT (version_num) DO NOTHING;

@@ -8,7 +8,7 @@ from app.database import get_db
 from app.deps import AuthContext, require_permission
 from app.models import Job, Paper
 from app.schemas import JobListResponse, JobPublic, MessageResponse
-from app.services.papers import delete_job
+from app.services.papers import cancel_job, delete_job
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
@@ -21,7 +21,7 @@ def list_jobs(
     items = db.scalars(
         select(Job)
         .join(Paper, Paper.id == Job.paper_id)
-        .where(Paper.organization_id == context.organization.id, Paper.deleted_at.is_(None))
+        .where(Job.deleted_at.is_(None), Paper.organization_id == context.organization.id, Paper.deleted_at.is_(None))
         .order_by(Job.id.desc())
         .limit(20)
     ).all()
@@ -37,8 +37,24 @@ def get_job(
     job = db.scalar(
         select(Job)
         .join(Paper, Paper.id == Job.paper_id)
-        .where(Job.id == job_id, Paper.organization_id == context.organization.id, Paper.deleted_at.is_(None))
+        .where(Job.id == job_id, Job.deleted_at.is_(None), Paper.organization_id == context.organization.id, Paper.deleted_at.is_(None))
     )
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    return JobPublic.model_validate(job)
+
+
+@router.post("/{job_id}/cancel", response_model=JobPublic)
+def cancel_job_item(
+    job_id: int,
+    db: Annotated[Session, Depends(get_db)],
+    context: Annotated[AuthContext, Depends(require_permission("jobs:manage"))],
+):
+    try:
+        job = cancel_job(db, job_id, organization_id=context.organization.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
     return JobPublic.model_validate(job)

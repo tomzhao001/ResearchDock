@@ -222,11 +222,14 @@ describe("PaperWorkbench", () => {
         id: 3,
         job_type: "paper_question_set",
         paper_id: 1,
+        celery_task_id: null,
         status: "completed",
         error_message: null,
         retry_count: 0,
+        cancel_requested_at: null,
         started_at: null,
         finished_at: null,
+        deleted_at: null,
         created_at: "2026-05-16T00:00:00Z",
       },
     });
@@ -244,5 +247,43 @@ describe("PaperWorkbench", () => {
     await userEvent.setup().click(screen.getByRole("button", { name: "问题集结果" }));
     expect(screen.getByText("这篇论文研究了什么？")).toBeInTheDocument();
     expect(screen.getByText("回答内容")).toBeInTheDocument();
+  });
+
+  it("cancel_requested 阶段仍视为进行中并禁用删除和重跑按钮", async () => {
+    const papers = [makePaperListItem({ id: 1, title: "Alpha", publishedAt: "2024-05-01T00:00:00Z" })];
+
+    fetchPapers.mockResolvedValue(papers);
+    fetchPaper.mockResolvedValue({
+      ...makePaperDetail(1, "Alpha"),
+      ocr_status: "cancel_requested",
+      latest_ocr_job: {
+        id: 9,
+        job_type: "pdf_ingest",
+        paper_id: 1,
+        celery_task_id: "task-9",
+        status: "cancel_requested",
+        error_message: null,
+        retry_count: 0,
+        cancel_requested_at: "2026-05-16T00:00:00Z",
+        started_at: "2026-05-16T00:00:00Z",
+        finished_at: null,
+        deleted_at: null,
+        created_at: "2026-05-16T00:00:00Z",
+      },
+    });
+
+    function Harness() {
+      const [selectedPaperId, setSelectedPaperId] = useState<number | null>(1);
+      return <PaperWorkbench selectedPaperId={selectedPaperId} onSelectedPaperChange={setSelectedPaperId} />;
+    }
+
+    render(<Harness />);
+
+    await waitFor(() => expect(fetchPaper).toHaveBeenCalledWith(1));
+    expect(screen.getByText("取消中")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "删除文档" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "重新解析文档" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "重新生成摘要" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "重新提取问题集" })).toBeDisabled();
   });
 });

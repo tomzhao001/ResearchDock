@@ -130,6 +130,7 @@ celery -A app.celery_app.celery_app worker --loglevel=info
 - 本机运行 worker 时，请确认 `redis-server` 已启动。
 - 默认 `DOCLING_OCR_ENGINE=easyocr` 时，`requirements.txt` 使用 `docling[easyocr]` 安装 EasyOCR；若此前只装过 `docling==2.94.0`，需补装：`pip install "docling[easyocr]==2.94.0"` 或 `pip install easyocr`。
 - 若 PDF 自带 text layer 质量很差、会把中文论文解析成整篇乱码，可设置 `DOCLING_FORCE_FULL_PAGE_OCR=true`，强制用整页 OCR 覆盖嵌入文字层。
+- 若需把图片裁剪结果继续送入 GLM-4.6V 做图表描述，请设置 `DOCLING_GENERATE_PICTURE_IMAGES=true`；`DOCLING_IMAGES_SCALE` 控制导出图片分辨率，默认 `2.0`。
 - **模型缓存卷**：Compose 下 `celery-worker` 挂载命名卷 `model_cache` → 容器内 `/data/models`。通过 `.env` 配置 `MODEL_CACHE_PATH`、`DOCLING_ARTIFACTS_PATH`、`EASYOCR_MODULE_PATH`、`HF_HOME`（后三项可留空，自动落在根目录子路径）。首次解析仍会下载模型，但会写入该卷，**重建容器后无需重复下载**。
 - 本机开发可在 `.env` 设置 `MODEL_CACHE_PATH=./data/models`，目录已加入 `.gitignore`。
 - 若不想装 EasyOCR，可将 `DOCLING_OCR_ENGINE` 改为 `rapidocr`（需 `pip install rapidocr onnxruntime`）或 `tesseract`（需系统安装 Tesseract）。
@@ -399,6 +400,7 @@ docker compose logs -f frontend
 - `DOCLING_DO_OCR` / `DOCLING_DO_TABLE_STRUCTURE`：控制 Docling OCR 与表格结构识别步骤。
 - `DOCLING_OCR_ENGINE` / `DOCLING_OCR_LANGUAGES`：控制 Docling 标准管线中的 OCR 引擎与语言；默认 `easyocr` 依赖 `docling[easyocr]`（见 `requirements.txt`），非 `docling` 主包自带。
 - `DOCLING_FORCE_FULL_PAGE_OCR`：是否强制整页 OCR 并覆盖 PDF 原有文字层；对“内嵌 text layer 有毒、默认解析成乱码”的中文 PDF 更有帮助，但会更依赖 OCR 质量。
+- `DOCLING_GENERATE_PICTURE_IMAGES` / `DOCLING_IMAGES_SCALE`：控制 Docling 是否导出图片裁剪结果，以及导出图片分辨率；启用后会把图片 bytes 继续传入当前 GLM 图片描述接口。
 - `MODEL_CACHE_PATH` / `DOCLING_ARTIFACTS_PATH` / `EASYOCR_MODULE_PATH` / `HF_HOME`：Docling、EasyOCR、Hugging Face 模型缓存目录；生产建议挂载持久卷（见 `docker-compose.yml` 中 `model_cache`）。
 - `PICTURE_VLM_*`：图片/图表描述模型配置，默认使用 GLM-4.6V；API key 不会写入任务元数据。
 - 生产环境若走 HTTPS，请将 `COOKIE_SECURE` 设为 `true`。

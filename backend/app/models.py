@@ -248,11 +248,14 @@ class Job(Base):
     job_type: Mapped[str | None] = mapped_column(String(64))
     source_id: Mapped[int | None] = mapped_column(bigint_sqlite, ForeignKey("sources.id", ondelete="SET NULL"))
     paper_id: Mapped[int | None] = mapped_column(bigint_sqlite, ForeignKey("papers.id", ondelete="SET NULL"))
+    celery_task_id: Mapped[str | None] = mapped_column(String(255))
     status: Mapped[str | None] = mapped_column(String(32))
     error_message: Mapped[str | None] = mapped_column(Text)
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

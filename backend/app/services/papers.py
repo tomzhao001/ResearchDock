@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from app.celery_app import celery_app
 from app.config import settings
 from app.database import SessionLocal
 from app.models import Job, Paper, PaperAsset, PaperChunk, PaperDocumentBlock, PaperDocumentPage, PaperDocumentPicture, PaperDocumentTable
@@ -47,8 +48,12 @@ class DuplicateFilenameError(RuntimeError):
         self.existing_paper_id = existing_paper_id
 
 
-ACTIVE_JOB_STATUSES = {"queued", "processing"}
-NON_DELETABLE_JOB_STATUSES = {"processing"}
+class JobCancellationRequested(RuntimeError):
+    """Signal cooperative task cancellation without marking the job as failed."""
+
+
+ACTIVE_JOB_STATUSES = {"queued", "processing", "cancel_requested"}
+DELETABLE_JOB_STATUSES = {"completed", "failed", "cancelled"}
 DOI_PATTERN = re.compile(r"^10\.\S+/\S+$", re.IGNORECASE)
 
 
@@ -103,6 +108,7 @@ def _get_latest_job_for_paper(db: Session, paper_id: int, job_type: str) -> Job 
         .where(
             Job.paper_id == paper_id,
             Job.job_type == job_type,
+            Job.deleted_at.is_(None),
         )
         .order_by(Job.id.desc())
         .limit(1)
@@ -114,11 +120,98 @@ def _get_active_job_for_paper(db: Session, paper_id: int) -> Job | None:
         select(Job)
         .where(
             Job.paper_id == paper_id,
+            Job.deleted_at.is_(None),
             Job.status.in_(ACTIVE_JOB_STATUSES),
         )
         .order_by(Job.id.desc())
         .limit(1)
     )
+
+
+def _get_latest_visible_job(db: Session, paper_id: int) -> Job | None:
+    return db.scalar(
+        select(Job)
+        .where(Job.paper_id == paper_id, Job.deleted_at.is_(None))
+        .order_by(Job.id.desc())
+        .limit(1)
+    )
+
+
+def _get_scoped_job(db: Session, job_id: int, *, organization_id: int | None = None) -> Job | None:
+    if organization_id is None:
+        job = db.get(Job, job_id)
+        if job is None or job.deleted_at is not None:
+            return None
+        return job
+    return db.scalar(
+        select(Job)
+        .join(Paper, Paper.id == Job.paper_id)
+        .where(
+            Job.id == job_id,
+            Job.deleted_at.is_(None),
+            Paper.organization_id == organization_id,
+            Paper.deleted_at.is_(None),
+        )
+    )
+
+
+def _set_paper_status_from_latest_job(db: Session, paper: Paper) -> None:
+    latest_job = _get_latest_visible_job(db, paper.id)
+    if latest_job is None:
+        return
+    if latest_job.status in ACTIVE_JOB_STATUSES:
+        paper.status = latest_job.status
+    elif latest_job.status == "failed":
+        paper.status = "failed"
+    elif latest_job.status == "cancelled":
+        paper.status = "cancelled"
+    elif latest_job.status == "completed":
+        paper.status = "completed"
+
+
+def set_job_celery_task_id(
+    job_id: int,
+    celery_task_id: str | None,
+    *,
+    db: Session | None = None,
+    session_factory: Callable[[], Session] = SessionLocal,
+) -> None:
+    if not celery_task_id:
+        return
+    owns_session = db is None
+    if db is None:
+        db = session_factory()
+    try:
+        job = db.get(Job, job_id)
+        if job is None or job.deleted_at is not None:
+            return
+        job.celery_task_id = celery_task_id
+        db.commit()
+    finally:
+        if owns_session:
+            db.close()
+
+
+def _mark_job_cancelled(db: Session, job: Job, paper: Paper | None) -> None:
+    now = datetime.now(timezone.utc)
+    job.status = "cancelled"
+    job.error_message = None
+    job.finished_at = job.finished_at or now
+    if paper is not None:
+        paper.updated_at = now
+        _set_paper_status_from_latest_job(db, paper)
+    db.commit()
+    if paper is not None:
+        publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
+
+
+def _raise_if_cancel_requested(db: Session, job: Job, paper: Paper | None) -> None:
+    db.refresh(job)
+    if job.deleted_at is not None or job.status == "cancelled":
+        raise JobCancellationRequested()
+    if job.status == "cancel_requested":
+        _mark_job_cancelled(db, job, paper)
+        raise JobCancellationRequested()
 
 
 def _queue_summary_job_if_needed(db: Session, paper: Paper, asset: PaperAsset) -> int | None:
@@ -310,9 +403,7 @@ def get_paper_detail(db: Session, paper_id: int, *, organization_id: int | None 
     latest_ocr_job = _get_latest_job_for_paper(db, paper_id, "pdf_ingest")
     latest_summary_job = _get_latest_job_for_paper(db, paper_id, "paper_summary")
     latest_question_set_job = _get_latest_job_for_paper(db, paper_id, "paper_question_set")
-    latest_job = db.scalar(
-        select(Job).where(Job.paper_id == paper_id).order_by(Job.id.desc()).limit(1)
-    )
+    latest_job = _get_latest_visible_job(db, paper_id)
     return PaperDetailData(
         paper=paper,
         asset=asset,
@@ -372,22 +463,57 @@ def update_paper_title(db: Session, paper_id: int, title: str, *, organization_i
 
 
 def delete_job(db: Session, job_id: int, *, organization_id: int | None = None) -> bool:
-    if organization_id is None:
-        job = db.get(Job, job_id)
-    else:
-        job = db.scalar(
-            select(Job)
-            .join(Paper, Paper.id == Job.paper_id)
-            .where(Job.id == job_id, Paper.organization_id == organization_id, Paper.deleted_at.is_(None))
-        )
+    job = _get_scoped_job(db, job_id, organization_id=organization_id)
     if job is None:
         return False
-    if job.status in NON_DELETABLE_JOB_STATUSES:
-        raise ValueError("Processing jobs cannot be deleted")
+    if job.status not in DELETABLE_JOB_STATUSES:
+        raise ValueError("Only completed, failed, or cancelled jobs can be deleted")
 
-    db.delete(job)
+    now = datetime.now(timezone.utc)
+    job.deleted_at = now
+    paper = db.get(Paper, job.paper_id) if job.paper_id is not None else None
+    if paper is not None and paper.deleted_at is None:
+        paper.updated_at = now
+        _set_paper_status_from_latest_job(db, paper)
     db.commit()
     return True
+
+
+def cancel_job(db: Session, job_id: int, *, organization_id: int) -> Job | None:
+    job = _get_scoped_job(db, job_id, organization_id=organization_id)
+    if job is None:
+        return None
+    if job.status == "cancel_requested":
+        return job
+    if job.status not in {"queued", "processing"}:
+        raise ValueError("Only queued or processing jobs can be cancelled")
+
+    paper = db.get(Paper, job.paper_id) if job.paper_id is not None else None
+    now = datetime.now(timezone.utc)
+    job.cancel_requested_at = job.cancel_requested_at or now
+    job.error_message = None
+    if job.status == "queued":
+        job.status = "cancelled"
+        job.finished_at = now
+        if paper is not None:
+            paper.updated_at = now
+            _set_paper_status_from_latest_job(db, paper)
+        db.commit()
+        if paper is not None:
+            publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
+    else:
+        job.status = "cancel_requested"
+        if paper is not None and paper.deleted_at is None:
+            paper.status = "cancel_requested"
+            paper.updated_at = now
+        db.commit()
+        if paper is not None:
+            publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
+
+    if job.celery_task_id:
+        celery_app.control.revoke(job.celery_task_id)
+    db.refresh(job)
+    return job
 
 
 def delete_paper(db: Session, paper_id: int, *, organization_id: int) -> bool:
@@ -402,7 +528,8 @@ def delete_paper(db: Session, paper_id: int, *, organization_id: int) -> bool:
     paper.deleted_at = now
     paper.updated_at = now
     paper.status = "deleted"
-    db.execute(delete(Job).where(Job.paper_id == paper_id))
+    for job in db.scalars(select(Job).where(Job.paper_id == paper_id, Job.deleted_at.is_(None))).all():
+        job.deleted_at = now
     db.execute(delete(PaperChunk).where(PaperChunk.paper_id == paper_id))
     db.commit()
     return True
@@ -600,7 +727,7 @@ def run_pdf_ingest_job(
     db = session_factory()
     try:
         job = db.get(Job, job_id)
-        if not job:
+        if not job or job.deleted_at is not None or job.status == "cancelled":
             return None
 
         paper = db.get(Paper, job.paper_id) if job.paper_id is not None else None
@@ -610,8 +737,9 @@ def run_pdf_ingest_job(
                 PaperAsset.asset_type == "original_pdf",
             )
         )
-        if paper is None or asset is None or not asset.storage_path:
+        if paper is None or paper.deleted_at is not None or asset is None or not asset.storage_path:
             raise RuntimeError("Missing upload asset for job")
+        _raise_if_cancel_requested(db, job, paper)
 
         now = datetime.now(timezone.utc)
         job.status = "processing"
@@ -621,8 +749,11 @@ def run_pdf_ingest_job(
         db.commit()
         publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
 
+        _raise_if_cancel_requested(db, job, paper)
         document = (extractor or build_document_extractor()).extract(Path(asset.storage_path))
+        _raise_if_cancel_requested(db, job, paper)
         _describe_pictures(document, picture_adapter or build_picture_description_adapter())
+        _raise_if_cancel_requested(db, job, paper)
         _clear_document_structure(db, paper.id)
         db.execute(delete(PaperChunk).where(PaperChunk.paper_id == paper.id))
         _persist_document_structure(db, paper_id=paper.id, asset_id=asset.id, document=document)
@@ -644,6 +775,7 @@ def run_pdf_ingest_job(
             raw_text=document.markdown_text,
             paper_title=paper.title,
         )
+        _raise_if_cancel_requested(db, job, paper)
         paper.status = "completed"
         paper.updated_at = datetime.now(timezone.utc)
         job.status = "completed"
@@ -652,6 +784,8 @@ def run_pdf_ingest_job(
         db.commit()
         publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
         return _queue_summary_job_if_needed(db, paper, asset)
+    except JobCancellationRequested:
+        return None
     except Exception as exc:
         if "job" in locals() and job is not None:
             job.status = "failed"
@@ -676,7 +810,7 @@ def run_paper_summary_job(
     db = session_factory()
     try:
         job = db.get(Job, job_id)
-        if not job:
+        if not job or job.deleted_at is not None or job.status == "cancelled":
             return None
 
         paper = db.get(Paper, job.paper_id) if job.paper_id is not None else None
@@ -687,6 +821,7 @@ def run_paper_summary_job(
             raise RuntimeError("LLM is not configured for summarization")
         if not (asset.raw_text or "").strip():
             raise RuntimeError("No parsed text available")
+        _raise_if_cancel_requested(db, job, paper)
 
         now = datetime.now(timezone.utc)
         job.status = "processing"
@@ -696,7 +831,9 @@ def run_paper_summary_job(
         db.commit()
         publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
 
+        _raise_if_cancel_requested(db, job, paper)
         summary = summarize_paper_text(asset.raw_text)
+        _raise_if_cancel_requested(db, job, paper)
         summary["authors"] = _normalize_summary_text(summary.get("authors"))
         summary["doi"] = _normalize_summary_doi(summary.get("doi"))
         summary["source_url"] = _normalize_summary_url(summary.get("source_url"))
@@ -722,6 +859,8 @@ def run_paper_summary_job(
         db.commit()
         publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
         return _queue_question_set_job_if_needed(db, paper, asset)
+    except JobCancellationRequested:
+        return None
     except Exception as exc:
         if "job" in locals() and job is not None:
             job.status = "failed"
@@ -746,7 +885,7 @@ def run_paper_question_set_job(
     db = session_factory()
     try:
         job = db.get(Job, job_id)
-        if not job:
+        if not job or job.deleted_at is not None or job.status == "cancelled":
             return
 
         paper = db.get(Paper, job.paper_id) if job.paper_id is not None else None
@@ -765,6 +904,7 @@ def run_paper_question_set_job(
         questions = get_organization_question_items(db, organization_id=paper.organization_id)
         if not questions:
             raise RuntimeError("No organization question set configured")
+        _raise_if_cancel_requested(db, job, paper)
 
         now = datetime.now(timezone.utc)
         job.status = "processing"
@@ -774,11 +914,13 @@ def run_paper_question_set_job(
         db.commit()
         publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
 
+        _raise_if_cancel_requested(db, job, paper)
         result = answer_question_set_questions(
             asset.raw_text,
             structured_summary=structured_summary,
             questions=questions,
         )
+        _raise_if_cancel_requested(db, job, paper)
         metadata = dict(asset.metadata_json or {})
         metadata["question_set_extraction"] = result
         asset.metadata_json = metadata
@@ -789,6 +931,8 @@ def run_paper_question_set_job(
         job.finished_at = datetime.now(timezone.utc)
         db.commit()
         publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
+    except JobCancellationRequested:
+        return
     except Exception as exc:
         if "job" in locals() and job is not None:
             job.status = "failed"

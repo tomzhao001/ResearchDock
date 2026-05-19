@@ -55,11 +55,14 @@ class JobPublic(BaseModel):
     id: int
     job_type: str | None
     paper_id: int | None
+    celery_task_id: str | None = None
     status: str | None
     error_message: str | None
     retry_count: int
+    cancel_requested_at: datetime | None = None
     started_at: datetime | None
     finished_at: datetime | None
+    deleted_at: datetime | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}

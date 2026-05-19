@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
 import { TabPanel, Tabs } from "@/components/ui/tabs";
+import { getJobStatusClassName, getJobStatusLabel, isActiveJobStatus } from "@/lib/job-status";
 import { useHasPermission } from "@/lib/session";
 import { Tooltip } from "./ui/tooltip";
 import { cn } from "@/lib/utils";
@@ -26,18 +27,13 @@ import {
   type UploadAcceptedResponse,
 } from "@/lib/papers";
 
-const ACTIVE_STATUSES = new Set(["queued", "processing"]);
 type PaperSortMode = "alphabet" | "publishedAt";
 type PaperSortDirection = "asc" | "desc";
 type PreviewTab = "metadata" | "parsedText" | "summary" | "questionSet";
 
 function statusLabel(status: string | null): string {
-  if (status === "queued") return "排队中";
-  if (status === "processing") return "处理中";
-  if (status === "completed") return "已完成";
-  if (status === "failed") return "失败";
   if (status === "uploaded") return "已上传";
-  return "未知";
+  return getJobStatusLabel(status);
 }
 
 function phaseStatusLabel(status: string | null): string {
@@ -81,11 +77,7 @@ function getMetadataSourceLabel({
 }
 
 function getStatusClassName(status: string | null): string {
-  if (status === "completed") return "bg-emerald-500/10 text-emerald-700 ring-emerald-500/20";
-  if (status === "failed") return "bg-rose-500/10 text-rose-700 ring-rose-500/20";
-  if (status === "processing") return "bg-amber-500/10 text-amber-700 ring-amber-500/20";
-  if (status === "queued") return "bg-sky-500/10 text-sky-700 ring-sky-500/20";
-  return "bg-muted text-muted-foreground ring-border";
+  return getJobStatusClassName(status);
 }
 
 function getPhaseStatusClassName(status: string | null): string {
@@ -332,9 +324,9 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
       return false;
     }
     return (
-      ACTIVE_STATUSES.has(paperDetail.ocr_status ?? "") ||
-      ACTIVE_STATUSES.has(paperDetail.summary_status ?? "") ||
-      ACTIVE_STATUSES.has(paperDetail.question_set_status ?? "")
+      isActiveJobStatus(paperDetail.ocr_status) ||
+      isActiveJobStatus(paperDetail.summary_status) ||
+      isActiveJobStatus(paperDetail.question_set_status)
     );
   }, [paperDetail]);
 

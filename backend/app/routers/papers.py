@@ -27,6 +27,7 @@ from app.services.papers import (
     get_original_filename,
     get_paper_detail,
     list_papers,
+    set_job_celery_task_id,
     update_paper_metadata,
 )
 from app.tasks.paper_ingest import process_paper_question_set, process_paper_summary, process_uploaded_pdf
@@ -176,7 +177,8 @@ def reparse_paper_document(
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Paper not found")
 
-    process_uploaded_pdf.delay(job.id)
+    task = process_uploaded_pdf.delay(job.id)
+    set_job_celery_task_id(job.id, getattr(task, "id", None), db=db)
     return JobAcceptedResponse(
         paper_id=paper_id,
         job_id=job.id,
@@ -199,7 +201,8 @@ def regenerate_paper_summary(
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Paper not found")
 
-    process_paper_summary.delay(job.id)
+    task = process_paper_summary.delay(job.id)
+    set_job_celery_task_id(job.id, getattr(task, "id", None), db=db)
     return JobAcceptedResponse(
         paper_id=paper_id,
         job_id=job.id,
@@ -222,7 +225,8 @@ def regenerate_paper_question_set(
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Paper not found")
 
-    process_paper_question_set.delay(job.id)
+    task = process_paper_question_set.delay(job.id)
+    set_job_celery_task_id(job.id, getattr(task, "id", None), db=db)
     return JobAcceptedResponse(
         paper_id=paper_id,
         job_id=job.id,
@@ -267,7 +271,8 @@ async def upload_paper(
             },
         ) from exc
 
-    process_uploaded_pdf.delay(artifacts.job_id)
+    task = process_uploaded_pdf.delay(artifacts.job_id)
+    set_job_celery_task_id(artifacts.job_id, getattr(task, "id", None), db=db)
     return UploadAcceptedResponse(
         paper_id=artifacts.paper_id,
         job_id=artifacts.job_id,

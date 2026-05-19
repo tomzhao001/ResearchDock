@@ -100,10 +100,12 @@ def build_task_status_event(db: Session, *, paper_id: int, job_id: int | None = 
         return None
 
     job = db.get(Job, job_id) if job_id is not None else detail.latest_job
+    if job is not None and job.deleted_at is not None:
+        job = None
     if job is None and detail.latest_job is not None:
         job = detail.latest_job
     if job is None:
-        job = db.scalar(select(Job).where(Job.paper_id == paper_id).order_by(Job.id.desc()).limit(1))
+        job = db.scalar(select(Job).where(Job.paper_id == paper_id, Job.deleted_at.is_(None)).order_by(Job.id.desc()).limit(1))
 
     detail_response = _build_paper_detail_response(detail)
     return TaskStatusEvent(

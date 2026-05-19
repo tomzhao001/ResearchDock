@@ -3,6 +3,7 @@ import httpx
 import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
+from types import SimpleNamespace
 
 from app.models import Job, OrganizationSettings, Paper, PaperAsset, PaperChunk
 from app.services import llm
@@ -155,6 +156,10 @@ def make_eager_question_set_delay(session_factory: sessionmaker, *, swallow_erro
         return None
 
     return eager_delay
+
+
+def make_task_result(task_id: str):
+    return SimpleNamespace(id=task_id)
 
 
 @pytest.fixture(autouse=True)
@@ -681,7 +686,13 @@ def test_delete_completed_job(
     delete_response = client.delete(f"/api/jobs/{job_id}")
     assert delete_response.status_code == 200
     assert delete_response.json() == {"message": "Job deleted"}
-    assert db_session.get(Job, job_id) is None
+    job = db_session.get(Job, job_id)
+    assert job is not None
+    assert job.deleted_at is not None
+
+    jobs_response = client.get("/api/jobs")
+    assert jobs_response.status_code == 200
+    assert jobs_response.json()["items"] == []
 
 
 def test_delete_active_job_is_rejected(client, user, db_session: Session) -> None:
@@ -696,10 +707,10 @@ def test_delete_active_job_is_rejected(client, user, db_session: Session) -> Non
 
     response = client.delete(f"/api/jobs/{job.id}")
     assert response.status_code == 409
-    assert response.json()["detail"] == "Processing jobs cannot be deleted"
+    assert response.json()["detail"] == "Only completed, failed, or cancelled jobs can be deleted"
 
 
-def test_delete_queued_job_is_allowed(client, user, db_session: Session) -> None:
+def test_delete_queued_job_is_rejected(client, user, db_session: Session) -> None:
     login(client)
 
     paper = Paper(organization_id=user.organization_id, title="queued paper", status="queued")
@@ -710,8 +721,8 @@ def test_delete_queued_job_is_allowed(client, user, db_session: Session) -> None
     db_session.commit()
 
     response = client.delete(f"/api/jobs/{job.id}")
-    assert response.status_code == 200
-    assert response.json() == {"message": "Job deleted"}
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Only completed, failed, or cancelled jobs can be deleted"
 
 
 def test_delete_paper_soft_deletes_and_removes_jobs(
@@ -748,7 +759,9 @@ def test_delete_paper_soft_deletes_and_removes_jobs(
     paper = db_session.get(Paper, paper_id)
     assert paper is not None
     assert paper.deleted_at is not None
-    assert db_session.scalars(select(Job).where(Job.paper_id == paper_id)).all() == []
+    jobs = db_session.scalars(select(Job).where(Job.paper_id == paper_id)).all()
+    assert jobs
+    assert all(job.deleted_at is not None for job in jobs)
 
     list_response = client.get("/api/papers")
     jobs_response = client.get("/api/jobs")
@@ -756,6 +769,85 @@ def test_delete_paper_soft_deletes_and_removes_jobs(
     assert jobs_response.status_code == 200
     assert list_response.json()["items"] == []
     assert jobs_response.json()["items"] == []
+
+
+def test_upload_persists_celery_task_id(client, user, db_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    login(client)
+
+    original_delay = papers_router.process_uploaded_pdf.delay
+    monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", lambda job_id: make_task_result(f"celery-{job_id}"))
+
+    try:
+        upload_response = client.post(
+            "/api/papers/upload",
+            files={"file": ("task-id.pdf", make_pdf_bytes("paper body"), "application/pdf")},
+        )
+    finally:
+        monkeypatch.setattr(papers_router.process_uploaded_pdf, "delay", original_delay)
+
+    assert upload_response.status_code == 202
+    db_session.expire_all()
+    job = db_session.get(Job, upload_response.json()["job_id"])
+    assert job is not None
+    assert job.celery_task_id == f"celery-{job.id}"
+
+
+def test_cancel_queued_job_marks_cancelled_and_revokes(client, user, db_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    login(client)
+
+    paper = Paper(organization_id=user.organization_id, title="queued paper", status="queued")
+    db_session.add(paper)
+    db_session.flush()
+    job = Job(job_type="pdf_ingest", paper_id=paper.id, status="queued", celery_task_id="celery-queued")
+    db_session.add(job)
+    db_session.commit()
+
+    revoke_calls: list[str] = []
+    monkeypatch.setattr("app.services.papers.celery_app.control.revoke", lambda task_id: revoke_calls.append(task_id))
+
+    response = client.post(f"/api/jobs/{job.id}/cancel")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "cancelled"
+    assert body["cancel_requested_at"] is not None
+
+    db_session.refresh(job)
+    db_session.refresh(paper)
+    assert job.status == "cancelled"
+    assert job.finished_at is not None
+    assert paper.status == "cancelled"
+    assert revoke_calls == ["celery-queued"]
+
+
+def test_cancel_processing_job_marks_cancel_requested_and_revokes(
+    client,
+    user,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    login(client)
+
+    paper = Paper(organization_id=user.organization_id, title="processing paper", status="processing")
+    db_session.add(paper)
+    db_session.flush()
+    job = Job(job_type="pdf_ingest", paper_id=paper.id, status="processing", celery_task_id="celery-processing")
+    db_session.add(job)
+    db_session.commit()
+
+    revoke_calls: list[str] = []
+    monkeypatch.setattr("app.services.papers.celery_app.control.revoke", lambda task_id: revoke_calls.append(task_id))
+
+    response = client.post(f"/api/jobs/{job.id}/cancel")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "cancel_requested"
+    assert body["cancel_requested_at"] is not None
+
+    db_session.refresh(job)
+    db_session.refresh(paper)
+    assert job.status == "cancel_requested"
+    assert paper.status == "cancel_requested"
+    assert revoke_calls == ["celery-processing"]
 
 
 def test_delete_paper_with_active_job_is_rejected(client, user, db_session: Session) -> None:

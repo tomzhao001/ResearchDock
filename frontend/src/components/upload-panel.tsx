@@ -5,6 +5,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { getJobStatusLabel } from "@/lib/job-status";
 import {
   UploadConflictError,
   fetchJob,
@@ -15,11 +16,7 @@ import {
 } from "@/lib/papers";
 
 function statusLabel(status: string | null): string {
-  if (status === "queued") return "已入队";
-  if (status === "processing") return "处理中";
-  if (status === "completed") return "已完成";
-  if (status === "failed") return "失败";
-  return "未开始";
+  return getJobStatusLabel(status, { variant: "upload", emptyLabel: "未开始" });
 }
 
 export type UploadPanelProps = {
