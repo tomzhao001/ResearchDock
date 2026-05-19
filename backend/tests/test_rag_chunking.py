@@ -3,9 +3,7 @@ from __future__ import annotations
 import pytest
 
 from app.models import Paper, PaperChunk
-from app.services.document_preprocess import preprocess_document
 from app.services.ocr.text_normalization import normalize_ocr_text
-from app.services.pdf_extraction import DocumentExtractionResult, PageExtractionResult
 from app.services.rag import (
     RetrievalResult,
     _boost_exact_match_candidates,
@@ -17,164 +15,6 @@ from app.services.rag import (
     _split_text,
     _verify_grounded_answer,
 )
-
-
-def test_preprocess_document_keeps_page_level_blocks() -> None:
-    page = PageExtractionResult(
-        page_number=1,
-        char_count=240,
-        alpha_ratio=0.9,
-        continuous_line_ratio=0.8,
-        image_count=0,
-        suspected_double_column=False,
-        needs_ocr=False,
-        used_ocr=False,
-        reasons=[],
-        ocr_metadata=None,
-        blocks=None,
-        text=(
-            "Abstract\n"
-            "This is the first paragraph with enough text to stand alone.\n\n"
-            "Table 1 Stimulation p-value 0.028\n\n"
-            "This is the second paragraph."
-        ),
-    )
-    document = DocumentExtractionResult(raw_text=page.text, metadata={"pages": []}, pages=[page])
-
-    preanalysis = preprocess_document(document)
-
-    assert preanalysis["chunking_hints"]["block_count"] >= 3
-    assert [block["block_type"] for block in preanalysis["blocks"]] == [
-        "paragraph",
-        "table_caption",
-        "paragraph",
-    ]
-    assert all(block["section_title"] == "Abstract" for block in preanalysis["blocks"])
-
-
-def test_preprocess_document_marks_normalized_ocr_pages() -> None:
-    normalized_text = normalize_ocr_text(
-        "\uff21\uff42\uff53\uff54\uff52\uff41\uff43\uff54\n"
-        "\uff34\uff41\uff42\uff4c\uff45\u3000\uff11\u3000\uff33\uff54\uff49\uff4d\uff55\uff4c\uff41\uff54\uff49\uff4f\uff4e\u3000\uff50\uff0d\uff56\uff41\uff4c\uff55\uff45\u3000\uff10\uff0e\uff10\uff12\uff18"
-    )
-    page = PageExtractionResult(
-        page_number=1,
-        char_count=len(normalized_text.text),
-        alpha_ratio=0.9,
-        continuous_line_ratio=0.8,
-        image_count=0,
-        suspected_double_column=False,
-        needs_ocr=True,
-        used_ocr=True,
-        reasons=["low_text_volume"],
-        ocr_metadata={"text_quality": normalized_text.to_metadata()},
-        blocks=None,
-        text=normalized_text.text,
-    )
-    document = DocumentExtractionResult(
-        raw_text=normalized_text.text,
-        metadata={"pages": []},
-        pages=[page],
-    )
-
-    preanalysis = preprocess_document(document)
-
-    assert "ocr_text_normalized" in preanalysis["document_tags"]
-    assert preanalysis["pages"][0]["ocr_text_normalized"] is True
-    assert [block["block_type"] for block in preanalysis["blocks"]] == ["table_caption"]
-    assert preanalysis["blocks"][0]["text"] == "Table 1 Stimulation p-value 0.028"
-
-
-def test_preprocess_document_marks_table_body_like_blocks() -> None:
-    page = PageExtractionResult(
-        page_number=1,
-        char_count=320,
-        alpha_ratio=0.9,
-        continuous_line_ratio=0.7,
-        image_count=0,
-        suspected_double_column=False,
-        needs_ocr=False,
-        used_ocr=False,
-        reasons=[],
-        ocr_metadata=None,
-        blocks=None,
-        text=(
-            "Results\n"
-            "Table 3 两组患儿干预前后脑电波频率比较（x±s）\n"
-            "研究组 干预后 θ波频率 20.09 2.04 β波频率 14.55 1.26\n"
-            "结论段落。"
-        ),
-    )
-    document = DocumentExtractionResult(raw_text=page.text, metadata={"pages": []}, pages=[page])
-
-    preanalysis = preprocess_document(document)
-
-    assert [block["block_type"] for block in preanalysis["blocks"]] == [
-        "table_caption",
-        "table_like",
-        "paragraph",
-    ]
-
-
-def test_preprocess_document_prefers_raw_blocks_when_page_text_is_low_quality() -> None:
-    page = PageExtractionResult(
-        page_number=1,
-        char_count=120,
-        alpha_ratio=0.1,
-        continuous_line_ratio=0.1,
-        image_count=0,
-        suspected_double_column=False,
-        needs_ocr=False,
-        used_ocr=False,
-        reasons=[],
-        ocr_metadata=None,
-        blocks=[
-            {"text": "表3 两组患儿干预前后脑电波频率比较（x±s）", "x0": 0, "y0": 0, "x1": 100, "y1": 20},
-            {"text": "研究组 55 6.93±0.67 7.96±0.91 26.21±2.35 20.09±2.04 5.86±0.86 6.78±1.03", "x0": 0, "y0": 21, "x1": 100, "y1": 40},
-        ],
-        text=". . .",
-    )
-    document = DocumentExtractionResult(raw_text=page.text, metadata={"pages": []}, pages=[page])
-
-    preanalysis = preprocess_document(document)
-
-    assert [block["block_type"] for block in preanalysis["blocks"]] == [
-        "table_caption",
-        "table_like",
-    ]
-
-
-def test_preprocess_document_keeps_table_row_labels_as_blocks() -> None:
-    page = PageExtractionResult(
-        page_number=1,
-        char_count=220,
-        alpha_ratio=0.3,
-        continuous_line_ratio=0.4,
-        image_count=0,
-        suspected_double_column=False,
-        needs_ocr=False,
-        used_ocr=False,
-        reasons=[],
-        ocr_metadata=None,
-        blocks=None,
-        text=(
-            "Results\n"
-            "表3 两组患儿干预前后脑电波频率比较（x±s）\n"
-            "研究组\n"
-            "55 6.93±0.67 7.96±0.91 26.21±2.35 20.09±2.04 5.86±0.86 6.78±1.03\n"
-            "对照组\n"
-        ),
-    )
-    document = DocumentExtractionResult(raw_text=page.text, metadata={"pages": []}, pages=[page])
-
-    preanalysis = preprocess_document(document)
-
-    assert [block["block_type"] for block in preanalysis["blocks"]] == [
-        "table_caption",
-        "paragraph",
-        "table_like",
-        "paragraph",
-    ]
 
 
 def test_split_text_adds_supporting_context_for_small_to_big(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -221,12 +61,72 @@ def test_split_text_adds_supporting_context_for_small_to_big(monkeypatch: pytest
         ]
     }
 
-    chunks = _split_text("unused", preanalysis=preanalysis, paper_title="Demo Paper")
+    chunks = _split_text(preanalysis=preanalysis, paper_title="Demo Paper")
 
     assert len(chunks) >= 2
     assert chunks[0]["metadata_json"]["body_text"]
     assert chunks[0]["metadata_json"]["supporting_context"]
     assert "上下文补充" not in chunks[0]["content"]
+
+
+def test_split_text_emits_child_and_parent_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.config.settings.rag_chunk_size", 260)
+    monkeypatch.setattr("app.config.settings.rag_chunk_overlap", 40)
+    preanalysis = {
+        "blocks": [
+            {
+                "block_index": 0,
+                "page_number": 1,
+                "section_id": "results",
+                "section_title": "Results",
+                "section_path": "Results",
+                "heading_level": 1,
+                "block_type": "heading",
+                "reading_order": 0,
+                "char_start": 0,
+                "char_end": 7,
+                "text": "Results",
+            },
+            {
+                "block_index": 1,
+                "page_number": 1,
+                "section_id": "results",
+                "section_title": "Results",
+                "section_path": "Results",
+                "heading_level": 1,
+                "block_type": "paragraph",
+                "reading_order": 1,
+                "char_start": 8,
+                "char_end": 120,
+                "text": "Alpha findings sentence. " * 4,
+            },
+            {
+                "block_index": 2,
+                "page_number": 1,
+                "section_id": "results",
+                "section_title": "Results",
+                "section_path": "Results",
+                "heading_level": 1,
+                "block_type": "table_like",
+                "reading_order": 2,
+                "char_start": 121,
+                "char_end": 220,
+                "text": "Table 1\nGroup A: 0.92\nGroup B: 0.88",
+                "table_data_json": [{"Group": "A", "Score": "0.92"}],
+            },
+        ]
+    }
+
+    chunks = _split_text(preanalysis=preanalysis, paper_title="Demo Paper")
+
+    child_chunks = [chunk for chunk in chunks if chunk["chunk_role"] == "child"]
+    parent_chunks = [chunk for chunk in chunks if chunk["chunk_role"] == "parent"]
+
+    assert child_chunks
+    assert len(parent_chunks) == 1
+    assert all(chunk["metadata_json"]["parent_text"] for chunk in child_chunks)
+    assert parent_chunks[0]["metadata_json"]["chunk_role"] == "parent"
+    assert "Results" in parent_chunks[0]["metadata_json"]["body_text"]
 
 
 def test_extract_exact_match_terms_prefers_table_and_hyphenated_terms() -> None:
@@ -239,13 +139,13 @@ def test_extract_exact_match_terms_prefers_table_and_hyphenated_terms() -> None:
 
 def test_extract_exact_match_terms_works_after_ocr_normalization() -> None:
     normalized_text = normalize_ocr_text(
-        "\uff34\uff41\uff42\uff4c\uff45\u3000\uff11\u3000\u4e2d\u3000\uff21\uff24\uff28\uff24\uff0d\uff32\uff33\u3000\u7684\u3000\uff30\uff24\uff26\u3000\u662f\u4ec0\u4e48\uff1f"
+        "\uff34\uff41\uff42\uff4c\uff45\u3000\uff11\u3000\u4e2d\u3000\uff21\uff24\uff28\uff24\uff0d\uff32\uff53\u3000\u7684\u3000\uff30\uff24\uff26\u3000\u662f\u4ec0\u4e48\uff1f"
     )
 
     terms = _extract_exact_match_terms(normalized_text.text)
 
     assert "Table 1" in terms
-    assert "ADHD-RS" in terms
+    assert "ADHD-Rs" in terms
     assert "PDF" in terms
 
 
@@ -331,7 +231,7 @@ def test_split_text_is_more_conservative_for_cjk_paragraphs(monkeypatch: pytest.
         ]
     }
 
-    chunks = _split_text("unused", preanalysis=preanalysis, paper_title="中文论文")
+    chunks = _split_text(preanalysis=preanalysis, paper_title="中文论文")
 
     assert len(chunks) <= 2
     assert chunks[0]["metadata_json"]["supporting_context"] is None
@@ -381,7 +281,7 @@ def test_split_text_pairs_table_caption_with_following_body(monkeypatch: pytest.
         ]
     }
 
-    chunks = _split_text("unused", preanalysis=preanalysis, paper_title="中文论文")
+    chunks = _split_text(preanalysis=preanalysis, paper_title="中文论文")
 
     assert chunks[0]["metadata_json"]["block_types"] == ["table_caption", "table_like"]
     assert "表3" in chunks[0]["metadata_json"]["body_text"]

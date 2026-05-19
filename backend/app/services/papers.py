@@ -102,6 +102,185 @@ def _get_original_pdf_asset(db: Session, paper_id: int) -> PaperAsset | None:
     )
 
 
+def _structure_sort_key(*, reading_order: int | None, page_number: int | None, fallback_group: int, fallback_index: int) -> tuple[int, int, int, int]:
+    if reading_order is not None:
+        return (0, int(reading_order), fallback_group, fallback_index)
+    return (1, int(page_number or 0), fallback_group, fallback_index)
+
+
+def _serialize_table_rows(data: object, *, max_rows: int = 6) -> str:
+    if not isinstance(data, list):
+        return ""
+    lines: list[str] = []
+    for row in data[:max_rows]:
+        if not isinstance(row, dict):
+            continue
+        cells = [f"{str(key).strip()}: {str(value).strip()}" for key, value in row.items() if str(value).strip()]
+        if cells:
+            lines.append("; ".join(cells))
+    return "\n".join(lines)
+
+
+def _normalize_rendered_lines(lines: list[str]) -> str:
+    compacted: list[str] = []
+    for line in lines:
+        normalized = str(line or "").strip()
+        if not normalized:
+            if compacted and compacted[-1] != "":
+                compacted.append("")
+            continue
+        compacted.append(normalized)
+    while compacted and compacted[-1] == "":
+        compacted.pop()
+    return "\n".join(compacted).strip()
+
+
+def render_document_text(document: ExtractedDocument) -> str:
+    rows: list[tuple[tuple[int, int, int, int], str]] = []
+    for fallback_index, block in enumerate(document.blocks):
+        text = str(block.text or "").strip()
+        if not text:
+            continue
+        if block.block_type == "heading":
+            heading_level = max(int(block.heading_level or 1), 1)
+            text = f"{'#' * min(heading_level, 6)} {text}"
+        rows.append(
+            (
+                _structure_sort_key(
+                    reading_order=block.reading_order,
+                    page_number=block.page_number,
+                    fallback_group=0,
+                    fallback_index=fallback_index,
+                ),
+                text,
+            )
+        )
+    for fallback_index, table in enumerate(document.tables):
+        parts = [str(table.caption or "").strip()]
+        table_rows = _serialize_table_rows(table.data)
+        if table_rows:
+            parts.append(table_rows)
+        elif str(table.markdown or "").strip():
+            parts.append(str(table.markdown or "").strip())
+        rendered = "\n".join(part for part in parts if part)
+        if not rendered:
+            continue
+        rows.append(
+            (
+                _structure_sort_key(
+                    reading_order=table.reading_order,
+                    page_number=table.page_from,
+                    fallback_group=1,
+                    fallback_index=fallback_index,
+                ),
+                rendered,
+            )
+        )
+    for fallback_index, picture in enumerate(document.pictures):
+        rendered = "\n".join(
+            part
+            for part in (str(picture.caption or "").strip(), str(picture.description or "").strip())
+            if part
+        )
+        if not rendered:
+            continue
+        rows.append(
+            (
+                _structure_sort_key(
+                    reading_order=picture.reading_order,
+                    page_number=picture.page_number,
+                    fallback_group=2,
+                    fallback_index=fallback_index,
+                ),
+                rendered,
+            )
+        )
+    return _normalize_rendered_lines([text for _sort_key, text in sorted(rows, key=lambda item: item[0])])
+
+
+def render_paper_text_from_structure(db: Session, paper_id: int) -> str:
+    rows: list[tuple[tuple[int, int, int, int], str]] = []
+    blocks = db.scalars(
+        select(PaperDocumentBlock)
+        .where(PaperDocumentBlock.paper_id == paper_id)
+        .order_by(PaperDocumentBlock.block_index.asc(), PaperDocumentBlock.id.asc())
+    ).all()
+    for fallback_index, block in enumerate(blocks):
+        text = str(block.text or "").strip()
+        if not text:
+            continue
+        if (block.block_type or "") == "heading":
+            heading_level = max(int(block.heading_level or 1), 1)
+            text = f"{'#' * min(heading_level, 6)} {text}"
+        page_number = None
+        page = getattr(block, "page_id", None)
+        if page is not None:
+            linked_page = db.get(PaperDocumentPage, block.page_id)
+            page_number = linked_page.page_number if linked_page is not None else None
+        rows.append(
+            (
+                _structure_sort_key(
+                    reading_order=block.reading_order,
+                    page_number=page_number,
+                    fallback_group=0,
+                    fallback_index=fallback_index,
+                ),
+                text,
+            )
+        )
+    tables = db.scalars(
+        select(PaperDocumentTable)
+        .where(PaperDocumentTable.paper_id == paper_id)
+        .order_by(PaperDocumentTable.table_index.asc(), PaperDocumentTable.id.asc())
+    ).all()
+    for fallback_index, table in enumerate(tables):
+        parts = [str(table.caption or "").strip()]
+        table_rows = _serialize_table_rows(table.data_json)
+        if table_rows:
+            parts.append(table_rows)
+        elif str(table.markdown or "").strip():
+            parts.append(str(table.markdown or "").strip())
+        rendered = "\n".join(part for part in parts if part)
+        if not rendered:
+            continue
+        rows.append(
+            (
+                _structure_sort_key(
+                    reading_order=table.reading_order,
+                    page_number=table.page_from,
+                    fallback_group=1,
+                    fallback_index=fallback_index,
+                ),
+                rendered,
+            )
+        )
+    pictures = db.scalars(
+        select(PaperDocumentPicture)
+        .where(PaperDocumentPicture.paper_id == paper_id)
+        .order_by(PaperDocumentPicture.picture_index.asc(), PaperDocumentPicture.id.asc())
+    ).all()
+    for fallback_index, picture in enumerate(pictures):
+        rendered = "\n".join(
+            part
+            for part in (str(picture.caption or "").strip(), str(picture.description or "").strip())
+            if part
+        )
+        if not rendered:
+            continue
+        rows.append(
+            (
+                _structure_sort_key(
+                    reading_order=picture.reading_order,
+                    page_number=picture.page_number,
+                    fallback_group=2,
+                    fallback_index=fallback_index,
+                ),
+                rendered,
+            )
+        )
+    return _normalize_rendered_lines([text for _sort_key, text in sorted(rows, key=lambda item: item[0])])
+
+
 def _get_latest_job_for_paper(db: Session, paper_id: int, job_type: str) -> Job | None:
     return db.scalar(
         select(Job)
@@ -217,7 +396,7 @@ def _raise_if_cancel_requested(db: Session, job: Job, paper: Paper | None) -> No
 def _queue_summary_job_if_needed(db: Session, paper: Paper, asset: PaperAsset) -> int | None:
     if not is_chat_llm_configured():
         return None
-    if not (asset.raw_text or "").strip():
+    if not render_paper_text_from_structure(db, paper.id):
         return None
 
     latest_summary_job = _get_latest_job_for_paper(db, paper.id, "paper_summary")
@@ -245,7 +424,7 @@ def _extract_structured_summary_from_asset(asset: PaperAsset | None) -> dict | N
 def _queue_question_set_job_if_needed(db: Session, paper: Paper, asset: PaperAsset) -> int | None:
     if not is_chat_llm_configured():
         return None
-    if not (asset.raw_text or "").strip():
+    if not render_paper_text_from_structure(db, paper.id):
         return None
     if _extract_structured_summary_from_asset(asset) is None:
         return None
@@ -620,6 +799,7 @@ def _persist_document_structure(db: Session, *, paper_id: int, asset_id: int, do
                 paper_id=paper_id,
                 page_id=page_id_by_number.get(block.page_number or 0),
                 block_index=block.block_index,
+                reading_order=block.reading_order,
                 block_type=block.block_type or "paragraph",
                 docling_label=block.docling_label,
                 heading_level=block.heading_level,
@@ -638,10 +818,14 @@ def _persist_document_structure(db: Session, *, paper_id: int, asset_id: int, do
                 page_from=table.page_from,
                 page_to=table.page_to,
                 table_index=table.table_index,
+                reading_order=table.reading_order,
+                heading_level=table.heading_level,
+                section_path=table.section_path,
                 caption=table.caption,
                 markdown=table.markdown,
                 data_json=table.data,
                 bbox_json=table.bbox,
+                provenance_json=table.provenance,
                 metadata_json=table.metadata,
             )
         )
@@ -652,11 +836,15 @@ def _persist_document_structure(db: Session, *, paper_id: int, asset_id: int, do
                 paper_id=paper_id,
                 page_number=picture.page_number,
                 picture_index=picture.picture_index,
+                reading_order=picture.reading_order,
+                heading_level=picture.heading_level,
+                section_path=picture.section_path,
                 caption=picture.caption,
                 description=picture.description,
                 description_model=picture.description_model,
                 description_prompt_version=picture.description_prompt_version,
                 bbox_json=picture.bbox,
+                provenance_json=picture.provenance,
                 image_asset_path=picture.image_asset_path,
                 metadata_json=picture.metadata,
             )
@@ -670,7 +858,7 @@ def enqueue_paper_summary_regeneration(db: Session, paper_id: int, *, organizati
     asset = _get_original_pdf_asset(db, paper_id)
     if asset is None:
         raise ValueError("Original PDF not found")
-    if not (asset.raw_text or "").strip():
+    if not render_paper_text_from_structure(db, paper_id):
         raise ValueError("No parsed text available")
     if not is_chat_llm_configured():
         raise ValueError("LLM is not configured for summarization")
@@ -695,7 +883,7 @@ def enqueue_paper_question_set_regeneration(db: Session, paper_id: int, *, organ
     asset = _get_original_pdf_asset(db, paper_id)
     if asset is None:
         raise ValueError("Original PDF not found")
-    if not (asset.raw_text or "").strip():
+    if not render_paper_text_from_structure(db, paper_id):
         raise ValueError("No parsed text available")
     if _extract_structured_summary_from_asset(asset) is None:
         raise ValueError("No structured summary available")
@@ -768,11 +956,10 @@ def run_pdf_ingest_job(
             },
         }
         asset.metadata_json = metadata
-        asset.raw_text = document.markdown_text
+        asset.raw_text = None
         rebuild_paper_index_from_document_structure(
             db,
             paper_id=paper.id,
-            raw_text=document.markdown_text,
             paper_title=paper.title,
         )
         _raise_if_cancel_requested(db, job, paper)
@@ -819,7 +1006,8 @@ def run_paper_summary_job(
             raise RuntimeError("Missing paper or upload asset for summary job")
         if not is_chat_llm_configured():
             raise RuntimeError("LLM is not configured for summarization")
-        if not (asset.raw_text or "").strip():
+        paper_text = render_paper_text_from_structure(db, paper.id)
+        if not paper_text:
             raise RuntimeError("No parsed text available")
         _raise_if_cancel_requested(db, job, paper)
 
@@ -832,7 +1020,7 @@ def run_paper_summary_job(
         publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
 
         _raise_if_cancel_requested(db, job, paper)
-        summary = summarize_paper_text(asset.raw_text)
+        summary = summarize_paper_text(paper_text)
         _raise_if_cancel_requested(db, job, paper)
         summary["authors"] = _normalize_summary_text(summary.get("authors"))
         summary["doi"] = _normalize_summary_doi(summary.get("doi"))
@@ -894,7 +1082,8 @@ def run_paper_question_set_job(
             raise RuntimeError("Missing paper or upload asset for question set job")
         if not is_chat_llm_configured():
             raise RuntimeError("LLM is not configured for question set extraction")
-        if not (asset.raw_text or "").strip():
+        paper_text = render_paper_text_from_structure(db, paper.id)
+        if not paper_text:
             raise RuntimeError("No parsed text available")
 
         structured_summary = _extract_structured_summary_from_asset(asset)
@@ -916,7 +1105,7 @@ def run_paper_question_set_job(
 
         _raise_if_cancel_requested(db, job, paper)
         result = answer_question_set_questions(
-            asset.raw_text,
+            paper_text,
             structured_summary=structured_summary,
             questions=questions,
         )

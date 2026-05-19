@@ -23,6 +23,7 @@ class ExtractedBlock:
     docling_label: str | None = None
     heading_level: int | None = None
     section_path: str | None = None
+    reading_order: int | None = None
     bbox: dict | None = None
     provenance: dict | None = None
     metadata: dict | None = None
@@ -36,7 +37,11 @@ class ExtractedTable:
     data: dict | list | None = None
     page_from: int | None = None
     page_to: int | None = None
+    section_path: str | None = None
+    heading_level: int | None = None
+    reading_order: int | None = None
     bbox: dict | None = None
+    provenance: dict | None = None
     metadata: dict | None = None
 
 
@@ -48,7 +53,11 @@ class ExtractedPicture:
     description_model: str | None = None
     description_prompt_version: str | None = None
     page_number: int | None = None
+    section_path: str | None = None
+    heading_level: int | None = None
+    reading_order: int | None = None
     bbox: dict | None = None
+    provenance: dict | None = None
     image_asset_path: str | None = None
     image_bytes: bytes | None = field(default=None, repr=False)
     metadata: dict | None = None
@@ -63,10 +72,6 @@ class ExtractedDocument:
     tables: list[ExtractedTable] = field(default_factory=list)
     pictures: list[ExtractedPicture] = field(default_factory=list)
     docling_json: dict | None = None
-
-    @property
-    def raw_text(self) -> str:
-        return self.markdown_text
 
     def extraction_metadata(self) -> dict:
         payload = dict(self.metadata or {})

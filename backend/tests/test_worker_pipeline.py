@@ -27,12 +27,27 @@ class FakeDoclingExtractor:
             blocks=[
                 ExtractedBlock(
                     block_index=0,
+                    text=self.title,
+                    block_type="heading",
+                    page_number=1,
+                    docling_label="section_header",
+                    heading_level=1,
+                    section_path=self.title,
+                    reading_order=0,
+                    bbox={"x0": 0, "y0": 0, "x1": 120, "y1": 20},
+                    provenance={"page_number": 1},
+                ),
+                ExtractedBlock(
+                    block_index=1,
                     text="This is Docling markdown text.",
                     block_type="paragraph",
                     page_number=1,
                     docling_label="text",
                     heading_level=1,
                     section_path=self.title,
+                    reading_order=1,
+                    bbox={"x0": 0, "y0": 24, "x1": 200, "y1": 80},
+                    provenance={"page_number": 1},
                 )
             ],
             tables=[
@@ -40,8 +55,14 @@ class FakeDoclingExtractor:
                     table_index=0,
                     caption="Table 1. Accuracy",
                     markdown="| Group | Score |\n| --- | --- |\n| A | 0.92 |",
+                    data=[{"Group": "A", "Score": "0.92"}],
                     page_from=1,
                     page_to=1,
+                    section_path=self.title,
+                    heading_level=1,
+                    reading_order=2,
+                    bbox={"x0": 0, "y0": 90, "x1": 200, "y1": 160},
+                    provenance={"page_number": 1},
                 )
             ],
             pictures=[
@@ -49,6 +70,11 @@ class FakeDoclingExtractor:
                     picture_index=0,
                     caption="Figure 1. Trend",
                     page_number=1,
+                    section_path=self.title,
+                    heading_level=1,
+                    reading_order=3,
+                    bbox={"x0": 0, "y0": 170, "x1": 200, "y1": 240},
+                    provenance={"page_number": 1},
                     image_bytes=b"fake-png",
                 )
             ],
@@ -59,8 +85,10 @@ class SecondFakeDoclingExtractor(FakeDoclingExtractor):
     def extract(self, pdf_path: Path) -> ExtractedDocument:
         document = super().extract(pdf_path)
         document.markdown_text = "# Results\n\nReplacement parse."
-        document.blocks[0].text = "Replacement parse."
+        document.blocks[0].text = "Results"
         document.blocks[0].section_path = "Results"
+        document.blocks[1].text = "Replacement parse."
+        document.blocks[1].section_path = "Results"
         document.tables = []
         document.pictures = []
         return document
@@ -136,20 +164,30 @@ def test_worker_persists_docling_structure_and_picture_descriptions(
     assert job is not None
     assert job.status == "completed"
     assert asset is not None
-    assert asset.raw_text == "# Abstract\n\nThis is Docling markdown text."
+    assert asset.raw_text is None
     assert asset.metadata_json is not None
     assert asset.metadata_json["extraction"]["engine"] == "docling"
     assert asset.metadata_json["extraction"]["page_count"] == 1
-    assert asset.metadata_json["extraction"]["block_count"] == 1
+    assert asset.metadata_json["extraction"]["block_count"] == 2
     assert asset.metadata_json["extraction"]["table_count"] == 1
     assert asset.metadata_json["extraction"]["picture_count"] == 1
     assert len(pages) == 1
-    assert len(blocks) == 1
+    assert len(blocks) == 2
     assert len(tables) == 1
     assert len(pictures) == 1
+    assert blocks[0].block_type == "heading"
+    assert blocks[0].reading_order == 0
+    assert blocks[1].section_path == "Abstract"
+    assert tables[0].section_path == "Abstract"
+    assert tables[0].reading_order == 2
+    assert pictures[0].section_path == "Abstract"
+    assert pictures[0].reading_order == 3
     assert pictures[0].description == "图表显示 A 组分数随时间上升。"
     assert pictures[0].description_model == "glm-4.6v"
     assert chunks
+    assert {chunk.chunk_role for chunk in chunks} == {"child", "parent"}
+    child_chunks = [chunk for chunk in chunks if chunk.chunk_role == "child"]
+    assert child_chunks and all(chunk.parent_chunk_id is not None for chunk in child_chunks)
     assert any("Table 1. Accuracy" in chunk.content for chunk in chunks)
     assert any("图表显示 A 组分数随时间上升" in chunk.content for chunk in chunks)
 
@@ -191,7 +229,7 @@ def test_worker_reparse_replaces_existing_structure(
     pictures = db_session.scalars(select(PaperDocumentPicture).where(PaperDocumentPicture.paper_id == artifacts.paper_id)).all()
 
     assert asset is not None
-    assert asset.raw_text == "# Results\n\nReplacement parse."
+    assert asset.raw_text is None
     assert tables == []
     assert pictures == []
     assert chunks

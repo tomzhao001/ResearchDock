@@ -65,6 +65,19 @@ def _provenance(item: Any) -> dict | None:
     return payload or None
 
 
+def _bbox_distance(lhs: dict | None, rhs: dict | None) -> float:
+    if not lhs or not rhs:
+        return float("inf")
+    try:
+        left_cx = (float(lhs["x0"]) + float(lhs["x1"])) / 2
+        left_cy = (float(lhs["y0"]) + float(lhs["y1"])) / 2
+        right_cx = (float(rhs["x0"]) + float(rhs["x1"])) / 2
+        right_cy = (float(rhs["y0"]) + float(rhs["y1"])) / 2
+    except Exception:
+        return float("inf")
+    return abs(left_cx - right_cx) + abs(left_cy - right_cy)
+
+
 def _block_type(label: str | None) -> str:
     normalized = (label or "").lower()
     if "section" in normalized or "heading" in normalized or "title" in normalized:
@@ -159,10 +172,11 @@ class DoclingDocumentExtractor:
         except Exception:
             docling_json = None
 
+        context_rows = self._collect_context_rows(doc)
         pages = self._extract_pages(doc, docling_json)
-        blocks = self._extract_blocks(doc)
-        tables = self._extract_tables(doc)
-        pictures = self._extract_pictures(doc)
+        blocks = self._extract_blocks(context_rows)
+        tables = self._extract_tables(doc, context_rows)
+        pictures = self._extract_pictures(doc, context_rows)
         elapsed_ms = int((time.monotonic() - started) * 1000)
 
         metadata = {
@@ -214,39 +228,101 @@ class DoclingDocumentExtractor:
         page_count = max((_page_number(item) or 0 for item, _level in doc.iterate_items()), default=0)
         return [ExtractedPage(page_number=index) for index in range(1, page_count + 1)]
 
-    def _extract_blocks(self, doc: Any) -> list[ExtractedBlock]:
-        blocks: list[ExtractedBlock] = []
+    def _collect_context_rows(self, doc: Any) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
         section_stack: dict[int, str] = {}
-        for item, level in doc.iterate_items():
-            text = str(getattr(item, "text", "") or "").strip()
-            if not text:
-                continue
+        for reading_order, (item, level) in enumerate(doc.iterate_items()):
             label = _label_name(item)
             block_type = _block_type(label)
-            heading_level = int(level) if block_type == "heading" and str(level).isdigit() else (int(level) if block_type == "heading" else None)
+            text = str(getattr(item, "text", "") or "").strip()
+            if not text and block_type in {"table_like", "figure_caption"}:
+                text = _extract_caption(item, doc) or ""
+            if not text and block_type not in {"table_like", "figure_caption"}:
+                continue
+            heading_level = int(level) if block_type == "heading" and str(level).isdigit() else None
             if block_type == "heading":
                 heading_level = heading_level or 1
                 section_stack = {key: value for key, value in section_stack.items() if key < heading_level}
                 section_stack[heading_level] = text
+                section_path = " > ".join(section_stack[key] for key in sorted(section_stack)) or None
+            else:
+                section_path = " > ".join(section_stack[key] for key in sorted(section_stack)) or None
+                heading_level = max(section_stack.keys(), default=1) if section_stack else 1
+            rows.append(
+                {
+                    "text": text,
+                    "block_type": block_type,
+                    "docling_label": label,
+                    "page_number": _page_number(item),
+                    "heading_level": heading_level,
+                    "section_path": section_path,
+                    "bbox": _bbox(item),
+                    "provenance": _provenance(item),
+                    "reading_order": reading_order,
+                }
+            )
+        return rows
+
+    def _extract_blocks(self, context_rows: list[dict[str, Any]]) -> list[ExtractedBlock]:
+        blocks: list[ExtractedBlock] = []
+        for row in context_rows:
+            block_type = str(row.get("block_type") or "paragraph")
+            if block_type in {"table_like", "figure_caption"}:
                 continue
-            section_path = " > ".join(section_stack[key] for key in sorted(section_stack)) or None
+            text = str(row.get("text") or "").strip()
+            if not text:
+                continue
             blocks.append(
                 ExtractedBlock(
                     block_index=len(blocks),
                     text=text,
                     block_type=block_type,
-                    page_number=_page_number(item),
-                    docling_label=label,
-                    heading_level=max(section_stack.keys(), default=1) if section_stack else 1,
-                    section_path=section_path,
-                    bbox=_bbox(item),
-                    provenance=_provenance(item),
+                    page_number=row.get("page_number"),
+                    docling_label=row.get("docling_label"),
+                    heading_level=row.get("heading_level"),
+                    section_path=row.get("section_path"),
+                    reading_order=row.get("reading_order"),
+                    bbox=row.get("bbox"),
+                    provenance=row.get("provenance"),
                 )
             )
         return blocks
 
-    def _extract_tables(self, doc: Any) -> list[ExtractedTable]:
+    def _match_context_row(
+        self,
+        context_rows: list[dict[str, Any]],
+        *,
+        kind: str,
+        page_number: int | None,
+        bbox: dict | None,
+        used_indexes: set[int],
+    ) -> dict[str, Any] | None:
+        preferred_types = {"table": {"table_like"}, "picture": {"figure_caption"}}.get(kind, set())
+        candidates: list[tuple[float, int, dict[str, Any]]] = []
+        fallback: list[tuple[float, int, dict[str, Any]]] = []
+        for index, row in enumerate(context_rows):
+            if index in used_indexes:
+                continue
+            row_page = row.get("page_number")
+            if page_number is not None and row_page is not None and int(row_page) != int(page_number):
+                continue
+            row_bbox = row.get("bbox") if isinstance(row.get("bbox"), dict) else None
+            distance = _bbox_distance(bbox, row_bbox)
+            record = (distance, index, row)
+            if str(row.get("block_type") or "") in preferred_types:
+                candidates.append(record)
+            else:
+                fallback.append(record)
+        ordered = sorted(candidates or fallback, key=lambda item: (item[0], item[1]))
+        if not ordered:
+            return None
+        _, index, row = ordered[0]
+        used_indexes.add(index)
+        return row
+
+    def _extract_tables(self, doc: Any, context_rows: list[dict[str, Any]]) -> list[ExtractedTable]:
         tables: list[ExtractedTable] = []
+        used_indexes: set[int] = set()
         for index, table in enumerate(getattr(doc, "tables", []) or []):
             try:
                 markdown = table.export_to_markdown(doc=doc)
@@ -261,6 +337,18 @@ class DoclingDocumentExtractor:
             except Exception:
                 data = None
             page = _page_number(table)
+            bbox = _bbox(table)
+            provenance = _provenance(table)
+            matched = self._match_context_row(
+                context_rows,
+                kind="table",
+                page_number=page,
+                bbox=bbox,
+                used_indexes=used_indexes,
+            )
+            matched_section_path = str(matched.get("section_path") or "").strip() if matched else ""
+            matched_heading_level = int(matched.get("heading_level")) if matched and str(matched.get("heading_level") or "").isdigit() else None
+            matched_reading_order = int(matched.get("reading_order")) if matched and str(matched.get("reading_order") or "").isdigit() else None
             tables.append(
                 ExtractedTable(
                     table_index=index,
@@ -269,21 +357,43 @@ class DoclingDocumentExtractor:
                     data=data,
                     page_from=page,
                     page_to=page,
-                    bbox=_bbox(table),
+                    section_path=matched_section_path or None,
+                    heading_level=matched_heading_level,
+                    reading_order=matched_reading_order,
+                    bbox=bbox,
+                    provenance=provenance or (matched.get("provenance") if matched else None),
                     metadata={"docling_label": _label_name(table)},
                 )
             )
         return tables
 
-    def _extract_pictures(self, doc: Any) -> list[ExtractedPicture]:
+    def _extract_pictures(self, doc: Any, context_rows: list[dict[str, Any]]) -> list[ExtractedPicture]:
         pictures: list[ExtractedPicture] = []
+        used_indexes: set[int] = set()
         for index, picture in enumerate(getattr(doc, "pictures", []) or []):
+            page_number = _page_number(picture)
+            bbox = _bbox(picture)
+            provenance = _provenance(picture)
+            matched = self._match_context_row(
+                context_rows,
+                kind="picture",
+                page_number=page_number,
+                bbox=bbox,
+                used_indexes=used_indexes,
+            )
+            matched_section_path = str(matched.get("section_path") or "").strip() if matched else ""
+            matched_heading_level = int(matched.get("heading_level")) if matched and str(matched.get("heading_level") or "").isdigit() else None
+            matched_reading_order = int(matched.get("reading_order")) if matched and str(matched.get("reading_order") or "").isdigit() else None
             pictures.append(
                 ExtractedPicture(
                     picture_index=index,
                     caption=_extract_caption(picture, doc),
-                    page_number=_page_number(picture),
-                    bbox=_bbox(picture),
+                    page_number=page_number,
+                    section_path=matched_section_path or None,
+                    heading_level=matched_heading_level,
+                    reading_order=matched_reading_order,
+                    bbox=bbox,
+                    provenance=provenance or (matched.get("provenance") if matched else None),
                     image_bytes=_picture_image_bytes(picture, doc),
                     metadata={"docling_label": _label_name(picture), "provenance": _provenance(picture)},
                 )

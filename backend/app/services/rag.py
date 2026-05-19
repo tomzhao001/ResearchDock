@@ -268,9 +268,12 @@ def _chunk_text_payload(chunk: PaperChunk, *, include_supporting_context: bool =
     header = str(metadata.get("context_header") or "").strip()
     body_text = str(metadata.get("body_text") or chunk.content or "").strip()
     supporting_context = str(metadata.get("supporting_context") or "").strip()
+    parent_context = str(metadata.get("parent_text") or "").strip()
     parts = [part for part in (header, body_text) if part]
     if include_supporting_context and supporting_context:
         parts.append(f"上下文补充: {supporting_context}")
+    if include_supporting_context and parent_context:
+        parts.append(f"章节上下文: {parent_context}")
     return "\n\n".join(parts) if parts else str(chunk.content or "")
 
 
@@ -724,7 +727,7 @@ def _search_chunks_legacy(db: Session, *, query: str, top_k: int, organization_i
     rows = db.execute(
         select(PaperChunk, Paper)
         .join(Paper, Paper.id == PaperChunk.paper_id)
-        .where(Paper.deleted_at.is_(None), Paper.organization_id == organization_id)
+        .where(Paper.deleted_at.is_(None), Paper.organization_id == organization_id, PaperChunk.chunk_role == "child")
         .order_by(PaperChunk.paper_id.asc(), PaperChunk.chunk_index.asc())
     ).all()
     if not rows:
@@ -797,6 +800,7 @@ def _search_sparse_chunks_postgres(
             JOIN papers AS p ON p.id = pc.paper_id
             WHERE p.deleted_at IS NULL
               AND p.organization_id = :organization_id
+              AND pc.chunk_role = 'child'
               AND (
                     pc.search_vector @@ plainto_tsquery('{search_config}', :query)
                     OR {exact_match_sql}
@@ -834,7 +838,12 @@ def _search_dense_chunks_postgres(
             (1 - distance).label("score"),
         )
         .join(Paper, Paper.id == PaperChunk.paper_id)
-        .where(Paper.deleted_at.is_(None), Paper.organization_id == organization_id, PaperChunk.embedding.is_not(None))
+        .where(
+            Paper.deleted_at.is_(None),
+            Paper.organization_id == organization_id,
+            PaperChunk.embedding.is_not(None),
+            PaperChunk.chunk_role == "child",
+        )
         .order_by(distance.asc(), PaperChunk.id.asc())
         .limit(limit)
     ).all()
@@ -1200,6 +1209,35 @@ def _build_context_header(
     return "\n".join(lines)
 
 
+def _serialize_table_rows(data: object, *, max_rows: int = 8) -> str:
+    if not isinstance(data, list):
+        return ""
+    lines: list[str] = []
+    for row in data[:max_rows]:
+        if not isinstance(row, dict):
+            continue
+        cells = [f"{str(key).strip()}: {str(value).strip()}" for key, value in row.items() if str(value).strip()]
+        if cells:
+            lines.append("; ".join(cells))
+    return "\n".join(lines)
+
+
+def _compose_table_text(*, caption: str | None, markdown: str | None, data: object) -> str:
+    parts = [str(caption or "").strip()]
+    serialized_rows = _serialize_table_rows(data)
+    if serialized_rows:
+        parts.append(serialized_rows)
+    elif str(markdown or "").strip():
+        parts.append(str(markdown or "").strip())
+    return "\n".join(part for part in parts if part)
+
+
+def _structure_sort_key(*, reading_order: int | None, page_number: int | None, fallback_group: int, fallback_index: int) -> tuple[int, int, int, int]:
+    if reading_order is not None:
+        return (0, int(reading_order), fallback_group, fallback_index)
+    return (1, int(page_number or 0), fallback_group, fallback_index)
+
+
 def _window_text(text: str, *, chunk_size: int, overlap: int) -> list[dict[str, int | str]]:
     text = re.sub(r"\s+", " ", (text or "").strip())
     if not text:
@@ -1276,6 +1314,9 @@ def _make_chunk_record(
     block_rows: list[dict[str, Any]],
     paper_title: str | None,
     supporting_context_rows: list[dict[str, Any]] | None = None,
+    chunk_role: str = "child",
+    parent_key: str | None = None,
+    parent_text: str | None = None,
 ) -> dict[str, Any]:
     page_numbers = sorted(
         {
@@ -1319,6 +1360,8 @@ def _make_chunk_record(
         "token_count": len(_tokenize(body_text)),
         "page_from": page_from,
         "page_to": page_to,
+        "chunk_role": chunk_role,
+        "parent_key": parent_key,
         "metadata_json": {
             "char_start": min((int(block.get("char_start") or 0) for block in block_rows), default=0),
             "char_end": max((int(block.get("char_end") or 0) for block in block_rows), default=0),
@@ -1329,47 +1372,32 @@ def _make_chunk_record(
             "heading_level": heading_level,
             "block_types": sorted({str(block.get("block_type") or "paragraph") for block in block_rows}),
             "block_count": len(block_rows),
+            "chunk_role": chunk_role,
             "body_text": body_text,
             "supporting_context": supporting_context or None,
+            "parent_text": parent_text or None,
+            "reading_order_start": min(
+                (int(block.get("reading_order")) for block in block_rows if isinstance(block.get("reading_order"), int) or str(block.get("reading_order") or "").isdigit()),
+                default=None,
+            ),
+            "reading_order_end": max(
+                (int(block.get("reading_order")) for block in block_rows if isinstance(block.get("reading_order"), int) or str(block.get("reading_order") or "").isdigit()),
+                default=None,
+            ),
+            "bbox": next((block.get("bbox") for block in block_rows if isinstance(block.get("bbox"), dict)), None),
+            "provenance": next((block.get("provenance") for block in block_rows if isinstance(block.get("provenance"), dict)), None),
             "source_block_ids": sorted({int(block["source_block_id"]) for block in block_rows if str(block.get("source_block_id") or "").isdigit()}),
             "source_table_ids": sorted({int(block["source_table_id"]) for block in block_rows if str(block.get("source_table_id") or "").isdigit()}),
             "source_picture_ids": sorted({int(block["source_picture_id"]) for block in block_rows if str(block.get("source_picture_id") or "").isdigit()}),
             "docling_labels": sorted({str(block.get("docling_label")) for block in block_rows if str(block.get("docling_label") or "").strip()}),
             "table_markdown": next((block.get("table_markdown") for block in block_rows if block.get("table_markdown")), None),
+            "table_data_json": next((block.get("table_data_json") for block in block_rows if block.get("table_data_json") is not None), None),
             "picture_description": next((block.get("picture_description") for block in block_rows if block.get("picture_description")), None),
         },
     }
 
 
-def _split_text_legacy(raw_text: str, *, paper_title: str | None = None) -> list[dict[str, Any]]:
-    chunk_size = max(settings.rag_chunk_size, 200)
-    overlap = max(min(settings.rag_chunk_overlap, chunk_size - 1), 0)
-    chunks: list[dict[str, Any]] = []
-    for index, window in enumerate(_window_text(raw_text, chunk_size=chunk_size, overlap=overlap)):
-        body_text = str(window["content"])
-        chunks.append(
-            _make_chunk_record(
-                chunk_index=index,
-                body_text=body_text,
-                block_rows=[
-                    {
-                        "char_start": int(window["char_start"]),
-                        "char_end": int(window["char_end"]),
-                        "page_number": 1,
-                        "block_type": "window",
-                        "section_title": "Document",
-                        "section_path": "Document",
-                        "heading_level": 1,
-                    }
-                ],
-                paper_title=paper_title,
-            )
-        )
-    return chunks
-
-
 def _split_text(
-    raw_text: str,
     *,
     preanalysis: dict[str, Any] | None = None,
     paper_title: str | None = None,
@@ -1378,24 +1406,25 @@ def _split_text(
     overlap = max(min(settings.rag_chunk_overlap, chunk_size - 1), 0)
     blocks = preanalysis.get("blocks") if isinstance(preanalysis, dict) else None
     if not isinstance(blocks, list) or not blocks:
-        return _split_text_legacy(raw_text, paper_title=paper_title)
+        raise RuntimeError("Structured blocks unavailable for chunking")
 
     normalized_blocks: list[dict[str, Any]] = []
     for block in blocks:
         if not isinstance(block, dict):
             continue
-        raw_text = str(block.get("text") or "").strip()
-        if not raw_text:
+        raw_block_text = str(block.get("text") or "").strip()
+        if not raw_block_text:
             continue
         block_type = str(block.get("block_type") or "")
-        normalized_text = raw_text
+        normalized_text = raw_block_text
         if block_type not in {"table_caption", "table_like"} and not _block_is_table_body_candidate(block):
-            normalized_text = re.sub(r"\s+", " ", raw_text)
-        normalized_blocks.append({**block, "text": normalized_text})
+            normalized_text = re.sub(r"\s+", " ", raw_block_text)
+        section_id = str(block.get("section_id") or block.get("section_path") or "Document").strip() or "Document"
+        normalized_blocks.append({**block, "section_id": section_id, "text": normalized_text})
     if not normalized_blocks:
-        return _split_text_legacy(raw_text, paper_title=paper_title)
+        raise RuntimeError("Structured blocks unavailable for chunking")
 
-    document_text = " ".join(str(block.get("text") or "") for block in normalized_blocks[:80])
+    document_text = " ".join(str(block.get("text") or "") for block in normalized_blocks[:80] if str(block.get("block_type") or "") != "heading")
     document_is_cjk_dominant = _is_cjk_dominant_text(document_text)
     child_chunk_size = (
         min(chunk_size, max(int(chunk_size * 0.85), chunk_size - overlap, 320))
@@ -1403,6 +1432,10 @@ def _split_text(
         else min(chunk_size, max(min(chunk_size // 2, 500), 220))
     )
     chunks: list[dict[str, Any]] = []
+    parent_chunks_by_section: dict[str, dict[str, Any]] = {}
+    section_blocks: dict[str, list[dict[str, Any]]] = {}
+    for block in normalized_blocks:
+        section_blocks.setdefault(str(block.get("section_id") or "Document"), []).append(block)
     pending_blocks: list[dict[str, Any]] = []
     pending_length = 0
 
@@ -1417,6 +1450,7 @@ def _split_text(
         )
         if not chunk_body_text:
             return
+        parent_key = str(block_rows[0].get("section_id") or "Document") if block_rows else "Document"
         chunks.append(
             _make_chunk_record(
                 chunk_index=len(chunks),
@@ -1424,6 +1458,7 @@ def _split_text(
                 block_rows=list(block_rows),
                 paper_title=paper_title,
                 supporting_context_rows=supporting_context_rows,
+                parent_key=parent_key,
             )
         )
 
@@ -1455,6 +1490,10 @@ def _split_text(
         section_id = str(block.get("section_id") or "")
         pending_section_id = str(pending_blocks[0].get("section_id") or "") if pending_blocks else ""
         block_type = str(block.get("block_type") or "paragraph")
+        if block_type == "heading":
+            flush_pending()
+            block_index += 1
+            continue
         isolate_block = block_type in {"table_like", "table_caption", "figure_caption"}
 
         if pending_blocks and section_id != pending_section_id:
@@ -1534,7 +1573,37 @@ def _split_text(
 
     flush_pending()
     if not chunks:
-        return _split_text_legacy(raw_text, paper_title=paper_title)
+        raise RuntimeError("Structured blocks unavailable for chunking")
+    parent_records: list[dict[str, Any]] = []
+    for section_id, rows in section_blocks.items():
+        parent_rows = [row for row in rows if str(row.get("text") or "").strip()]
+        if not parent_rows:
+            continue
+        parent_body_text = "\n\n".join(str(row.get("text") or "").strip() for row in parent_rows if str(row.get("text") or "").strip())
+        if not parent_body_text:
+            continue
+        parent_record = _make_chunk_record(
+            chunk_index=len(chunks) + len(parent_records),
+            body_text=parent_body_text,
+            block_rows=parent_rows,
+            paper_title=paper_title,
+            chunk_role="parent",
+        )
+        parent_record["section_key"] = section_id
+        parent_chunks_by_section[section_id] = parent_record
+        parent_records.append(parent_record)
+    parent_text_by_section = {
+        section_id: str(parent_record["metadata_json"].get("body_text") or "")[:2200]
+        for section_id, parent_record in parent_chunks_by_section.items()
+    }
+    for chunk in chunks:
+        section_key = str(chunk.get("parent_key") or "")
+        if not section_key:
+            continue
+        parent_text = parent_text_by_section.get(section_key)
+        if parent_text:
+            chunk["metadata_json"]["parent_text"] = parent_text
+    chunks.extend(parent_records)
     return chunks
 
 
@@ -1546,7 +1615,7 @@ def _build_preanalysis_from_document_structure(db: Session, *, paper_id: int) ->
         .where(PaperDocumentBlock.paper_id == paper_id)
         .order_by(PaperDocumentBlock.block_index.asc(), PaperDocumentBlock.id.asc())
     ).all()
-    for row in db_blocks:
+    for fallback_index, row in enumerate(db_blocks):
         text_value = (row.text or "").strip()
         if not text_value:
             continue
@@ -1566,9 +1635,18 @@ def _build_preanalysis_from_document_structure(db: Session, *, paper_id: int) ->
                 "heading_level": row.heading_level or 1,
                 "block_type": row.block_type or "paragraph",
                 "docling_label": row.docling_label,
+                "reading_order": row.reading_order,
                 "char_start": char_start,
                 "char_end": char_end,
                 "text": text_value,
+                "bbox": row.bbox_json if isinstance(row.bbox_json, dict) else None,
+                "provenance": provenance or None,
+                "_sort_key": _structure_sort_key(
+                    reading_order=row.reading_order,
+                    page_number=page_number,
+                    fallback_group=0,
+                    fallback_index=fallback_index,
+                ),
             }
         )
 
@@ -1577,9 +1655,8 @@ def _build_preanalysis_from_document_structure(db: Session, *, paper_id: int) ->
         .where(PaperDocumentTable.paper_id == paper_id)
         .order_by(PaperDocumentTable.table_index.asc(), PaperDocumentTable.id.asc())
     ).all()
-    for table in tables:
-        parts = [str(table.caption or "").strip(), str(table.markdown or "").strip()]
-        text_value = "\n\n".join(part for part in parts if part)
+    for fallback_index, table in enumerate(tables):
+        text_value = _compose_table_text(caption=table.caption, markdown=table.markdown, data=table.data_json)
         if not text_value:
             continue
         char_start = char_cursor
@@ -1590,15 +1667,25 @@ def _build_preanalysis_from_document_structure(db: Session, *, paper_id: int) ->
                 "block_index": len(blocks),
                 "source_table_id": table.id,
                 "page_number": table.page_from or 1,
-                "section_id": "Tables",
-                "section_title": "Tables",
-                "section_path": "Tables",
-                "heading_level": 1,
+                "section_id": table.section_path or "Document",
+                "section_title": table.section_path or "Document",
+                "section_path": table.section_path or "Document",
+                "heading_level": table.heading_level or 1,
                 "block_type": "table_like",
+                "reading_order": table.reading_order,
                 "char_start": char_start,
                 "char_end": char_end,
                 "text": text_value,
                 "table_markdown": table.markdown,
+                "table_data_json": table.data_json,
+                "bbox": table.bbox_json if isinstance(table.bbox_json, dict) else None,
+                "provenance": table.provenance_json if isinstance(table.provenance_json, dict) else None,
+                "_sort_key": _structure_sort_key(
+                    reading_order=table.reading_order,
+                    page_number=table.page_from,
+                    fallback_group=1,
+                    fallback_index=fallback_index,
+                ),
             }
         )
 
@@ -1607,7 +1694,7 @@ def _build_preanalysis_from_document_structure(db: Session, *, paper_id: int) ->
         .where(PaperDocumentPicture.paper_id == paper_id)
         .order_by(PaperDocumentPicture.picture_index.asc(), PaperDocumentPicture.id.asc())
     ).all()
-    for picture in pictures:
+    for fallback_index, picture in enumerate(pictures):
         parts = [str(picture.caption or "").strip(), str(picture.description or "").strip()]
         text_value = "\n\n".join(part for part in parts if part)
         if not text_value:
@@ -1620,29 +1707,41 @@ def _build_preanalysis_from_document_structure(db: Session, *, paper_id: int) ->
                 "block_index": len(blocks),
                 "source_picture_id": picture.id,
                 "page_number": picture.page_number or 1,
-                "section_id": "Figures",
-                "section_title": "Figures",
-                "section_path": "Figures",
-                "heading_level": 1,
+                "section_id": picture.section_path or "Document",
+                "section_title": picture.section_path or "Document",
+                "section_path": picture.section_path or "Document",
+                "heading_level": picture.heading_level or 1,
                 "block_type": "figure_caption",
+                "reading_order": picture.reading_order,
                 "char_start": char_start,
                 "char_end": char_end,
                 "text": text_value,
                 "picture_description": picture.description,
+                "bbox": picture.bbox_json if isinstance(picture.bbox_json, dict) else None,
+                "provenance": picture.provenance_json if isinstance(picture.provenance_json, dict) else None,
+                "_sort_key": _structure_sort_key(
+                    reading_order=picture.reading_order,
+                    page_number=picture.page_number,
+                    fallback_group=2,
+                    fallback_index=fallback_index,
+                ),
             }
         )
-    return {"blocks": blocks} if blocks else None
+    sorted_blocks = sorted(blocks, key=lambda item: item.get("_sort_key", (1, 0, 99, int(item.get("block_index") or 0))))
+    for index, block in enumerate(sorted_blocks):
+        block["block_index"] = index
+        block.pop("_sort_key", None)
+    return {"blocks": sorted_blocks} if sorted_blocks else None
 
 
 def rebuild_paper_index(
     db: Session,
     *,
     paper_id: int,
-    raw_text: str,
     preanalysis: dict[str, Any] | None = None,
     paper_title: str | None = None,
 ) -> int:
-    chunks = _split_text(raw_text, preanalysis=preanalysis, paper_title=paper_title)
+    chunks = _split_text(preanalysis=preanalysis, paper_title=paper_title)
     embeddings: list[list[float]] = []
     if chunks and (settings.glm_api_key.strip() or settings.openai_api_key.strip()):
         try:
@@ -1651,19 +1750,33 @@ def rebuild_paper_index(
             embeddings = []
 
     db.execute(delete(PaperChunk).where(PaperChunk.paper_id == paper_id))
+    parent_chunk_ids_by_section: dict[str, int] = {}
+    child_rows: list[tuple[PaperChunk, str]] = []
     for index, chunk in enumerate(chunks):
-        db.add(
-            PaperChunk(
-                paper_id=paper_id,
-                chunk_index=chunk["chunk_index"],
-                content=chunk["content"],
-                embedding=embeddings[index] if index < len(embeddings) else None,
-                token_count=chunk["token_count"],
-                page_from=chunk["page_from"],
-                page_to=chunk["page_to"],
-                metadata_json=chunk["metadata_json"],
-            )
+        record = PaperChunk(
+            paper_id=paper_id,
+            parent_chunk_id=None,
+            chunk_index=chunk["chunk_index"],
+            chunk_role=str(chunk.get("chunk_role") or "child"),
+            content=chunk["content"],
+            embedding=embeddings[index] if index < len(embeddings) else None,
+            token_count=chunk["token_count"],
+            page_from=chunk["page_from"],
+            page_to=chunk["page_to"],
+            metadata_json=chunk["metadata_json"],
         )
+        db.add(record)
+        db.flush()
+        if record.chunk_role == "parent":
+            section_key = str(chunk.get("section_key") or chunk["metadata_json"].get("section_id") or "")
+            if section_key:
+                parent_chunk_ids_by_section[section_key] = int(record.id)
+        else:
+            child_rows.append((record, str(chunk.get("parent_key") or "")))
+    for record, section_key in child_rows:
+        parent_chunk_id = parent_chunk_ids_by_section.get(section_key)
+        if parent_chunk_id is not None:
+            record.parent_chunk_id = parent_chunk_id
     db.commit()
     if _is_postgres_session(db):
         db.execute(
@@ -1684,11 +1797,10 @@ def rebuild_paper_index_from_document_structure(
     db: Session,
     *,
     paper_id: int,
-    raw_text: str,
     paper_title: str | None = None,
 ) -> int:
     preanalysis = _build_preanalysis_from_document_structure(db, paper_id=paper_id)
-    return rebuild_paper_index(db, paper_id=paper_id, raw_text=raw_text, preanalysis=preanalysis, paper_title=paper_title)
+    return rebuild_paper_index(db, paper_id=paper_id, preanalysis=preanalysis, paper_title=paper_title)
 
 
 def _search_chunks(
@@ -1953,7 +2065,7 @@ def _build_evidence_candidates(
     if not results:
         return []
     max_score = max((float(result.score) for result in results), default=0.0)
-    include_supporting_context = _is_table_or_figure_query(query)
+    include_supporting_context = True
     total = len(results)
     candidates: list[dict[str, Any]] = []
     for rank, result in enumerate(results, start=1):

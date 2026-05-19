@@ -426,8 +426,8 @@ def rerank_documents(
     return _request_glm_rerank(query, documents, top_n=top_n)
 
 
-def summarize_paper_text(raw_text: str) -> dict:
-    text = (raw_text or "").strip()
+def summarize_paper_text(paper_text: str) -> dict:
+    text = (paper_text or "").strip()
     if not text:
         raise RuntimeError("论文文本为空，无法生成摘要")
 
@@ -457,12 +457,12 @@ def summarize_paper_text(raw_text: str) -> dict:
 
 
 def answer_question_set_questions(
-    raw_text: str,
+    paper_text: str,
     *,
     structured_summary: dict | None,
     questions: Sequence[dict[str, str]],
 ) -> dict:
-    text = (raw_text or "").strip()
+    text = (paper_text or "").strip()
     if not text:
         raise RuntimeError("论文文本为空，无法生成问题集结果")
     if not questions:

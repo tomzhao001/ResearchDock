@@ -56,12 +56,13 @@ def test_chat_topic_roundtrip_with_knowledge_base_citations(client, user, db_ses
     chunk = PaperChunk(
         paper_id=paper.id,
         chunk_index=0,
+        chunk_role="child",
         content="transformer attention method improves translation accuracy and training stability",
         embedding=None,
         token_count=9,
-        page_from=None,
-        page_to=None,
-        metadata_json={"char_start": 0, "char_end": 78},
+        page_from=3,
+        page_to=3,
+        metadata_json={"char_start": 0, "char_end": 78, "section_path": "Methods", "body_text": "transformer attention method improves translation accuracy and training stability"},
     )
     db_session.add(chunk)
     db_session.commit()
@@ -89,6 +90,8 @@ def test_chat_topic_roundtrip_with_knowledge_base_citations(client, user, db_ses
     assert body["assistant_message"]["citations"][0]["paper_title"] == "Transformer Paper"
     assert body["assistant_message"]["citations"][0]["evidence_id"] == f"chunk-{chunk.id}"
     assert body["assistant_message"]["citations"][0]["support_score"] is not None
+    assert body["assistant_message"]["citations"][0]["section_path"] == "Methods"
+    assert body["assistant_message"]["citations"][0]["page_from"] == 3
     assert body["topic"]["title"] != "新话题"
 
     messages_response = client.get(f"/api/chat/topics/{topic_id}/messages")

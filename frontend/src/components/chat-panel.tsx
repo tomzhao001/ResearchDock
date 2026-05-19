@@ -330,6 +330,17 @@ export function ChatPanel() {
                     {message.citations.map((citation) => (
                       <div key={citation.chunk_id} className="rounded-2xl bg-slate-50 px-4 py-3 text-sm text-slate-600 ring-1 ring-slate-200">
                         <p className="font-medium text-slate-700">{citation.paper_title || `论文 #${citation.paper_id}`}</p>
+                        <div className="mt-1 flex flex-wrap gap-3 text-xs text-slate-500">
+                          {citation.section_path ? <span>章节：{citation.section_path}</span> : null}
+                          {citation.page_from !== null ? (
+                            <span>
+                              页码：
+                              {citation.page_to !== null && citation.page_to !== citation.page_from
+                                ? `${citation.page_from}-${citation.page_to}`
+                                : citation.page_from}
+                            </span>
+                          ) : null}
+                        </div>
                         <p className="mt-1 whitespace-pre-wrap leading-6">{citation.snippet}</p>
                         <div className="mt-2 flex flex-wrap gap-3 text-xs text-slate-500">
                           {citation.source_url ? <span>{citation.source_url}</span> : null}

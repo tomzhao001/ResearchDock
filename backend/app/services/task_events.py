@@ -27,8 +27,8 @@ def get_task_status_channel(organization_id: int) -> str:
     return f"{TASK_STATUS_CHANNEL}:{organization_id}"
 
 
-def _build_paper_detail_response(detail) -> PaperDetailResponse:
-    from app.services.papers import get_job_phase_status, get_original_filename
+def _build_paper_detail_response(detail, *, db: Session) -> PaperDetailResponse:
+    from app.services.papers import get_job_phase_status, get_original_filename, render_paper_text_from_structure
 
     metadata = detail.asset.metadata_json if detail.asset else None
     extraction_metadata = None
@@ -62,7 +62,7 @@ def _build_paper_detail_response(detail) -> PaperDetailResponse:
         created_at=detail.paper.created_at,
         updated_at=detail.paper.updated_at,
         original_filename=get_original_filename(detail.asset),
-        preview_text=detail.asset.raw_text if detail.asset else None,
+        preview_text=render_paper_text_from_structure(db, detail.paper.id),
         extraction_metadata=extraction_metadata if isinstance(extraction_metadata, dict) else None,
         structured_summary=structured_summary if isinstance(structured_summary, dict) else None,
         question_set_extraction=question_set_extraction,
@@ -107,7 +107,7 @@ def build_task_status_event(db: Session, *, paper_id: int, job_id: int | None = 
     if job is None:
         job = db.scalar(select(Job).where(Job.paper_id == paper_id, Job.deleted_at.is_(None)).order_by(Job.id.desc()).limit(1))
 
-    detail_response = _build_paper_detail_response(detail)
+    detail_response = _build_paper_detail_response(detail, db=db)
     return TaskStatusEvent(
         paper_id=paper_id,
         job_id=job.id if job else None,

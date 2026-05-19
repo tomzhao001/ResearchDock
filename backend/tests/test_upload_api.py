@@ -77,10 +77,25 @@ class SuccessfulTextExtractor:
             blocks=[
                 ExtractedBlock(
                     block_index=0,
+                    text="Document",
+                    block_type="heading",
+                    page_number=1,
+                    section_path="Document",
+                    heading_level=1,
+                    reading_order=0,
+                    bbox={"x0": 0, "y0": 0, "x1": 120, "y1": 20},
+                    provenance={"page_number": 1},
+                ),
+                ExtractedBlock(
+                    block_index=1,
                     text="This is extracted directly from the embedded text layer.",
                     block_type="paragraph",
                     page_number=1,
                     section_path="Document",
+                    heading_level=1,
+                    reading_order=1,
+                    bbox={"x0": 0, "y0": 24, "x1": 240, "y1": 80},
+                    provenance={"page_number": 1},
                 )
             ],
         )
@@ -275,18 +290,21 @@ def test_upload_creates_records_and_completes_job(
     assert paper.published_at is not None
     assert paper.published_at.date().isoformat() == "2024-05-01"
     assert asset is not None
-    assert "embedded text layer" in (asset.raw_text or "")
+    assert asset.raw_text is None
     assert isinstance(asset.metadata_json, dict)
     assert asset.metadata_json["extraction"]["engine"] == "docling"
     assert asset.metadata_json["extraction"]["block_count"] >= 1
     assert asset.metadata_json["structured_summary"]["doi"] == "10.1000/researchdock"
     assert asset.metadata_json["question_set_extraction"]["questions"][0]["id"] == "q1"
-    assert len(chunks) > 0
-    assert chunks[0].content
-    assert chunks[0].page_from == 1
-    assert isinstance(chunks[0].metadata_json, dict)
-    assert chunks[0].metadata_json["section_title"] in {"Front Matter", "Document"}
-    assert chunks[0].metadata_json["context_header"]
+    child_chunks = [chunk for chunk in chunks if chunk.chunk_role == "child"]
+    parent_chunks = [chunk for chunk in chunks if chunk.chunk_role == "parent"]
+    assert child_chunks and parent_chunks
+    assert child_chunks[0].content
+    assert child_chunks[0].page_from == 1
+    assert child_chunks[0].parent_chunk_id is not None
+    assert isinstance(child_chunks[0].metadata_json, dict)
+    assert child_chunks[0].metadata_json["section_title"] in {"Front Matter", "Document"}
+    assert child_chunks[0].metadata_json["context_header"]
 
     job_response = client.get(f"/api/jobs/{job.id}")
     assert job_response.status_code == 200

@@ -40,7 +40,9 @@ ALLOWED_PDF_MIME_TYPES = {
 }
 
 
-def build_paper_detail_response(detail) -> PaperDetailResponse:
+def build_paper_detail_response(detail, *, db: Session) -> PaperDetailResponse:
+    from app.services.papers import render_paper_text_from_structure
+
     metadata = detail.asset.metadata_json if detail.asset else None
     extraction_metadata = None
     structured_summary = None
@@ -73,7 +75,7 @@ def build_paper_detail_response(detail) -> PaperDetailResponse:
         created_at=detail.paper.created_at,
         updated_at=detail.paper.updated_at,
         original_filename=get_original_filename(detail.asset),
-        preview_text=detail.asset.raw_text if detail.asset else None,
+        preview_text=render_paper_text_from_structure(db, detail.paper.id),
         extraction_metadata=extraction_metadata if isinstance(extraction_metadata, dict) else None,
         structured_summary=structured_summary if isinstance(structured_summary, dict) else None,
         question_set_extraction=question_set_extraction,
@@ -122,7 +124,7 @@ def get_paper(
     detail = get_paper_detail(db, paper_id, organization_id=context.organization.id)
     if detail is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Paper not found")
-    return build_paper_detail_response(detail)
+    return build_paper_detail_response(detail, db=db)
 
 
 @router.patch("/{paper_id}", response_model=PaperDetailResponse)
@@ -144,7 +146,7 @@ def patch_paper(
 
     if detail is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Paper not found")
-    return build_paper_detail_response(detail)
+    return build_paper_detail_response(detail, db=db)
 
 
 @router.delete("/{paper_id}", response_model=MessageResponse)
