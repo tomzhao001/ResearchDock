@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import ChatMessage, ChatTopic, Paper, PaperChunk, User
-from app.services.llm import chat_with_messages, embed_texts, rerank_documents
+from app.services.llm import chat_with_messages, embed_texts, get_chat_llm_configuration, rerank_documents
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +65,20 @@ QUERY_PLAN_USER_TEMPLATE = """
 用户问题：
 {query}
 """.strip()
+
+_QUERY_TEMPLATE_RULES: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
+    (re.compile(r"(研究设计|试验设计|研究方法)"), ("study design",)),
+    (re.compile(r"(主要结局|主要终点|主要结局指标)"), ("primary outcome measure",)),
+    (re.compile(r"(年龄范围|年龄段|纳入.*年龄)"), ("age range",)),
+    (re.compile(r"(样本量|受试者|参与者)"), ("sample size", "participants")),
+    (re.compile(r"(完成研究|最终完成)"), ("completed participants",)),
+    (re.compile(r"(干预|刺激|治疗)"), ("intervention",)),
+    (re.compile(r"(对照组|对照条件|安慰剂|假刺激)"), ("control group",)),
+    (re.compile(r"(量表)"), ("scale",)),
+    (re.compile(r"(副作用|不良反应|安全性)"), ("adverse events", "side effects")),
+    (re.compile(r"(显著性|p值|p-value|P值)"), ("p-value", "statistical significance")),
+    (re.compile(r"(基线)"), ("baseline",)),
+)
 
 EVIDENCE_SELECTION_SYSTEM_PROMPT = (
     "你是 ResearchDock 的归因证据选择器。"
@@ -148,7 +162,13 @@ class RetrievalQueryPlan:
     subqueries_en: tuple[str, ...]
     variants: tuple[RetrievalQueryVariant, ...]
     rewrite_status: str
+    llm_rewrite_status: str
     used_llm: bool
+    llm_attempted: bool
+    rewrite_provider: str | None
+    rewrite_model: str | None
+    fallback_source: str | None
+    rewrite_error: str | None
 
 
 @dataclass(frozen=True)
@@ -330,7 +350,8 @@ def _detect_query_language(text: str) -> str:
 def _llm_available_for_query_rewrite() -> bool:
     if not settings.rag_crosslingual_query_rewrite_enabled:
         return False
-    return bool(settings.glm_api_key.strip() or settings.openai_api_key.strip())
+    llm_config = get_chat_llm_configuration()
+    return bool(llm_config.get("configured"))
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:
@@ -358,6 +379,48 @@ def _default_generation_instruction(language: str) -> str:
     if language in {"zh", "mixed"}:
         return "请用中文回答，保留关键英文术语原文，并引用英文证据。"
     return "请使用与用户提问一致的语言回答，并在必要时保留英文术语原文。"
+
+
+def _summarize_exception_message(exc: Exception, *, limit: int = 160) -> str:
+    message = f"{exc.__class__.__name__}: {exc}"
+    compact = re.sub(r"\s+", " ", message).strip()
+    if len(compact) <= limit:
+        return compact
+    return f"{compact[: limit - 3].rstrip()}..."
+
+
+def _extract_bilingual_structural_terms(query: str) -> list[str]:
+    terms: list[str] = []
+    if re.search(r"(显著性|p值|P值)", query or ""):
+        terms.append("p-value")
+    if re.search(r"(基线)", query or ""):
+        terms.append("baseline")
+    if re.search(r"(量表)", query or ""):
+        terms.append("scale")
+    for match in re.finditer(r"表\s*(\d+)", query or ""):
+        terms.append(f"Table {match.group(1)}")
+    for match in re.finditer(r"图\s*(\d+)", query or ""):
+        terms.append(f"Figure {match.group(1)}")
+    return _unique_strings(terms)
+
+
+def _extract_template_rule_terms(query: str) -> list[str]:
+    terms: list[str] = []
+    for pattern, mapped_terms in _QUERY_TEMPLATE_RULES:
+        if pattern.search(query or ""):
+            terms.extend(mapped_terms)
+    return _unique_strings(terms)
+
+
+def _build_heuristic_retrieval_query_en(query: str, exact_terms: list[str]) -> tuple[str, str | None]:
+    english_terms = [term for term in exact_terms if re.search(r"[A-Za-z]", term)]
+    template_terms = _extract_template_rule_terms(query)
+    structural_terms = _extract_bilingual_structural_terms(query)
+    combined_terms = _unique_strings([*english_terms, *template_terms, *structural_terms])
+    if not combined_terms:
+        return "", None
+    fallback_source = "template_rules" if template_terms or structural_terms else "exact_terms"
+    return _normalize_query_text(" ".join(combined_terms[:8])), fallback_source
 
 
 def _llm_available_for_grounding() -> bool:
@@ -429,7 +492,13 @@ def _serialize_query_plan(plan: RetrievalQueryPlan) -> dict[str, Any]:
         "retrieval_query_en": plan.retrieval_query_en,
         "subqueries_en": list(plan.subqueries_en),
         "rewrite_status": plan.rewrite_status,
+        "llm_rewrite_status": plan.llm_rewrite_status,
         "used_llm": plan.used_llm,
+        "llm_attempted": plan.llm_attempted,
+        "rewrite_provider": plan.rewrite_provider,
+        "rewrite_model": plan.rewrite_model,
+        "fallback_source": plan.fallback_source,
+        "rewrite_error": plan.rewrite_error,
         "variants": [
             {
                 "name": variant.name,
@@ -452,19 +521,29 @@ def _build_crosslingual_query_plan(query: str) -> RetrievalQueryPlan:
     exact_terms = _unique_strings(_extract_exact_match_terms(original_query))
     generation_instruction = _default_generation_instruction(detected_language)
     rewrite_status = "not_needed"
+    llm_rewrite_status = "not_needed"
     used_llm = False
+    llm_attempted = False
+    rewrite_provider: str | None = None
+    rewrite_model: str | None = None
+    fallback_source: str | None = None
+    rewrite_error: str | None = None
 
     if detected_language in {"zh", "mixed"}:
-        rewrite_status = "fallback_only"
+        llm_config = get_chat_llm_configuration()
+        rewrite_provider = str(llm_config.get("provider") or "") or None
+        llm_rewrite_status = "not_attempted_config_unavailable"
         if _llm_available_for_query_rewrite():
+            llm_attempted = True
             rewrite_started_at = time.perf_counter()
             logger.info(
-                "RAG query rewrite started: language=%s query=%s",
+                "RAG query rewrite started: language=%s provider=%s query=%s",
                 detected_language,
+                rewrite_provider or "-",
                 _preview_log_text(original_query),
             )
             try:
-                content, _ = chat_with_messages(
+                content, rewrite_model = chat_with_messages(
                     [
                         {"role": "system", "content": QUERY_PLAN_SYSTEM_PROMPT},
                         {
@@ -477,42 +556,64 @@ def _build_crosslingual_query_plan(query: str) -> RetrievalQueryPlan:
                     ],
                     temperature=0.0,
                 )
-                payload = _parse_json_object(content)
-                retrieval_query_en = _normalize_query_text(str(payload.get("retrieval_query_en") or ""))
-                subqueries_en = _unique_strings(payload.get("subqueries_en") or [])[: settings.rag_crosslingual_max_subqueries]
-                exact_terms = _unique_strings(
-                    [
-                        *exact_terms,
-                        *(payload.get("exact_terms") or []),
-                        *_extract_exact_match_terms(retrieval_query_en),
-                    ]
-                )
-                generation_instruction = _normalize_query_text(
-                    str(payload.get("generation_instruction") or generation_instruction)
-                ) or generation_instruction
-                rewrite_status = "llm_rewritten"
-                used_llm = True
-                logger.info(
-                    "RAG query rewrite finished: language=%s status=%s retrieval_query_en=%s subqueries=%s elapsed=%.2fs",
-                    detected_language,
-                    rewrite_status,
-                    _preview_log_text(retrieval_query_en),
-                    len(subqueries_en),
-                    time.perf_counter() - rewrite_started_at,
-                )
             except Exception as exc:
-                rewrite_status = "llm_failed_fallback"
+                llm_rewrite_status = "llm_failed_http_or_provider"
+                rewrite_error = _summarize_exception_message(exc)
                 logger.warning(
-                    "RAG query rewrite failed, falling back: language=%s error=%s elapsed=%.2fs",
+                    "RAG query rewrite request failed: language=%s provider=%s error=%s elapsed=%.2fs",
                     detected_language,
-                    exc,
+                    rewrite_provider or "-",
+                    rewrite_error,
                     time.perf_counter() - rewrite_started_at,
                 )
+            else:
+                try:
+                    payload = _parse_json_object(content)
+                except Exception as exc:
+                    llm_rewrite_status = "llm_failed_parse"
+                    rewrite_error = _summarize_exception_message(exc)
+                    logger.warning(
+                        "RAG query rewrite parse failed: language=%s provider=%s error=%s elapsed=%.2fs",
+                        detected_language,
+                        rewrite_provider or "-",
+                        rewrite_error,
+                        time.perf_counter() - rewrite_started_at,
+                    )
+                else:
+                    retrieval_query_en = _normalize_query_text(str(payload.get("retrieval_query_en") or ""))
+                    subqueries_en = _unique_strings(payload.get("subqueries_en") or [])[
+                        : settings.rag_crosslingual_max_subqueries
+                    ]
+                    exact_terms = _unique_strings(
+                        [
+                            *exact_terms,
+                            *(payload.get("exact_terms") or []),
+                            *_extract_exact_match_terms(retrieval_query_en),
+                        ]
+                    )
+                    generation_instruction = _normalize_query_text(
+                        str(payload.get("generation_instruction") or generation_instruction)
+                    ) or generation_instruction
+                    rewrite_status = "llm_rewritten"
+                    llm_rewrite_status = "llm_rewritten"
+                    used_llm = True
+                    rewrite_error = None
+                    logger.info(
+                        "RAG query rewrite finished: language=%s provider=%s status=%s retrieval_query_en=%s subqueries=%s elapsed=%.2fs",
+                        detected_language,
+                        rewrite_provider or "-",
+                        rewrite_status,
+                        _preview_log_text(retrieval_query_en),
+                        len(subqueries_en),
+                        time.perf_counter() - rewrite_started_at,
+                    )
         if not retrieval_query_en:
-            english_terms = [term for term in exact_terms if re.search(r"[A-Za-z]", term)]
-            retrieval_query_en = _normalize_query_text(" ".join(english_terms))
+            retrieval_query_en, fallback_source = _build_heuristic_retrieval_query_en(original_query, exact_terms)
             if retrieval_query_en:
-                rewrite_status = "heuristic_terms"
+                rewrite_status = "heuristic_template" if fallback_source == "template_rules" else "heuristic_terms"
+            else:
+                fallback_source = "none"
+                rewrite_status = "fallback_empty"
 
     rerank_query = retrieval_query_en or original_query
     variants = _query_variants_for_plan(
@@ -531,7 +632,13 @@ def _build_crosslingual_query_plan(query: str) -> RetrievalQueryPlan:
         subqueries_en=tuple(subqueries_en),
         variants=tuple(variants),
         rewrite_status=rewrite_status,
+        llm_rewrite_status=llm_rewrite_status,
         used_llm=used_llm,
+        llm_attempted=llm_attempted,
+        rewrite_provider=rewrite_provider,
+        rewrite_model=rewrite_model,
+        fallback_source=fallback_source,
+        rewrite_error=rewrite_error,
     )
 
 
@@ -1660,7 +1767,16 @@ def _search_chunks(
                 limit=max(settings.rag_rerank_top_n, limit),
             )
             rerank_status = "applied"
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "Rerank failed, falling back to fused order: user_query=%s rerank_query=%s fused_count=%s rerank_limit=%s error=%s",
+                _preview_log_text(query, limit=200),
+                _preview_log_text(query_plan.rerank_query, limit=200),
+                len(fused_candidates),
+                max(settings.rag_rerank_top_n, limit),
+                exc,
+                exc_info=True,
+            )
             reranked_candidates = fused_candidates[: max(settings.rag_rerank_top_n, limit)]
             rerank_status = "fallback_to_fused"
             rerank_error = "rerank_failed"

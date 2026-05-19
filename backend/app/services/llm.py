@@ -98,6 +98,39 @@ def is_chat_llm_configured() -> bool:
     return bool(settings.openai_api_key.strip() and (settings.openai_base_url or "").strip())
 
 
+def get_chat_llm_configuration() -> dict[str, str | bool | None]:
+    """Describe the resolved chat provider and whether it is actually callable."""
+    try:
+        provider = _get_llm_provider()
+    except RuntimeError as exc:
+        return {
+            "provider": None,
+            "configured": False,
+            "model": None,
+            "base_url": None,
+            "reason": str(exc),
+        }
+
+    if provider == "glm":
+        base_url = (settings.glm_base_url or "").strip()
+        model = (settings.glm_model or "").strip() or settings.openai_model
+        configured = bool(settings.glm_api_key.strip() and base_url)
+        reason = None if configured else "glm_chat_config_incomplete"
+    else:
+        base_url = (settings.openai_base_url or "").strip()
+        model = settings.openai_model
+        configured = bool(settings.openai_api_key.strip() and base_url)
+        reason = None if configured else "openai_chat_config_incomplete"
+
+    return {
+        "provider": provider,
+        "configured": configured,
+        "model": model,
+        "base_url": base_url or None,
+        "reason": reason,
+    }
+
+
 def _build_chat_completions_url(base_url: str) -> str:
     normalized = (base_url or "").strip().rstrip("/")
     if not normalized:

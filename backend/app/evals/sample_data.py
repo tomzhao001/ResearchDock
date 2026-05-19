@@ -230,6 +230,14 @@ def _summarize_groups(
     return summary
 
 
+def _count_groups(items: list[dict[str, Any]], key_fn: Callable[[dict[str, Any]], Any]) -> dict[str, dict[str, int]]:
+    grouped: dict[str, int] = {}
+    for item in items:
+        key = str(key_fn(item))
+        grouped[key] = grouped.get(key, 0) + 1
+    return {key: {"count": count} for key, count in sorted(grouped.items())}
+
+
 def _first_hit_rank(candidates: list[dict[str, Any]], gold_set: set[int]) -> int | None:
     return next(
         (
@@ -617,6 +625,11 @@ def evaluate_retrieval(
             max_k=max_k,
             gold_chunk_count=len(resolved.gold_chunk_ids),
         )
+        query_plan = retrieval_trace.get("query_plan") if isinstance(retrieval_trace.get("query_plan"), dict) else {}
+        rewrite_status = str(query_plan.get("rewrite_status") or "unknown")
+        llm_rewrite_status = str(query_plan.get("llm_rewrite_status") or "unknown")
+        fallback_source = str(query_plan.get("fallback_source") or "none")
+        rewrite_provider = str(query_plan.get("rewrite_provider") or "unknown")
         row = {
             "q_id": resolved.question.q_id,
             "question": resolved.question.question,
@@ -645,6 +658,10 @@ def evaluate_retrieval(
             "variant_hit_ranks": variant_hit_ranks,
             "likely_failure_stage": likely_failure_stage,
             "chunking_risk": len(resolved.gold_chunk_ids) > 1,
+            "rewrite_status": rewrite_status,
+            "llm_rewrite_status": llm_rewrite_status,
+            "fallback_source": fallback_source,
+            "rewrite_provider": rewrite_provider,
             "retrieval_trace": retrieval_trace,
         }
         for k in k_values:
@@ -682,6 +699,21 @@ def evaluate_retrieval(
             key_fn=lambda row: row["language"],
             score_fns={"hit@10": lambda row: 1.0 if row.get("hit@10") else 0.0, "mrr": lambda row: float(row["mrr"])},
         ),
+        "by_rewrite_status": _summarize_groups(
+            rows,
+            key_fn=lambda row: row.get("rewrite_status") or "unknown",
+            score_fns={"hit@10": lambda row: 1.0 if row.get("hit@10") else 0.0, "mrr": lambda row: float(row["mrr"])},
+        ),
+        "by_llm_rewrite_status": _summarize_groups(
+            rows,
+            key_fn=lambda row: row.get("llm_rewrite_status") or "unknown",
+            score_fns={"hit@10": lambda row: 1.0 if row.get("hit@10") else 0.0, "mrr": lambda row: float(row["mrr"])},
+        ),
+        "by_fallback_source": _summarize_groups(
+            rows,
+            key_fn=lambda row: row.get("fallback_source") or "none",
+            score_fns={"hit@10": lambda row: 1.0 if row.get("hit@10") else 0.0, "mrr": lambda row: float(row["mrr"])},
+        ),
         "by_failure_stage": {
             key: {"count": len(values)}
             for key, values in {
@@ -689,6 +721,8 @@ def evaluate_retrieval(
                 for stage in sorted({str(row.get("likely_failure_stage") or "unknown") for row in rows})
             }.items()
         },
+        "rewrite_status_counts": _count_groups(rows, key_fn=lambda row: row.get("rewrite_status") or "unknown"),
+        "llm_rewrite_status_counts": _count_groups(rows, key_fn=lambda row: row.get("llm_rewrite_status") or "unknown"),
     }
     logger.info(
         "Retrieval evaluation finished: completed=%s skipped=%s hit@10=%.4f mrr=%.4f",
