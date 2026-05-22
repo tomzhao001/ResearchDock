@@ -229,7 +229,11 @@ data/files/
 data/models/
 
 # Benchmark / eval generated reports (regenerate: backend/ → python -m scripts.sample_data_eval --output reports/...)
-backend/reports/
+backend/reports/*.json
+backend/*.log
+
+# Parallel research raw dumps (regeneratable; see docs/research/)
+docs/research/*.json
 
 # Cursor IDE
 .specstory/

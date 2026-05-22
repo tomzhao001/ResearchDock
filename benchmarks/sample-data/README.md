@@ -38,3 +38,9 @@
 python -m scripts.sample_data_eval --mode retrieval --subset smoke
 python -m scripts.sample_data_eval --mode both --subset full --output reports/sample-data-report.json
 ```
+
+### 报告输出路径
+
+- 所有 benchmark 报告写入 `backend/reports/`（已在 `.gitignore` 中忽略）。
+- **不要**将 `--output` 指向 `backend/` 根目录；若只传文件名（如 `--output smoke.json`），脚本会自动写入 `reports/smoke.json`。
+- 建议命名：`reports/smoke-<描述>.json`、`reports/full-benchmark-<YYYYMMDD>.json`、`reports/full-retrieval-<YYYYMMDD>.json`。

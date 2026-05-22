@@ -195,11 +195,26 @@ python -m scripts.sample_data_eval --mode e2e --subset smoke --question-id zh_06
 python -m scripts.sample_data_eval --mode retrieval --subset full --question-id cross_093 --timeout-seconds 180
 ```
 
+**结果落盘（benchmark 报告）：**
+
+- 报告应写入 `backend/reports/`，**不要**放在 `backend/` 根目录。
+- `reports/` 已在 `.gitignore` 中忽略，可随时重跑生成。
+- 只写文件名时，脚本会自动落到 `reports/` 下（例如 `--output smoke.json` → `reports/smoke.json`）。
+
+```bash
+# smoke 快速验证
+python -m scripts.sample_data_eval --mode both --subset smoke --output reports/smoke-20260522.json
+
+# full 全量 benchmark（建议带日期后缀便于对比）
+python -m scripts.sample_data_eval --mode both --subset full --output reports/full-benchmark-20260522.json
+python -m scripts.sample_data_eval --mode retrieval --subset full --output reports/full-retrieval-20260522.json
+```
+
 说明：
 
 - `--question-id` 只会运行当前 `subset` 内的单个问题；若题号不在当前子集，会直接报错。
 - `--timeout-seconds` 仅在单题模式下生效；传 `0` 或负数表示不启用单题超时。
-- 若想把结果落盘，可继续配合 `--output path/to/report.json` 使用。
+- 更多 benchmark 数据与字段说明见 [`benchmarks/sample-data/README.md`](benchmarks/sample-data/README.md)。
 
 ---
 

@@ -17,6 +17,16 @@ from app.evals.sample_data import run_sample_data_evaluation
 
 logger = logging.getLogger(__name__)
 _DEFAULT_SINGLE_RUN_TIMEOUT_SECONDS = 600
+_REPORTS_DIR = Path("reports")
+
+
+def _resolve_output_path(output: Path) -> Path:
+    """Relative paths without a parent dir go under reports/ (not backend root)."""
+    if output.is_absolute():
+        return output
+    if output.parent == Path("."):
+        return _REPORTS_DIR / output.name
+    return output
 
 
 def parse_args() -> argparse.Namespace:
@@ -194,9 +204,10 @@ def main() -> None:
     logger.info("Evaluation finished in %.2fs", time.perf_counter() - started_at)
     content = json.dumps(report, ensure_ascii=False, indent=2)
     if args.output is not None:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(content, encoding="utf-8")
-        logger.info("Evaluation report written to %s", args.output)
+        output_path = _resolve_output_path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(content, encoding="utf-8")
+        logger.info("Evaluation report written to %s", output_path)
     try:
         print(content)
     except UnicodeEncodeError:
