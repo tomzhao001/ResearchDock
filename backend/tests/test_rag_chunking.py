@@ -9,6 +9,7 @@ from app.services.rag import (
     _boost_exact_match_candidates,
     _build_evidence_candidates,
     _build_crosslingual_query_plan,
+    _build_rerank_context_for_chunk,
     _extract_exact_match_terms,
     _is_exact_match_heavy_query,
     _select_claim_supporting_evidence,
@@ -333,6 +334,82 @@ def test_boost_exact_match_candidates_demotes_caption_only_for_table_queries() -
 
     assert boosted[0]["chunk_id"] == 2
     assert boosted[0]["exact_match_bonus"] > boosted[1]["exact_match_bonus"]
+
+
+def test_build_rerank_context_for_table_prefers_caption_and_matching_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.config.settings.rerank_max_context_chars", 220)
+    monkeypatch.setattr("app.config.settings.rerank_max_evidence_blocks", 3)
+    monkeypatch.setattr("app.config.settings.rerank_neighbor_blocks", 1)
+    chunk = PaperChunk(
+        id=101,
+        paper_id=7,
+        chunk_index=3,
+        content="论文标题: Demo\n\nTable 2 full chunk",
+        embedding=None,
+        token_count=12,
+        page_from=1,
+        page_to=1,
+        metadata_json={
+            "context_header": "论文标题: Demo\n章节: Results\n页码: 1",
+            "body_text": "Table 2 full chunk",
+            "source_table_ids": [11],
+        },
+    )
+    table_block = {
+        "block_index": 4,
+        "section_id": "results",
+        "section_path": "Results",
+        "block_type": "table_like",
+        "text": "Table 2 Working memory outcomes\nMeasure: backward digit span; Stimulation: 0.038\nMeasure: forward digit span; Stimulation: 0.81",
+        "source_table_id": 11,
+        "table_data_json": [
+            {"Measure": "backward digit span", "Stimulation": "0.038"},
+            {"Measure": "forward digit span", "Stimulation": "0.81"},
+        ],
+    }
+    catalog = {
+        "blocks": [table_block],
+        "by_block_index": {4: table_block},
+        "by_source_block_id": {},
+        "by_source_table_id": {11: table_block},
+        "by_source_picture_id": {},
+    }
+
+    context, meta = _build_rerank_context_for_chunk(
+        "Table 2 里 backward digit span 那一行的 Stimulation p-value 是多少？",
+        chunk=chunk,
+        catalog=catalog,
+    )
+
+    assert "Table 2 Working memory outcomes" in context
+    assert "backward digit span" in context
+    assert "0.038" in context
+    assert meta["rerank_context_chars"] <= 220
+    assert meta["rerank_evidence_blocks"] >= 2
+    assert "table_row" in meta["rerank_evidence_types"]
+
+
+def test_build_rerank_context_falls_back_to_truncated_chunk_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.config.settings.rerank_max_context_chars", 80)
+    chunk = PaperChunk(
+        id=102,
+        paper_id=7,
+        chunk_index=4,
+        content="论文标题: Demo\n\n" + ("Alpha finding sentence. " * 20),
+        embedding=None,
+        token_count=40,
+        page_from=1,
+        page_to=1,
+        metadata_json={
+            "context_header": "论文标题: Demo\n章节: Results\n页码: 1",
+            "body_text": "Alpha finding sentence. " * 20,
+        },
+    )
+
+    context, meta = _build_rerank_context_for_chunk("What is the main finding?", chunk=chunk, catalog=None)
+
+    assert len(context) <= 80
+    assert meta["rerank_context_truncated"] is True
 
 
 def test_claim_level_evidence_selection_supports_crosslingual_query(monkeypatch: pytest.MonkeyPatch) -> None:

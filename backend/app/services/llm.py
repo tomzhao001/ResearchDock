@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -10,6 +11,8 @@ import httpx
 
 from app.config import settings
 from app.services.http_clients import get_shared_http_client
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_SYSTEM_PROMPT = (
     "你是 ResearchDock 的研究助理。"
@@ -208,6 +211,52 @@ def _post_json(
     return response.json()
 
 
+def _parse_http_error_payload(exc: httpx.HTTPStatusError) -> tuple[str | None, str | None]:
+    response = exc.response
+    if response is None:
+        return None, None
+    try:
+        payload = response.json()
+    except Exception:
+        return None, (response.text or "").strip()[:500] or None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(error, dict):
+        code = str(error.get("code") or "").strip() or None
+        message = str(error.get("message") or "").strip() or None
+        return code, message
+    return None, (response.text or "").strip()[:500] or None
+
+
+def _log_http_status_error(
+    exc: httpx.HTTPStatusError,
+    *,
+    operation: str,
+    payload_summary: dict[str, object],
+) -> None:
+    status_code = exc.response.status_code if exc.response is not None else None
+    code, message = _parse_http_error_payload(exc)
+    logger.warning(
+        "%s failed with HTTP status: status_code=%s error_code=%s error_message=%s payload_summary=%s",
+        operation,
+        status_code,
+        code,
+        message,
+        payload_summary,
+    )
+
+
+def _clean_embedding_inputs(texts: Sequence[str]) -> list[str]:
+    return [str(item).strip() for item in texts if str(item or "").strip()]
+
+
+def _batched_texts(items: Sequence[str], *, batch_size: int) -> list[list[str]]:
+    normalized_batch_size = max(int(batch_size), 1)
+    return [
+        list(items[start : start + normalized_batch_size])
+        for start in range(0, len(items), normalized_batch_size)
+    ]
+
+
 def _request_chat_completion(
     messages: Sequence[dict[str, str]],
     *,
@@ -272,7 +321,7 @@ def _request_chat_completion(
 
 
 def _request_openai_embeddings(inputs: Sequence[str]) -> list[list[float]]:
-    cleaned_inputs = [item.strip() for item in inputs if item and item.strip()]
+    cleaned_inputs = _clean_embedding_inputs(inputs)
     if not cleaned_inputs:
         return []
     if not settings.openai_api_key.strip():
@@ -304,7 +353,7 @@ def _request_openai_embeddings(inputs: Sequence[str]) -> list[list[float]]:
 
 
 def _request_glm_embeddings(inputs: Sequence[str]) -> list[list[float]]:
-    cleaned_inputs = [item.strip() for item in inputs if item and item.strip()]
+    cleaned_inputs = _clean_embedding_inputs(inputs)
     if not cleaned_inputs:
         return []
     if not settings.glm_api_key.strip():
@@ -317,14 +366,27 @@ def _request_glm_embeddings(inputs: Sequence[str]) -> list[list[float]]:
     if settings.glm_embedding_dimensions > 0:
         payload_data["dimensions"] = settings.glm_embedding_dimensions
 
-    payload = _post_json(
-        _build_embeddings_url(settings.glm_base_url),
-        client_name="glm",
-        api_key=settings.glm_api_key,
-        payload=payload_data,
-        timeout=settings.glm_timeout_seconds,
-        verify_ssl=settings.glm_verify_ssl,
-    )
+    try:
+        payload = _post_json(
+            _build_embeddings_url(settings.glm_base_url),
+            client_name="glm",
+            api_key=settings.glm_api_key,
+            payload=payload_data,
+            timeout=settings.glm_timeout_seconds,
+            verify_ssl=settings.glm_verify_ssl,
+        )
+    except httpx.HTTPStatusError as exc:
+        _log_http_status_error(
+            exc,
+            operation="GLM embedding request",
+            payload_summary={
+                "model": settings.glm_embedding_model,
+                "input_count": len(cleaned_inputs),
+                "max_input_chars": max((len(item) for item in cleaned_inputs), default=0),
+                "dimensions": settings.glm_embedding_dimensions if settings.glm_embedding_dimensions > 0 else None,
+            },
+        )
+        raise
     data = payload.get("data") or []
     embeddings: list[list[float]] = []
     for item in data:
@@ -361,14 +423,28 @@ def _request_glm_rerank(
     if top_n is not None:
         payload_data["top_n"] = max(min(int(top_n), len(cleaned_documents), 128), 1)
 
-    payload = _post_json(
-        _build_rerank_url(settings.glm_base_url),
-        client_name="glm",
-        api_key=settings.glm_api_key,
-        payload=payload_data,
-        timeout=settings.glm_timeout_seconds,
-        verify_ssl=settings.glm_verify_ssl,
-    )
+    try:
+        payload = _post_json(
+            _build_rerank_url(settings.glm_base_url),
+            client_name="glm",
+            api_key=settings.glm_api_key,
+            payload=payload_data,
+            timeout=settings.glm_timeout_seconds,
+            verify_ssl=settings.glm_verify_ssl,
+        )
+    except httpx.HTTPStatusError as exc:
+        _log_http_status_error(
+            exc,
+            operation="GLM rerank request",
+            payload_summary={
+                "model": settings.glm_rerank_model,
+                "query_chars": len(cleaned_query),
+                "documents_count": len(cleaned_documents[:128]),
+                "max_document_chars": max((len(item) for item in cleaned_documents[:128]), default=0),
+                "top_n": payload_data.get("top_n"),
+            },
+        )
+        raise
     results = payload.get("results") or []
     reranked: list[RerankResult] = []
     for item in results:
@@ -412,9 +488,36 @@ def chat_with_model(user_message: str) -> tuple[str, str | None]:
 
 
 def embed_texts(texts: Sequence[str]) -> list[list[float]]:
-    if _get_embedding_provider() == "glm":
-        return _request_glm_embeddings(texts)
-    return _request_openai_embeddings(texts)
+    cleaned_texts = _clean_embedding_inputs(texts)
+    if not cleaned_texts:
+        return []
+    provider = _get_embedding_provider()
+    request_fn = _request_glm_embeddings if provider == "glm" else _request_openai_embeddings
+    batch_size = max(int(settings.embedding_batch_size), 1)
+    batches = _batched_texts(cleaned_texts, batch_size=batch_size)
+    if len(batches) > 1:
+        logger.info(
+            "Embedding request batched: provider=%s total_texts=%s batch_size=%s batches=%s",
+            provider,
+            len(cleaned_texts),
+            batch_size,
+            len(batches),
+        )
+    embeddings: list[list[float]] = []
+    for batch_index, batch in enumerate(batches, start=1):
+        try:
+            embeddings.extend(request_fn(batch))
+        except Exception:
+            logger.warning(
+                "Embedding batch failed: provider=%s batch_index=%s batch_size=%s total_batches=%s",
+                provider,
+                batch_index,
+                len(batch),
+                len(batches),
+                exc_info=True,
+            )
+            raise
+    return embeddings
 
 
 def rerank_documents(

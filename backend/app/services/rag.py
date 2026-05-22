@@ -1011,6 +1011,14 @@ def _serialize_ranked_trace_candidates(
             row["exact_match_bonus"] = round(float(item["exact_match_bonus"]), 4)
         if item.get("exact_match_terms"):
             row["exact_match_terms"] = [str(term) for term in item["exact_match_terms"]]
+        if item.get("rerank_context_chars") is not None:
+            row["rerank_context_chars"] = int(item["rerank_context_chars"])
+        if item.get("rerank_evidence_blocks") is not None:
+            row["rerank_evidence_blocks"] = int(item["rerank_evidence_blocks"])
+        if item.get("rerank_context_truncated") is not None:
+            row["rerank_context_truncated"] = bool(item["rerank_context_truncated"])
+        if item.get("rerank_evidence_types"):
+            row["rerank_evidence_types"] = [str(kind) for kind in item["rerank_evidence_types"]]
         serialized.append(row)
     return serialized
 
@@ -1061,27 +1069,352 @@ def _results_to_ranked_hits(results: list[RetrievalResult]) -> list[dict[str, An
     ]
 
 
+def _extract_query_numbers(text: str) -> tuple[str, ...]:
+    return tuple(sorted({match.group(0) for match in re.finditer(r"[-+]?\d+(?:\.\d+)?", text or "")}))
+
+
+def _compact_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _truncate_for_budget(text: str, *, max_chars: int) -> str:
+    compact = _compact_text(text)
+    if len(compact) <= max_chars:
+        return compact
+    if max_chars <= 3:
+        return compact[:max_chars]
+    return f"{compact[: max_chars - 3].rstrip()}..."
+
+
+def _build_rerank_block_catalog(
+    db: Session,
+    *,
+    paper_ids: Iterable[int],
+) -> dict[int, dict[str, Any]]:
+    catalogs: dict[int, dict[str, Any]] = {}
+    for paper_id in sorted({int(item) for item in paper_ids if int(item)}):
+        preanalysis = _build_preanalysis_from_document_structure(db, paper_id=paper_id) or {}
+        blocks = preanalysis.get("blocks") if isinstance(preanalysis, dict) else []
+        if not isinstance(blocks, list):
+            blocks = []
+        catalogs[paper_id] = {
+            "blocks": blocks,
+            "by_block_index": {
+                int(block.get("block_index")): block
+                for block in blocks
+                if isinstance(block, dict) and (isinstance(block.get("block_index"), int) or str(block.get("block_index") or "").isdigit())
+            },
+            "by_source_block_id": {
+                int(block.get("source_block_id")): block
+                for block in blocks
+                if isinstance(block, dict) and (isinstance(block.get("source_block_id"), int) or str(block.get("source_block_id") or "").isdigit())
+            },
+            "by_source_table_id": {
+                int(block.get("source_table_id")): block
+                for block in blocks
+                if isinstance(block, dict) and (isinstance(block.get("source_table_id"), int) or str(block.get("source_table_id") or "").isdigit())
+            },
+            "by_source_picture_id": {
+                int(block.get("source_picture_id")): block
+                for block in blocks
+                if isinstance(block, dict) and (isinstance(block.get("source_picture_id"), int) or str(block.get("source_picture_id") or "").isdigit())
+            },
+        }
+    return catalogs
+
+
+def _score_rerank_text(
+    text: str,
+    *,
+    query_tokens: list[str],
+    exact_terms: list[str],
+    query_numbers: tuple[str, ...],
+    prefers_table: bool,
+    unit_type: str,
+    is_primary: bool,
+    section_path: str,
+) -> float:
+    compact = _compact_text(text).lower()
+    if not compact:
+        return 0.0
+    score = 0.0
+    query_token_set = set(query_tokens)
+    unit_token_set = set(_tokenize(compact))
+    score += float(len(query_token_set & unit_token_set))
+    exact_hits = sum(1 for term in exact_terms if term.lower() in compact)
+    score += exact_hits * 4.0
+    if section_path:
+        section_compact = section_path.lower()
+        score += sum(1.5 for term in exact_terms if term.lower() in section_compact)
+    if query_numbers:
+        text_numbers = {match.group(0) for match in re.finditer(r"[-+]?\d+(?:\.\d+)?", compact)}
+        score += float(len(set(query_numbers) & text_numbers)) * 3.0
+    if prefers_table and unit_type in {"table_caption", "table_row"}:
+        score += 1.5
+    if is_primary:
+        score += 2.0
+    if unit_type == "neighbor_context":
+        score -= 0.25
+    return score
+
+
+def _neighbor_blocks_for_rerank(
+    block: dict[str, Any],
+    *,
+    catalog: dict[str, Any],
+    neighbor_count: int,
+) -> list[dict[str, Any]]:
+    if neighbor_count <= 0:
+        return []
+    block_index = int(block.get("block_index") or -1)
+    if block_index < 0:
+        return []
+    by_block_index = catalog.get("by_block_index") if isinstance(catalog, dict) else {}
+    section_id = str(block.get("section_id") or "")
+    neighbors: list[dict[str, Any]] = []
+    for distance in range(1, neighbor_count + 1):
+        for candidate_index in (block_index - distance, block_index + distance):
+            candidate = by_block_index.get(candidate_index) if isinstance(by_block_index, dict) else None
+            if not isinstance(candidate, dict):
+                continue
+            if str(candidate.get("section_id") or "") != section_id:
+                continue
+            neighbors.append(candidate)
+    return neighbors
+
+
+def _table_evidence_units(block: dict[str, Any]) -> list[dict[str, Any]]:
+    units: list[dict[str, Any]] = []
+    table_text = str(block.get("text") or "").strip()
+    lines = [line.strip() for line in table_text.splitlines() if line.strip()]
+    if lines:
+        units.append({"text": lines[0], "unit_type": "table_caption"})
+    serialized_rows = _serialize_table_rows(block.get("table_data_json"), max_rows=16)
+    row_lines = [line.strip() for line in serialized_rows.splitlines() if line.strip()]
+    if row_lines:
+        for row_line in row_lines:
+            units.append({"text": row_line, "unit_type": "table_row"})
+    elif len(lines) > 1:
+        for row_line in lines[1:9]:
+            units.append({"text": row_line, "unit_type": "table_row"})
+    if not units and table_text:
+        units.append({"text": table_text, "unit_type": "table_row"})
+    return units
+
+
+def _candidate_rerank_units(
+    chunk: PaperChunk,
+    *,
+    catalog: dict[str, Any],
+    query: str,
+) -> list[dict[str, Any]]:
+    metadata = chunk.metadata_json if isinstance(chunk.metadata_json, dict) else {}
+    source_blocks = metadata.get("source_block_ids") if isinstance(metadata.get("source_block_ids"), list) else []
+    source_tables = metadata.get("source_table_ids") if isinstance(metadata.get("source_table_ids"), list) else []
+    source_pictures = metadata.get("source_picture_ids") if isinstance(metadata.get("source_picture_ids"), list) else []
+    prefers_table = _is_table_or_figure_query(query)
+    query_tokens = _tokenize(query)
+    exact_terms = _extract_exact_match_terms(query)
+    query_numbers = _extract_query_numbers(query)
+    units: list[dict[str, Any]] = []
+    seen_texts: set[str] = set()
+    source_candidates: list[tuple[dict[str, Any], bool]] = []
+    for block_id in source_blocks:
+        block = catalog.get("by_source_block_id", {}).get(int(block_id))
+        if isinstance(block, dict):
+            source_candidates.append((block, True))
+    for table_id in source_tables:
+        block = catalog.get("by_source_table_id", {}).get(int(table_id))
+        if isinstance(block, dict):
+            source_candidates.append((block, True))
+    for picture_id in source_pictures:
+        block = catalog.get("by_source_picture_id", {}).get(int(picture_id))
+        if isinstance(block, dict):
+            source_candidates.append((block, True))
+    for block, is_primary in list(source_candidates):
+        for neighbor in _neighbor_blocks_for_rerank(
+            block,
+            catalog=catalog,
+            neighbor_count=settings.rerank_neighbor_blocks,
+        ):
+            source_candidates.append((neighbor, False))
+    for block, is_primary in source_candidates:
+        block_type = str(block.get("block_type") or "paragraph")
+        unit_specs = (
+            _table_evidence_units(block)
+            if block_type == "table_like"
+            else [{"text": str(block.get("text") or "").strip(), "unit_type": "primary_block" if is_primary else "neighbor_context"}]
+        )
+        for unit_spec in unit_specs:
+            text = _compact_text(unit_spec.get("text") or "")
+            if not text or text in seen_texts:
+                continue
+            unit_type = str(unit_spec.get("unit_type") or "primary_block")
+            section_path = str(block.get("section_path") or "")
+            score = _score_rerank_text(
+                text,
+                query_tokens=query_tokens,
+                exact_terms=exact_terms,
+                query_numbers=query_numbers,
+                prefers_table=prefers_table,
+                unit_type=unit_type,
+                is_primary=is_primary,
+                section_path=section_path,
+            )
+            units.append(
+                {
+                    "text": text,
+                    "unit_type": unit_type,
+                    "score": score,
+                    "is_primary": is_primary,
+                    "block_index": int(block.get("block_index") or -1),
+                    "section_path": section_path,
+                    "source_key": (
+                        f"block:{block.get('source_block_id')}"
+                        if block.get("source_block_id") is not None
+                        else f"table:{block.get('source_table_id')}"
+                        if block.get("source_table_id") is not None
+                        else f"picture:{block.get('source_picture_id')}"
+                        if block.get("source_picture_id") is not None
+                        else f"idx:{int(block.get('block_index') or -1)}"
+                    ),
+                }
+            )
+            seen_texts.add(text)
+    return units
+
+
+def _build_rerank_context_for_chunk(
+    query: str,
+    *,
+    chunk: PaperChunk,
+    catalog: dict[str, Any] | None,
+) -> tuple[str, dict[str, Any]]:
+    metadata = chunk.metadata_json if isinstance(chunk.metadata_json, dict) else {}
+    header = str(metadata.get("context_header") or "").strip()
+    if not isinstance(catalog, dict):
+        fallback = _truncate_for_budget(
+            _chunk_text_payload(chunk, include_supporting_context=False),
+            max_chars=settings.rerank_max_context_chars,
+        )
+        return fallback, {
+            "rerank_context_chars": len(fallback),
+            "rerank_evidence_blocks": 0,
+            "rerank_context_truncated": len(fallback) < len(_compact_text(_chunk_text_payload(chunk, include_supporting_context=False))),
+            "rerank_evidence_types": [],
+        }
+
+    units = _candidate_rerank_units(chunk, catalog=catalog, query=query)
+    grouped_primary: dict[str, dict[str, Any]] = {}
+    others: list[dict[str, Any]] = []
+    for unit in sorted(
+        units,
+        key=lambda item: (-float(item.get("score") or 0.0), not bool(item.get("is_primary")), int(item.get("block_index") or -1)),
+    ):
+        source_key = str(unit.get("source_key") or "")
+        if unit.get("is_primary") and source_key and source_key not in grouped_primary:
+            grouped_primary[source_key] = unit
+            continue
+        others.append(unit)
+    ordered_units = list(grouped_primary.values()) + others
+
+    pieces: list[str] = []
+    used_types: list[str] = []
+    total_chars = 0
+    max_chars = max(int(settings.rerank_max_context_chars), 200)
+    if header:
+        pieces.append(header)
+        total_chars = len(header)
+    selected_count = 0
+    truncated = False
+    for unit in ordered_units:
+        if selected_count >= max(int(settings.rerank_max_evidence_blocks), 1):
+            truncated = True
+            break
+        label = {
+            "table_caption": "表格标题",
+            "table_row": "表格证据",
+            "neighbor_context": "相邻上下文",
+        }.get(str(unit.get("unit_type") or ""), "正文证据")
+        formatted = f"{label}: {str(unit.get('text') or '').strip()}"
+        if not formatted.strip():
+            continue
+        remaining = max_chars - total_chars - (2 if pieces else 0)
+        if remaining <= 40:
+            truncated = True
+            break
+        if len(formatted) > remaining:
+            formatted = _truncate_for_budget(formatted, max_chars=remaining)
+            truncated = True
+        pieces.append(formatted)
+        total_chars += len(formatted) + (2 if len(pieces) > 1 else 0)
+        used_types.append(str(unit.get("unit_type") or "primary_block"))
+        selected_count += 1
+
+    if len(pieces) <= 1:
+        fallback_body = str(metadata.get("body_text") or chunk.content or "").strip()
+        fallback = "\n\n".join(part for part in (header, _truncate_for_budget(fallback_body, max_chars=max_chars // 2)) if part)
+        return fallback, {
+            "rerank_context_chars": len(fallback),
+            "rerank_evidence_blocks": 0,
+            "rerank_context_truncated": truncated or len(fallback) >= max_chars,
+            "rerank_evidence_types": [],
+        }
+
+    context = "\n\n".join(part for part in pieces if part)
+    return context, {
+        "rerank_context_chars": len(context),
+        "rerank_evidence_blocks": selected_count,
+        "rerank_context_truncated": truncated,
+        "rerank_evidence_types": sorted(set(used_types)),
+    }
+
+
 def _apply_reranking(
+    db: Session,
     query: str,
     *,
     fused_candidates: list[dict[str, Any]],
     record_map: dict[int, tuple[PaperChunk, Paper]],
     limit: int,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     documents: list[str] = []
     aligned_candidates: list[dict[str, Any]] = []
-    include_supporting_context = _is_table_or_figure_query(query)
+    rerank_stats = {
+        "query_chars": len(query or ""),
+        "documents_count": 0,
+        "max_document_chars": 0,
+        "over_budget_truncated_count": 0,
+    }
+    block_catalogs = _build_rerank_block_catalog(
+        db,
+        paper_ids=[paper.id for _, paper in record_map.values()],
+    )
     for candidate in fused_candidates:
         record = record_map.get(int(candidate["chunk_id"]))
         if record is None:
             continue
-        documents.append(_chunk_text_payload(record[0], include_supporting_context=include_supporting_context))
-        aligned_candidates.append(candidate)
+        chunk, paper = record
+        rerank_context, context_meta = _build_rerank_context_for_chunk(
+            query,
+            chunk=chunk,
+            catalog=block_catalogs.get(int(paper.id)),
+        )
+        if not rerank_context:
+            continue
+        candidate_with_meta = dict(candidate)
+        candidate_with_meta.update(context_meta)
+        documents.append(rerank_context)
+        aligned_candidates.append(candidate_with_meta)
+        rerank_stats["documents_count"] = len(documents)
+        rerank_stats["max_document_chars"] = max(int(rerank_stats["max_document_chars"]), len(rerank_context))
+        if bool(context_meta.get("rerank_context_truncated")):
+            rerank_stats["over_budget_truncated_count"] = int(rerank_stats["over_budget_truncated_count"]) + 1
     if not documents:
-        return []
+        return [], rerank_stats
     rerank_results = rerank_documents(query, documents, top_n=limit)
     if not rerank_results:
-        return aligned_candidates[:limit]
+        return aligned_candidates[:limit], rerank_stats
 
     reranked: list[dict[str, Any]] = []
     seen_indexes: set[int] = set()
@@ -1100,7 +1433,7 @@ def _apply_reranking(
             continue
         reranked.append(dict(candidate))
 
-    return reranked[:limit]
+    return reranked[:limit], rerank_stats
 
 
 def _history_messages(records: list[ChatMessage], *, include_last_user: bool = False) -> list[dict[str, str]]:
@@ -2000,9 +2333,16 @@ def _search_chunks(
     reranked_candidates = fused_candidates
     rerank_status = "skipped"
     rerank_error: str | None = None
+    rerank_context_stats: dict[str, Any] = {
+        "query_chars": len(query_plan.rerank_query or ""),
+        "documents_count": 0,
+        "max_document_chars": 0,
+        "over_budget_truncated_count": 0,
+    }
     if fused_candidates:
         try:
-            reranked_candidates = _apply_reranking(
+            reranked_candidates, rerank_context_stats = _apply_reranking(
+                db,
                 query_plan.rerank_query,
                 fused_candidates=fused_candidates,
                 record_map=record_map,
@@ -2011,11 +2351,12 @@ def _search_chunks(
             rerank_status = "applied"
         except Exception as exc:
             logger.warning(
-                "Rerank failed, falling back to fused order: user_query=%s rerank_query=%s fused_count=%s rerank_limit=%s error=%s",
+                "Rerank failed, falling back to fused order: user_query=%s rerank_query=%s fused_count=%s rerank_limit=%s rerank_context_stats=%s error=%s",
                 _preview_log_text(query, limit=200),
                 _preview_log_text(query_plan.rerank_query, limit=200),
                 len(fused_candidates),
                 max(settings.rag_rerank_top_n, limit),
+                rerank_context_stats,
                 exc,
                 exc_info=True,
             )
@@ -2044,6 +2385,7 @@ def _search_chunks(
                 "fusion_limit": fusion_limit,
                 "rerank_status": rerank_status,
                 "rerank_error": rerank_error,
+                "rerank_context_stats": rerank_context_stats,
             }
         )
     return results

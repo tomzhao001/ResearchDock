@@ -72,6 +72,7 @@ class Settings(BaseSettings):
     llm_chat_max_retries: int = 2
     openai_embedding_model: str = "text-embedding-3-small"
     embedding_provider: str = "auto"
+    embedding_batch_size: int = 32
     openai_timeout_seconds: int = 120
     openai_verify_ssl: bool = True
     glm_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
@@ -90,6 +91,9 @@ class Settings(BaseSettings):
     rag_fusion_window: int = 20
     rag_rrf_k: int = 60
     rag_rerank_top_n: int = 10
+    rerank_max_context_chars: int = 3600
+    rerank_max_evidence_blocks: int = 6
+    rerank_neighbor_blocks: int = 1
     rag_text_search_config: str = "simple"
     rag_crosslingual_query_rewrite_enabled: bool = True
     rag_crosslingual_max_subqueries: int = 2
