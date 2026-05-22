@@ -64,6 +64,7 @@ class SampleQuestion:
     gold_evidence: tuple[GoldEvidence, ...]
     expected_keywords: tuple[str, ...]
     keyword_hit_threshold: int
+    gold_evidence_satisfy: str = "all"
     session_id: str | None = None
     turn_index: int | None = None
 
@@ -83,6 +84,7 @@ class ResolvedQuestion:
     gold_evidence_texts: tuple[str, ...]
     gold_evidence_refs: tuple[tuple[int, str], ...]
     gold_evidence_matches: tuple["GoldEvidenceMatch", ...] = ()
+    gold_evidence_required_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -150,6 +152,21 @@ def _resolved_gold_refs(resolved: ResolvedQuestion) -> tuple[GoldEvidenceMatch |
     return resolved.gold_evidence_matches or resolved.gold_evidence_refs
 
 
+def _required_gold_match_count(question: SampleQuestion, evidence_count: int) -> int:
+    if evidence_count <= 0:
+        return 0
+    satisfy = str(question.gold_evidence_satisfy or "all").strip().lower()
+    if satisfy == "any":
+        return 1
+    return evidence_count
+
+
+def _resolved_required_gold_match_count(resolved: ResolvedQuestion) -> int:
+    if resolved.gold_evidence_required_count > 0:
+        return int(resolved.gold_evidence_required_count)
+    return _required_gold_match_count(resolved.question, len(_resolved_gold_refs(resolved)))
+
+
 def _mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
@@ -180,7 +197,8 @@ def _ndcg_at_match_sets(match_sets: list[set[int]], *, relevant_count: int, k: i
     dcg = 0.0
     covered: set[int] = set()
     for index, match_set in enumerate(match_sets[:k], start=1):
-        gain = len(match_set - covered)
+        remaining_relevant = max(relevant_count - len(covered), 0)
+        gain = min(len(match_set - covered), remaining_relevant)
         if gain:
             dcg += gain / math.log2(index + 1)
             covered.update(match_set)
@@ -299,6 +317,45 @@ def _count_groups(items: list[dict[str, Any]], key_fn: Callable[[dict[str, Any]]
     return {key: {"count": count} for key, count in sorted(grouped.items())}
 
 
+def _summarize_slice(rows: list[dict[str, Any]]) -> dict[str, float | int]:
+    return {
+        "count": len(rows),
+        "hit@10": round(_mean([1.0 if row.get("hit@10") else 0.0 for row in rows]), 4) if rows else 0.0,
+        "mrr": round(_mean([float(row.get("mrr") or 0.0) for row in rows]), 4) if rows else 0.0,
+    }
+
+
+def _is_table_or_figure_reference(text: str) -> bool:
+    return bool(
+        re.search(r"\b(?:table|tab\.?|figure|fig\.?)\s*\d+", text or "", re.IGNORECASE)
+        or re.search(r"(表|图)\s*\d+", text or "")
+    )
+
+
+def _short_query_slice_tags(question: SampleQuestion, query_plan: dict[str, Any]) -> list[str]:
+    tags: list[str] = []
+    query_type = str(query_plan.get("query_type") or "unknown")
+    exact_terms = query_plan.get("exact_terms") if isinstance(query_plan.get("exact_terms"), list) else []
+    normalized_question = str(question.question or "")
+    if query_type == "exact_heavy_short":
+        tags.append("exact_heavy_short")
+    if query_type == "decontextualization_short":
+        tags.append("decontextualization_short")
+    if _is_table_or_figure_reference(normalized_question):
+        tags.append("table_figure_reference")
+    if question.turn_index is not None and len(re.sub(r"\s+", "", normalized_question)) <= 96:
+        tags.append("short_multi_turn_followup")
+    if any(
+        2 <= len(re.sub(r"[^A-Za-z]", "", str(term))) <= 10
+        and any(char.isupper() for char in re.sub(r"[^A-Za-z]", "", str(term)))
+        for term in exact_terms
+    ):
+        tags.append("acronym")
+    elif any(re.search(r"\b[A-Za-z]+(?:-[A-Za-z0-9]+)+\b", str(term)) or re.search(r"\d", str(term)) for term in exact_terms):
+        tags.append("exact_term")
+    return sorted(set(tags))
+
+
 def _first_hit_rank(candidates: list[dict[str, Any]], gold_set: set[int]) -> int | None:
     return next(
         (
@@ -374,6 +431,8 @@ def _classify_retrieval_failure(
     *,
     max_k: int,
     gold_chunk_count: int,
+    gold_evidence_required_count: int,
+    multi_chunk_gold: bool,
 ) -> str:
     reranked_rank = stage_hit_ranks.get("reranked")
     fused_rank = stage_hit_ranks.get("fused")
@@ -400,7 +459,7 @@ def _classify_retrieval_failure(
         and (fused_rank is None or fused_rank > max_k)
     ):
         return "fusion"
-    if gold_chunk_count > 1:
+    if multi_chunk_gold and gold_evidence_required_count > 1 and gold_chunk_count > 1:
         return "chunking"
     if sparse_rank is None and dense_rank is not None:
         return "sparse"
@@ -448,6 +507,7 @@ def load_sample_data_questions(data_dir: Path | None = None) -> list[SampleQuest
                 gold_evidence=gold_evidence,
                 expected_keywords=tuple(item.get("expected_keywords", [])),
                 keyword_hit_threshold=int(item.get("keyword_hit_threshold", 1)),
+                gold_evidence_satisfy=str(item.get("gold_evidence_satisfy") or "all"),
                 session_id=item.get("session_id"),
                 turn_index=item.get("turn_index"),
             )
@@ -681,6 +741,7 @@ def resolve_question_gold(
                 gold_evidence_texts=tuple(gold_evidence_texts),
                 gold_evidence_refs=tuple(gold_evidence_refs),
                 gold_evidence_matches=tuple(gold_evidence_matches),
+                gold_evidence_required_count=_required_gold_match_count(question, len(gold_evidence_matches)),
             )
         )
     return resolved
@@ -709,6 +770,7 @@ def evaluate_retrieval(
         )
         retrieval_trace: dict[str, Any] = {}
         gold_refs = _resolved_gold_refs(resolved)
+        required_gold_match_count = _resolved_required_gold_match_count(resolved)
         results = _search_chunks(
             db,
             query=resolved.question.question,
@@ -718,9 +780,10 @@ def evaluate_retrieval(
         )
         retrieved_match_sets = [_result_match_indexes(item, gold_refs) for item in results]
         first_hit_rank = _first_hit_rank_from_match_sets(retrieved_match_sets)
+        retrieved_match_union: set[int] = set().union(*retrieved_match_sets) if retrieved_match_sets else set()
         trace_chunk_ids = {
             int(candidate.get("chunk_id") or -1)
-            for stage_name in ("sparse_candidates", "dense_candidates", "fused_candidates", "reranked_candidates")
+            for stage_name in ("sparse_candidates", "dense_candidates", "fused_candidates", "expanded_candidates", "reranked_candidates")
             for candidate in retrieval_trace.get(stage_name, [])
             if int(candidate.get("chunk_id") or -1) > 0
         }
@@ -749,6 +812,12 @@ def evaluate_retrieval(
                     for candidate in retrieval_trace.get("fused_candidates", [])
                 ]
             ),
+            "expanded": _first_hit_rank_from_match_sets(
+                [
+                    _trace_candidate_match_indexes(candidate, gold_refs, chunk_lookup=trace_chunk_lookup)
+                    for candidate in retrieval_trace.get("expanded_candidates", [])
+                ]
+            ),
             "reranked": _first_hit_rank_from_match_sets(
                 [
                     _trace_candidate_match_indexes(candidate, gold_refs, chunk_lookup=trace_chunk_lookup)
@@ -759,7 +828,7 @@ def evaluate_retrieval(
         gold_chunk_id_set = set(resolved.gold_chunk_ids)
         stage_gold_chunk_ranks = {
             stage_name: _first_hit_rank(retrieval_trace.get(f"{stage_name}_candidates", []), gold_chunk_id_set)
-            for stage_name in ("sparse", "dense", "fused", "reranked")
+            for stage_name in ("sparse", "dense", "fused", "expanded", "reranked")
         }
         variant_hit_ranks = {
             variant_name: _first_hit_rank_from_match_sets(
@@ -776,8 +845,16 @@ def evaluate_retrieval(
             stage_gold_chunk_ranks,
             max_k=max_k,
             gold_chunk_count=len(resolved.gold_chunk_ids),
+            gold_evidence_required_count=required_gold_match_count,
+            multi_chunk_gold=len(resolved.gold_chunk_ids) > 1,
         )
         query_plan = retrieval_trace.get("query_plan") if isinstance(retrieval_trace.get("query_plan"), dict) else {}
+        query_type = str(query_plan.get("query_type") or "unknown")
+        short_query_slice_tags = _short_query_slice_tags(resolved.question, query_plan)
+        guardrail_variant_generated = any(
+            isinstance(variant_payload, dict) and str(variant_payload.get("role") or "") == "guardrail"
+            for variant_payload in (retrieval_trace.get("variant_candidates") or {}).values()
+        )
         rewrite_status = str(query_plan.get("rewrite_status") or "unknown")
         llm_rewrite_status = str(query_plan.get("llm_rewrite_status") or "unknown")
         fallback_source = str(query_plan.get("fallback_source") or "none")
@@ -794,6 +871,9 @@ def evaluate_retrieval(
                 {"paper_id": paper_id, "snippet": snippet}
                 for paper_id, snippet in resolved.gold_evidence_refs
             ],
+            "gold_evidence_satisfy": resolved.question.gold_evidence_satisfy,
+            "gold_evidence_required_count": required_gold_match_count,
+            "gold_evidence_count": len(resolved.gold_evidence_refs),
             "gold_evidence_matches": [
                 {
                     "paper_id": item.paper_id,
@@ -832,17 +912,32 @@ def evaluate_retrieval(
             "variant_hit_ranks": variant_hit_ranks,
             "likely_failure_stage": likely_failure_stage,
             "gold_alignment_detected": likely_failure_stage == "gold_alignment",
+            "matched_evidence_count": len(retrieved_match_union),
             "chunking_risk": len(resolved.gold_chunk_ids) > 1,
+            "multi_chunk_gold": len(resolved.gold_chunk_ids) > 1,
             "rewrite_status": rewrite_status,
             "llm_rewrite_status": llm_rewrite_status,
             "fallback_source": fallback_source,
             "rewrite_provider": rewrite_provider,
+            "query_type": query_type,
+            "short_query_slice_tags": short_query_slice_tags,
+            "guardrail_variant_generated": guardrail_variant_generated,
+            "rewrite_backfilled_terms": [
+                str(term)
+                for term in (
+                    query_plan.get("rewrite_backfilled_terms")
+                    if isinstance(query_plan.get("rewrite_backfilled_terms"), list)
+                    else []
+                )
+            ],
             "retrieval_trace": retrieval_trace,
         }
         for k in k_values:
-            row[f"hit@{k}"] = any(match_set for match_set in retrieved_match_sets[:k])
+            covered_at_k: set[int] = set().union(*retrieved_match_sets[:k]) if retrieved_match_sets[:k] else set()
+            row[f"matched_evidence_count@{k}"] = len(covered_at_k)
+            row[f"hit@{k}"] = len(covered_at_k) >= required_gold_match_count
             row[f"ndcg@{k}"] = round(
-                _ndcg_at_match_sets(retrieved_match_sets, relevant_count=len(resolved.gold_evidence_refs), k=k),
+                _ndcg_at_match_sets(retrieved_match_sets, relevant_count=required_gold_match_count, k=k),
                 4,
             )
         rows.append(row)
@@ -879,6 +974,11 @@ def evaluate_retrieval(
             key_fn=lambda row: row.get("rewrite_status") or "unknown",
             score_fns={"hit@10": lambda row: 1.0 if row.get("hit@10") else 0.0, "mrr": lambda row: float(row["mrr"])},
         ),
+        "by_query_type": _summarize_groups(
+            rows,
+            key_fn=lambda row: row.get("query_type") or "unknown",
+            score_fns={"hit@10": lambda row: 1.0 if row.get("hit@10") else 0.0, "mrr": lambda row: float(row["mrr"])},
+        ),
         "by_llm_rewrite_status": _summarize_groups(
             rows,
             key_fn=lambda row: row.get("llm_rewrite_status") or "unknown",
@@ -898,6 +998,17 @@ def evaluate_retrieval(
         },
         "rewrite_status_counts": _count_groups(rows, key_fn=lambda row: row.get("rewrite_status") or "unknown"),
         "llm_rewrite_status_counts": _count_groups(rows, key_fn=lambda row: row.get("llm_rewrite_status") or "unknown"),
+        "short_query_slices": {
+            slice_name: _summarize_slice([row for row in rows if slice_name in row.get("short_query_slice_tags", [])])
+            for slice_name in (
+                "exact_heavy_short",
+                "decontextualization_short",
+                "acronym",
+                "exact_term",
+                "table_figure_reference",
+                "short_multi_turn_followup",
+            )
+        },
     }
     logger.info(
         "Retrieval evaluation finished: completed=%s skipped=%s hit@10=%.4f mrr=%.4f",

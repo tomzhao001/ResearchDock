@@ -9,9 +9,12 @@ from app.services.rag import (
     _boost_exact_match_candidates,
     _build_evidence_candidates,
     _build_crosslingual_query_plan,
+    _expand_retrieval_candidates,
     _build_rerank_context_for_chunk,
     _extract_exact_match_terms,
     _is_exact_match_heavy_query,
+    RetrievalQueryPlan,
+    RetrievalQueryVariant,
     _select_claim_supporting_evidence,
     _split_text,
     _verify_grounded_answer,
@@ -173,11 +176,46 @@ def test_build_crosslingual_query_plan_creates_bilingual_variants(monkeypatch: p
     plan = _build_crosslingual_query_plan("文中的 tES 指什么？")
 
     assert plan.detected_language == "zh"
-    assert plan.retrieval_query_en == "What does tES stand for in the paper?"
+    assert plan.query_type == "exact_heavy_short"
+    assert plan.retrieval_query_en == "What does tES stand for in the paper? transcranial electrical stimulation"
+    assert plan.rewrite_backfilled_terms == ("transcranial electrical stimulation",)
     assert "tES" in plan.exact_terms
     assert "transcranial electrical stimulation" in plan.exact_terms
-    assert [variant.name for variant in plan.variants] == ["zh_original", "en_rewrite"]
-    assert plan.rerank_query == "What does tES stand for in the paper?"
+    assert plan.exact_guardrail_query_en == "tES transcranial electrical stimulation"
+    assert [variant.name for variant in plan.variants] == ["zh_original", "en_exact_terms", "en_rewrite"]
+    assert plan.rerank_query == "What does tES stand for in the paper? transcranial electrical stimulation"
+
+
+def test_build_crosslingual_query_plan_sanitizes_boolean_rewrite_and_backfills_exact_terms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.config.settings.rag_crosslingual_query_rewrite_enabled", True)
+    monkeypatch.setattr("app.config.settings.glm_api_key", "test-key")
+
+    def fake_chat(messages: list[dict[str, str]], *, temperature: float = 0.3) -> tuple[str, str | None]:
+        return (
+            """
+            {
+              "detected_language": "zh",
+              "retrieval_query_en": "\\"acronym\\" OR \\"definition\\"",
+              "exact_terms": ["OR"],
+              "subqueries_en": ["\\"stands for\\" OR glossary"],
+              "generation_instruction": "请用中文回答。"
+            }
+            """.strip(),
+            "test-model",
+        )
+
+    monkeypatch.setattr("app.services.rag.chat_with_messages", fake_chat)
+
+    plan = _build_crosslingual_query_plan("如果用户只记得缩写，这里的 tES 全称展开是什么？")
+
+    assert plan.query_type == "decontextualization_short"
+    assert plan.retrieval_query_en == "acronym definition tES"
+    assert plan.rewrite_backfilled_terms == ("tES",)
+    assert "OR" not in plan.exact_terms
+    assert plan.subqueries_en == ()
+    assert [variant.name for variant in plan.variants] == ["zh_original", "en_exact_terms", "en_rewrite"]
 
 
 def test_exact_match_heavy_query_stays_conservative_for_cjk_single_fact() -> None:
@@ -410,6 +448,170 @@ def test_build_rerank_context_falls_back_to_truncated_chunk_text(monkeypatch: py
 
     assert len(context) <= 80
     assert meta["rerank_context_truncated"] is True
+
+
+def test_expand_retrieval_candidates_adds_sibling_and_parent_for_multi_span_query(db_session) -> None:
+    paper = Paper(id=17, organization_id=1, title="ADHD Study", status="completed")
+    parent = PaperChunk(
+        id=1000,
+        paper_id=17,
+        parent_chunk_id=None,
+        chunk_index=90,
+        chunk_role="parent",
+        content="Section parent chunk",
+        embedding=None,
+        token_count=20,
+        page_from=2,
+        page_to=2,
+        metadata_json={"section_id": "study_design", "body_text": "Section parent chunk"},
+    )
+    anchor = PaperChunk(
+        id=1001,
+        paper_id=17,
+        parent_chunk_id=1000,
+        chunk_index=12,
+        chunk_role="child",
+        content="First exclusion reason",
+        embedding=None,
+        token_count=10,
+        page_from=2,
+        page_to=2,
+        metadata_json={"section_id": "study_design", "body_text": "First exclusion reason"},
+    )
+    sibling = PaperChunk(
+        id=1002,
+        paper_id=17,
+        parent_chunk_id=1000,
+        chunk_index=13,
+        chunk_role="child",
+        content="Second exclusion reason",
+        embedding=None,
+        token_count=10,
+        page_from=2,
+        page_to=2,
+        metadata_json={"section_id": "study_design", "body_text": "Second exclusion reason"},
+    )
+    db_session.add_all([paper, parent, anchor, sibling])
+    db_session.commit()
+
+    query_plan = RetrievalQueryPlan(
+        original_query="两位被排除的受试者分别因为什么原因退出？",
+        detected_language="zh",
+        query_type="complex_multi_query",
+        generation_instruction="请用中文回答。",
+        rerank_query="reasons for excluded participants dropout",
+        exact_terms=(),
+        retrieval_query_en="reasons for excluded participants dropout",
+        exact_guardrail_query_en=None,
+        subqueries_en=(),
+        variants=(RetrievalQueryVariant(name="en_rewrite", query="reasons for excluded participants dropout", language="en", use_sparse=True, use_dense=True, role="rewrite"),),
+        rewrite_status="llm_rewritten",
+        llm_rewrite_status="llm_rewritten",
+        used_llm=True,
+        llm_attempted=True,
+        rewrite_provider="glm",
+        rewrite_model="glm-5.1",
+        fallback_source=None,
+        rewrite_error=None,
+        rewrite_backfilled_terms=(),
+    )
+
+    expanded, stats = _expand_retrieval_candidates(
+        db_session,
+        query="两位被排除的受试者分别因为什么原因退出？",
+        candidates=[{"chunk_id": 1001, "paper_id": 17, "score": 0.9, "rank": 1, "source_scores": {"dense": 0.9}}],
+        record_map={1001: (anchor, paper)},
+        organization_id=1,
+        query_plan=query_plan,
+        limit=10,
+    )
+
+    expanded_ids = [candidate["chunk_id"] for candidate in expanded]
+    assert 1001 in expanded_ids
+    assert 1002 in expanded_ids
+    assert 1000 in expanded_ids
+    assert stats["enabled"] is True
+    assert stats["expanded_candidate_count"] >= 2
+
+
+def test_expand_retrieval_candidates_skips_exact_term_lookup_queries(db_session) -> None:
+    paper = Paper(id=18, organization_id=1, title="ADHD Study", status="completed")
+    parent = PaperChunk(
+        id=1100,
+        paper_id=18,
+        parent_chunk_id=None,
+        chunk_index=90,
+        chunk_role="parent",
+        content="Section parent chunk",
+        embedding=None,
+        token_count=20,
+        page_from=1,
+        page_to=1,
+        metadata_json={"section_id": "definitions", "body_text": "Section parent chunk"},
+    )
+    anchor = PaperChunk(
+        id=1101,
+        paper_id=18,
+        parent_chunk_id=1100,
+        chunk_index=2,
+        chunk_role="child",
+        content="CGI-S definition",
+        embedding=None,
+        token_count=8,
+        page_from=1,
+        page_to=1,
+        metadata_json={"section_id": "definitions", "body_text": "CGI-S definition"},
+    )
+    sibling = PaperChunk(
+        id=1102,
+        paper_id=18,
+        parent_chunk_id=1100,
+        chunk_index=3,
+        chunk_role="child",
+        content="CGI-S scoring range",
+        embedding=None,
+        token_count=8,
+        page_from=1,
+        page_to=1,
+        metadata_json={"section_id": "definitions", "body_text": "CGI-S scoring range"},
+    )
+    db_session.add_all([paper, parent, anchor, sibling])
+    db_session.commit()
+
+    query_plan = RetrievalQueryPlan(
+        original_query="CGI-S 是什么量表，评分范围如何？",
+        detected_language="zh",
+        query_type="exact_heavy_short",
+        generation_instruction="请用中文回答。",
+        rerank_query="CGI-S scale definition and scoring range",
+        exact_terms=("CGI-S",),
+        retrieval_query_en="CGI-S scale definition and scoring range",
+        exact_guardrail_query_en=None,
+        subqueries_en=(),
+        variants=(RetrievalQueryVariant(name="en_rewrite", query="CGI-S scale definition and scoring range", language="en", use_sparse=True, use_dense=True, role="rewrite"),),
+        rewrite_status="llm_rewritten",
+        llm_rewrite_status="llm_rewritten",
+        used_llm=True,
+        llm_attempted=True,
+        rewrite_provider="glm",
+        rewrite_model="glm-5.1",
+        fallback_source=None,
+        rewrite_error=None,
+        rewrite_backfilled_terms=(),
+    )
+
+    expanded, stats = _expand_retrieval_candidates(
+        db_session,
+        query="CGI-S 是什么量表，评分范围如何？",
+        candidates=[{"chunk_id": 1101, "paper_id": 18, "score": 0.9, "rank": 1, "source_scores": {"dense": 0.9}}],
+        record_map={1101: (anchor, paper)},
+        organization_id=1,
+        query_plan=query_plan,
+        limit=10,
+    )
+
+    assert [candidate["chunk_id"] for candidate in expanded] == [1101]
+    assert stats["enabled"] is False
 
 
 def test_claim_level_evidence_selection_supports_crosslingual_query(monkeypatch: pytest.MonkeyPatch) -> None:

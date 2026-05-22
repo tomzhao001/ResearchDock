@@ -74,6 +74,10 @@ def test_sample_data_benchmark_files_have_expected_shape() -> None:
     assert len(smoke_ids) == 14
     assert papers[0].pdf_path.exists()
     assert papers[1].pdf_path.exists()
+    question_by_id = {question.q_id: question for question in questions}
+    assert question_by_id["en_014"].gold_evidence_satisfy == "all"
+    assert question_by_id["en_015"].gold_evidence_satisfy == "any"
+    assert len(question_by_id["en_014"].gold_evidence) == 1
 
 
 def test_sample_data_gold_evidence_resolves_against_ingested_sample_papers(
@@ -238,6 +242,7 @@ def test_evaluate_retrieval_reports_stage_hit_ranks(db_session, monkeypatch: pyt
         "sparse": 1,
         "dense": None,
         "fused": None,
+        "expanded": None,
         "reranked": None,
     }
     assert report["questions"][0]["variant_hit_ranks"] == {"en_rewrite": 1}
@@ -374,6 +379,148 @@ def test_evaluate_retrieval_reports_gold_alignment_when_chunk_id_hits_but_text_d
     assert report["questions"][0]["gold_alignment_detected"] is True
 
 
+def test_evaluate_retrieval_treats_any_satisfy_gold_as_recall_not_chunking(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+    user,
+) -> None:
+    question = SampleQuestion(
+        q_id="term_lookup_any",
+        question="CGI-S 是什么量表，评分范围如何？",
+        category="term_lookup",
+        difficulty="medium",
+        language="en",
+        requires_multi_span=False,
+        needs_table_or_figure=False,
+        allow_fallback_general=False,
+        expected_abstention=False,
+        gold_evidence=(
+            GoldEvidence(paper_key="paper", snippet="CGI-S (Clinical Global Impression-Severity) scale"),
+            GoldEvidence(paper_key="paper", snippet="rated on a 7-point scale"),
+        ),
+        expected_keywords=("CGI-S", "7-point scale"),
+        keyword_hit_threshold=1,
+        gold_evidence_satisfy="any",
+    )
+    resolved = ResolvedQuestion(
+        question=question,
+        gold_chunk_ids=(101, 102),
+        gold_chunk_indices=(1, 2),
+        gold_paper_ids=(7, 7),
+        gold_evidence_texts=(
+            "CGI-S (Clinical Global Impression-Severity) scale",
+            "rated on a 7-point scale",
+        ),
+        gold_evidence_refs=(
+            (7, "CGI-S (Clinical Global Impression-Severity) scale"),
+            (7, "rated on a 7-point scale"),
+        ),
+    )
+
+    def fake_search(_db, *, query: str, organization_id: int, top_k: int | None = None, trace: dict | None = None):
+        assert query == question.question
+        assert organization_id == user.organization_id
+        if trace is not None:
+            trace.update(
+                {
+                    "retrieval_backend": "postgres_hybrid",
+                    "sparse_candidates": [],
+                    "dense_candidates": [],
+                    "fused_candidates": [],
+                    "expanded_candidates": [],
+                    "reranked_candidates": [],
+                }
+            )
+        return []
+
+    monkeypatch.setattr("app.evals.sample_data._search_chunks", fake_search)
+    monkeypatch.setattr("app.evals.sample_data.ensure_sample_data_eval_user", lambda _db: user)
+
+    report = evaluate_retrieval(db_session, [resolved])
+
+    assert report["questions"][0]["gold_evidence_satisfy"] == "any"
+    assert report["questions"][0]["gold_evidence_required_count"] == 1
+    assert report["questions"][0]["likely_failure_stage"] == "recall"
+    assert report["questions"][0]["hit@10"] is False
+
+
+def test_evaluate_retrieval_caps_ndcg_for_any_satisfy_gold(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+    user,
+) -> None:
+    question = SampleQuestion(
+        q_id="term_lookup_any_hit",
+        question="CGI-S 是什么量表，评分范围如何？",
+        category="term_lookup",
+        difficulty="medium",
+        language="en",
+        requires_multi_span=False,
+        needs_table_or_figure=False,
+        allow_fallback_general=False,
+        expected_abstention=False,
+        gold_evidence=(
+            GoldEvidence(paper_key="paper", snippet="CGI-S (Clinical Global Impression-Severity) scale"),
+            GoldEvidence(paper_key="paper", snippet="rated on a 7-point scale"),
+        ),
+        expected_keywords=("CGI-S", "7-point scale"),
+        keyword_hit_threshold=1,
+        gold_evidence_satisfy="any",
+    )
+    resolved = ResolvedQuestion(
+        question=question,
+        gold_chunk_ids=(101, 102),
+        gold_chunk_indices=(1, 2),
+        gold_paper_ids=(7, 7),
+        gold_evidence_texts=(
+            "CGI-S (Clinical Global Impression-Severity) scale",
+            "rated on a 7-point scale",
+        ),
+        gold_evidence_refs=(
+            (7, "CGI-S (Clinical Global Impression-Severity) scale"),
+            (7, "rated on a 7-point scale"),
+        ),
+        gold_evidence_required_count=1,
+    )
+    paper = Paper(id=7, organization_id=user.organization_id, title="Demo Paper", status="completed")
+    chunk = PaperChunk(
+        id=101,
+        paper_id=7,
+        chunk_index=3,
+        content="CGI-S (Clinical Global Impression-Severity) scale rated on a 7-point scale.",
+        embedding=None,
+        token_count=10,
+        page_from=1,
+        page_to=1,
+        metadata_json={"body_text": "CGI-S (Clinical Global Impression-Severity) scale rated on a 7-point scale."},
+    )
+
+    def fake_search(_db, *, query: str, organization_id: int, top_k: int | None = None, trace: dict | None = None):
+        assert query == question.question
+        assert organization_id == user.organization_id
+        if trace is not None:
+            trace.update(
+                {
+                    "retrieval_backend": "postgres_hybrid",
+                    "sparse_candidates": [{"chunk_id": 101, "paper_id": 7, "score": 1.0, "snippet": chunk.content}],
+                    "dense_candidates": [],
+                    "fused_candidates": [{"chunk_id": 101, "paper_id": 7, "score": 1.0, "snippet": chunk.content}],
+                    "expanded_candidates": [{"chunk_id": 101, "paper_id": 7, "score": 1.0, "snippet": chunk.content}],
+                    "reranked_candidates": [{"chunk_id": 101, "paper_id": 7, "score": 1.0, "snippet": chunk.content}],
+                }
+            )
+        return [RetrievalResult(chunk=chunk, paper=paper, score=1.0)]
+
+    monkeypatch.setattr("app.evals.sample_data._search_chunks", fake_search)
+    monkeypatch.setattr("app.evals.sample_data.ensure_sample_data_eval_user", lambda _db: user)
+
+    report = evaluate_retrieval(db_session, [resolved])
+
+    assert report["questions"][0]["hit@1"] is True
+    assert report["questions"][0]["matched_evidence_count@1"] == 2
+    assert report["questions"][0]["ndcg@1"] == 1.0
+
+
 def test_grade_heuristic_uses_citation_text_match_instead_of_gold_chunk_id() -> None:
     question = SampleQuestion(
         q_id="heuristic_alignment",
@@ -407,3 +554,91 @@ def test_grade_heuristic_uses_citation_text_match_instead_of_gold_chunk_id() -> 
     assert heuristic["cited_gold"] == 1
     assert heuristic["citation_precision"] == 1.0
     assert heuristic["grounded"] is True
+
+
+def test_evaluate_retrieval_reports_short_query_slices_and_guardrail_variant(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+    user,
+) -> None:
+    question = SampleQuestion(
+        q_id="en_short_slice",
+        question="文中的 tES 指什么？",
+        category="term_lookup",
+        difficulty="easy",
+        language="en",
+        requires_multi_span=False,
+        needs_table_or_figure=False,
+        allow_fallback_general=False,
+        expected_abstention=False,
+        gold_evidence=(GoldEvidence(paper_key="paper", snippet="transcranial electrical stimulation (tES)"),),
+        expected_keywords=("transcranial electrical stimulation", "tES"),
+        keyword_hit_threshold=1,
+    )
+    resolved = ResolvedQuestion(
+        question=question,
+        gold_chunk_ids=(101,),
+        gold_chunk_indices=(1,),
+        gold_paper_ids=(7,),
+        gold_evidence_texts=("transcranial electrical stimulation (tES)",),
+        gold_evidence_refs=((7, "transcranial electrical stimulation (tES)"),),
+    )
+    paper = Paper(id=7, organization_id=user.organization_id, title="Demo Paper", status="completed")
+    chunk = PaperChunk(
+        id=101,
+        paper_id=7,
+        chunk_index=1,
+        content="The paper defines transcranial electrical stimulation (tES).",
+        embedding=None,
+        token_count=8,
+        page_from=1,
+        page_to=1,
+        metadata_json={"body_text": "The paper defines transcranial electrical stimulation (tES)."},
+    )
+
+    def fake_search(_db, *, query: str, organization_id: int, top_k: int | None = None, trace: dict | None = None):
+        assert query == question.question
+        assert organization_id == user.organization_id
+        if trace is not None:
+            trace.update(
+                {
+                    "retrieval_backend": "postgres_hybrid",
+                    "query_plan": {
+                        "query_type": "exact_heavy_short",
+                        "rewrite_status": "llm_rewritten",
+                        "llm_rewrite_status": "llm_rewritten",
+                        "fallback_source": "template_rules",
+                        "rewrite_provider": "glm",
+                        "exact_terms": ["tES", "transcranial electrical stimulation"],
+                        "rewrite_backfilled_terms": ["tES"],
+                    },
+                    "variant_candidates": {
+                        "zh_original": {"role": "original", "fused_candidates": []},
+                        "en_exact_terms": {
+                            "role": "guardrail",
+                            "fused_candidates": [{"chunk_id": 101, "paper_id": 7, "score": 1.0, "snippet": "tES"}],
+                        },
+                        "en_rewrite": {
+                            "role": "rewrite",
+                            "fused_candidates": [{"chunk_id": 101, "paper_id": 7, "score": 1.0, "snippet": "transcranial electrical stimulation (tES)"}],
+                        },
+                    },
+                    "sparse_candidates": [{"chunk_id": 101, "paper_id": 7, "score": 1.0, "snippet": "transcranial electrical stimulation (tES)"}],
+                    "dense_candidates": [],
+                    "fused_candidates": [{"chunk_id": 101, "paper_id": 7, "score": 1.0, "snippet": "transcranial electrical stimulation (tES)"}],
+                    "reranked_candidates": [{"chunk_id": 101, "paper_id": 7, "score": 1.0, "snippet": "transcranial electrical stimulation (tES)"}],
+                }
+            )
+        return [RetrievalResult(chunk=chunk, paper=paper, score=1.0)]
+
+    monkeypatch.setattr("app.evals.sample_data._search_chunks", fake_search)
+    monkeypatch.setattr("app.evals.sample_data.ensure_sample_data_eval_user", lambda _db: user)
+
+    report = evaluate_retrieval(db_session, [resolved])
+
+    assert report["questions"][0]["query_type"] == "exact_heavy_short"
+    assert report["questions"][0]["guardrail_variant_generated"] is True
+    assert set(report["questions"][0]["short_query_slice_tags"]) >= {"exact_heavy_short", "acronym"}
+    assert report["questions"][0]["rewrite_backfilled_terms"] == ["tES"]
+    assert report["breakdown"]["by_query_type"]["exact_heavy_short"]["count"] == 1
+    assert report["breakdown"]["short_query_slices"]["acronym"]["count"] == 1

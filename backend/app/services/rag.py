@@ -61,6 +61,8 @@ QUERY_PLAN_USER_TEMPLATE = """
 2. 保留论文中的关键英文术语，例如 tES、ADHD-RS、Table 3、theta wave、within-subject design。
 3. 只有在问题明显包含两个独立信息点时，才拆成 subqueries_en。
 4. 不要编造论文中不存在的新术语。
+5. 如果问题很短，或包含缩写、图表号、量表名、术语名、数值单位，不要把这些精确术语泛化掉。
+6. retrieval_query_en 必须是适合 sparse 检索的自然关键词串，不要输出 OR/AND/NOT 这类布尔模板。
 
 用户问题：
 {query}
@@ -155,10 +157,12 @@ class RetrievalQueryVariant:
 class RetrievalQueryPlan:
     original_query: str
     detected_language: str
+    query_type: str
     generation_instruction: str
     rerank_query: str
     exact_terms: tuple[str, ...]
     retrieval_query_en: str | None
+    exact_guardrail_query_en: str | None
     subqueries_en: tuple[str, ...]
     variants: tuple[RetrievalQueryVariant, ...]
     rewrite_status: str
@@ -169,6 +173,7 @@ class RetrievalQueryPlan:
     rewrite_model: str | None
     fallback_source: str | None
     rewrite_error: str | None
+    rewrite_backfilled_terms: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -254,13 +259,126 @@ def _extract_exact_match_terms(query: str) -> list[str]:
     return sorted(candidates, key=len, reverse=True)
 
 
+_SHORT_QUERY_DECONTEXT_PATTERN = re.compile(
+    r"(这里|这个|那个|上面|上一问|上一轮|前面|刚才|这篇|那篇|这里的|那个重新校准后的|这里说的)",
+    re.IGNORECASE,
+)
+_COMPLEX_QUERY_PATTERN = re.compile(
+    r"(为什么|如何|概括|总结|比较|对比|分别|以及|并且|同时|结合|影响|原因|差别|区别|优缺点)",
+    re.IGNORECASE,
+)
+_BOOLEAN_OPERATOR_PATTERN = re.compile(r"\b(?:OR|AND|NOT)\b", re.IGNORECASE)
+_NUMERIC_UNIT_PATTERN = re.compile(
+    r"[-+]?\d+(?:\.\d+)?\s*(?:hz|khz|mhz|ma|mg/d|mg|%|week|weeks|month|months|year|years|分钟|小时|周|个月|例|岁|分)",
+    re.IGNORECASE,
+)
+
+
+def _is_short_query_text(query: str) -> bool:
+    compact = _normalize_query_text(query)
+    if not compact:
+        return False
+    token_count = len(_tokenize(compact))
+    return len(compact) <= 96 or token_count <= 10
+
+
+def _has_strong_exact_term_signal(query: str, exact_terms: list[str]) -> bool:
+    if _is_table_or_figure_query(query):
+        return True
+    if _NUMERIC_UNIT_PATTERN.search(query or ""):
+        return True
+    for term in exact_terms:
+        normalized = _normalize_query_text(term)
+        if not normalized:
+            continue
+        if re.search(r"[A-Z]", normalized) or re.search(r"\d", normalized) or any(char in normalized for char in "-/()"):
+            return True
+    return False
+
+
+def _looks_like_decontextualization_short_query(query: str) -> bool:
+    compact = _normalize_query_text(query)
+    if not compact or not _is_short_query_text(compact):
+        return False
+    return bool(_SHORT_QUERY_DECONTEXT_PATTERN.search(compact))
+
+
+def _looks_like_complex_multi_query(query: str) -> bool:
+    compact = _normalize_query_text(query)
+    if not compact:
+        return False
+    token_count = len(_tokenize(compact))
+    return token_count >= 12 or bool(_COMPLEX_QUERY_PATTERN.search(compact))
+
+
+def _classify_query_type(query: str, exact_terms: list[str]) -> str:
+    if _looks_like_decontextualization_short_query(query):
+        return "decontextualization_short"
+    if _is_short_query_text(query) and _has_strong_exact_term_signal(query, exact_terms):
+        return "exact_heavy_short"
+    if _looks_like_complex_multi_query(query):
+        return "complex_multi_query"
+    return "general"
+
+
+def _sanitize_exact_terms(values: Iterable[str]) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = _normalize_query_text(str(value).strip(" \t\r\n\"'`[]{}"))
+        if not normalized:
+            continue
+        if _BOOLEAN_OPERATOR_PATTERN.fullmatch(normalized):
+            continue
+        lowered = normalized.lower()
+        if lowered in seen:
+            continue
+        cleaned.append(normalized)
+        seen.add(lowered)
+    return cleaned
+
+
+def _sanitize_sparse_query_text(text: str) -> str:
+    normalized = _normalize_query_text(text)
+    if not normalized:
+        return ""
+    normalized = re.sub(r"[\"'`]+", " ", normalized)
+    normalized = _BOOLEAN_OPERATOR_PATTERN.sub(" ", normalized)
+    normalized = re.sub(r"[(){}\[\]]+", " ", normalized)
+    return _normalize_query_text(normalized)
+
+
+def _backfill_exact_terms_into_query(
+    query: str,
+    *,
+    exact_terms: list[str],
+    query_type: str,
+) -> tuple[str, list[str]]:
+    normalized_query = _sanitize_sparse_query_text(query)
+    if not normalized_query or query_type not in {"exact_heavy_short", "decontextualization_short"}:
+        return normalized_query, []
+    protected_terms = [
+        term
+        for term in exact_terms
+        if re.search(r"[A-Za-z]", term) or re.search(r"\d", term) or any(char in term for char in "-/()")
+    ]
+    missing_terms = [term for term in protected_terms if term.lower() not in normalized_query.lower()]
+    if not missing_terms:
+        return normalized_query, []
+    backfilled_terms = missing_terms[:4]
+    return _normalize_query_text(f"{normalized_query} {' '.join(backfilled_terms)}"), backfilled_terms
+
+
 def _is_exact_match_heavy_query(query: str, exact_terms: list[str] | None = None) -> bool:
     terms = exact_terms if exact_terms is not None else _extract_exact_match_terms(query)
+    query_type = _classify_query_type(query, terms)
+    if query_type == "exact_heavy_short":
+        return True
     if _is_table_or_figure_query(query):
         return True
     if _is_cjk_dominant_text(query):
         return False
-    return len(terms) >= 2
+    return len(terms) >= 2 or _has_strong_exact_term_signal(query, terms)
 
 
 def _chunk_text_payload(chunk: PaperChunk, *, include_supporting_context: bool = False) -> str:
@@ -423,7 +541,7 @@ def _build_heuristic_retrieval_query_en(query: str, exact_terms: list[str]) -> t
     if not combined_terms:
         return "", None
     fallback_source = "template_rules" if template_terms or structural_terms else "exact_terms"
-    return _normalize_query_text(" ".join(combined_terms[:8])), fallback_source
+    return _sanitize_sparse_query_text(" ".join(combined_terms[:8])), fallback_source
 
 
 def _llm_available_for_grounding() -> bool:
@@ -434,6 +552,8 @@ def _query_variants_for_plan(
     *,
     original_query: str,
     detected_language: str,
+    query_type: str,
+    exact_guardrail_query_en: str,
     retrieval_query_en: str,
     subqueries_en: list[str],
 ) -> list[RetrievalQueryVariant]:
@@ -449,6 +569,17 @@ def _query_variants_for_plan(
                 role="original",
             )
         )
+        if exact_guardrail_query_en:
+            variants.append(
+                RetrievalQueryVariant(
+                    name="en_exact_terms",
+                    query=exact_guardrail_query_en,
+                    language="en",
+                    use_sparse=True,
+                    use_dense=False,
+                    role="guardrail",
+                )
+            )
         if retrieval_query_en:
             variants.append(
                 RetrievalQueryVariant(
@@ -460,7 +591,8 @@ def _query_variants_for_plan(
                     role="rewrite",
                 )
             )
-        for index, subquery in enumerate(subqueries_en, start=1):
+        allow_subqueries = query_type == "complex_multi_query"
+        for index, subquery in enumerate(subqueries_en if allow_subqueries else [], start=1):
             variants.append(
                 RetrievalQueryVariant(
                     name=f"en_subquery_{index}",
@@ -489,10 +621,12 @@ def _serialize_query_plan(plan: RetrievalQueryPlan) -> dict[str, Any]:
     return {
         "original_query": plan.original_query,
         "detected_language": plan.detected_language,
+        "query_type": plan.query_type,
         "generation_instruction": plan.generation_instruction,
         "rerank_query": plan.rerank_query,
         "exact_terms": list(plan.exact_terms),
         "retrieval_query_en": plan.retrieval_query_en,
+        "exact_guardrail_query_en": plan.exact_guardrail_query_en,
         "subqueries_en": list(plan.subqueries_en),
         "rewrite_status": plan.rewrite_status,
         "llm_rewrite_status": plan.llm_rewrite_status,
@@ -502,6 +636,7 @@ def _serialize_query_plan(plan: RetrievalQueryPlan) -> dict[str, Any]:
         "rewrite_model": plan.rewrite_model,
         "fallback_source": plan.fallback_source,
         "rewrite_error": plan.rewrite_error,
+        "rewrite_backfilled_terms": list(plan.rewrite_backfilled_terms),
         "variants": [
             {
                 "name": variant.name,
@@ -520,8 +655,10 @@ def _build_crosslingual_query_plan(query: str) -> RetrievalQueryPlan:
     original_query = _normalize_query_text(query)
     detected_language = _detect_query_language(original_query)
     retrieval_query_en = ""
+    exact_guardrail_query_en = ""
     subqueries_en: list[str] = []
-    exact_terms = _unique_strings(_extract_exact_match_terms(original_query))
+    exact_terms = _sanitize_exact_terms(_extract_exact_match_terms(original_query))
+    query_type = _classify_query_type(original_query, exact_terms)
     generation_instruction = _default_generation_instruction(detected_language)
     rewrite_status = "not_needed"
     llm_rewrite_status = "not_needed"
@@ -531,8 +668,10 @@ def _build_crosslingual_query_plan(query: str) -> RetrievalQueryPlan:
     rewrite_model: str | None = None
     fallback_source: str | None = None
     rewrite_error: str | None = None
+    rewrite_backfilled_terms: list[str] = []
 
     if detected_language in {"zh", "mixed"}:
+        exact_guardrail_query_en, fallback_source = _build_heuristic_retrieval_query_en(original_query, exact_terms)
         llm_config = get_chat_llm_configuration()
         rewrite_provider = str(llm_config.get("provider") or "") or None
         llm_rewrite_status = "not_attempted_config_unavailable"
@@ -583,17 +722,26 @@ def _build_crosslingual_query_plan(query: str) -> RetrievalQueryPlan:
                         time.perf_counter() - rewrite_started_at,
                     )
                 else:
-                    retrieval_query_en = _normalize_query_text(str(payload.get("retrieval_query_en") or ""))
-                    subqueries_en = _unique_strings(payload.get("subqueries_en") or [])[
+                    retrieval_query_en = _sanitize_sparse_query_text(str(payload.get("retrieval_query_en") or ""))
+                    subqueries_en = [_sanitize_sparse_query_text(item) for item in _unique_strings(payload.get("subqueries_en") or [])][
                         : settings.rag_crosslingual_max_subqueries
                     ]
-                    exact_terms = _unique_strings(
+                    exact_terms = _sanitize_exact_terms(
                         [
                             *exact_terms,
                             *(payload.get("exact_terms") or []),
                             *_extract_exact_match_terms(retrieval_query_en),
                         ]
                     )
+                    query_type = _classify_query_type(original_query, exact_terms)
+                    if query_type != "complex_multi_query":
+                        subqueries_en = []
+                    retrieval_query_en, rewrite_backfilled_terms = _backfill_exact_terms_into_query(
+                        retrieval_query_en,
+                        exact_terms=exact_terms,
+                        query_type=query_type,
+                    )
+                    exact_guardrail_query_en, fallback_source = _build_heuristic_retrieval_query_en(original_query, exact_terms)
                     generation_instruction = _normalize_query_text(
                         str(payload.get("generation_instruction") or generation_instruction)
                     ) or generation_instruction
@@ -611,7 +759,7 @@ def _build_crosslingual_query_plan(query: str) -> RetrievalQueryPlan:
                         time.perf_counter() - rewrite_started_at,
                     )
         if not retrieval_query_en:
-            retrieval_query_en, fallback_source = _build_heuristic_retrieval_query_en(original_query, exact_terms)
+            retrieval_query_en = exact_guardrail_query_en
             if retrieval_query_en:
                 rewrite_status = "heuristic_template" if fallback_source == "template_rules" else "heuristic_terms"
             else:
@@ -619,19 +767,27 @@ def _build_crosslingual_query_plan(query: str) -> RetrievalQueryPlan:
                 rewrite_status = "fallback_empty"
 
     rerank_query = retrieval_query_en or original_query
+    guardrail_query_en = ""
+    if detected_language in {"zh", "mixed"} and exact_guardrail_query_en:
+        if not retrieval_query_en or exact_guardrail_query_en.lower() != retrieval_query_en.lower():
+            guardrail_query_en = exact_guardrail_query_en
     variants = _query_variants_for_plan(
         original_query=original_query,
         detected_language=detected_language,
+        query_type=query_type,
+        exact_guardrail_query_en=guardrail_query_en,
         retrieval_query_en=retrieval_query_en,
         subqueries_en=subqueries_en,
     )
     return RetrievalQueryPlan(
         original_query=original_query,
         detected_language=detected_language,
+        query_type=query_type,
         generation_instruction=generation_instruction,
         rerank_query=rerank_query,
         exact_terms=tuple(exact_terms),
         retrieval_query_en=retrieval_query_en or None,
+        exact_guardrail_query_en=guardrail_query_en or None,
         subqueries_en=tuple(subqueries_en),
         variants=tuple(variants),
         rewrite_status=rewrite_status,
@@ -642,6 +798,7 @@ def _build_crosslingual_query_plan(query: str) -> RetrievalQueryPlan:
         rewrite_model=rewrite_model,
         fallback_source=fallback_source,
         rewrite_error=rewrite_error,
+        rewrite_backfilled_terms=tuple(rewrite_backfilled_terms),
     )
 
 
@@ -976,6 +1133,186 @@ def _load_chunk_record_map(
     return {int(chunk.id): (chunk, paper) for chunk, paper in rows}
 
 
+def _should_expand_multi_span_candidates(query: str, *, query_plan: RetrievalQueryPlan) -> bool:
+    if not query.strip() or _is_table_or_figure_query(query):
+        return False
+    if query_plan.query_type in {"exact_heavy_short", "decontextualization_short"}:
+        return False
+    if query_plan.subqueries_en:
+        return True
+    normalized_query = re.sub(r"\s+", " ", query).strip().lower()
+    patterns = (
+        r"分别",
+        r"各自",
+        r"哪些",
+        r"以及",
+        r"同时",
+        r"原因",
+        r"退出",
+        r"why .* reasons?",
+        r"reasons? for",
+        r"respectively",
+        r"\bboth\b",
+    )
+    return any(re.search(pattern, normalized_query, re.IGNORECASE) for pattern in patterns)
+
+
+def _merge_ranked_candidates(
+    primary: list[dict[str, Any]],
+    additional: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    merged: dict[int, dict[str, Any]] = {int(item["chunk_id"]): dict(item) for item in primary}
+    for item in additional:
+        chunk_id = int(item["chunk_id"])
+        existing = merged.get(chunk_id)
+        if existing is None:
+            merged[chunk_id] = dict(item)
+            continue
+        existing["score"] = max(float(existing.get("score") or 0.0), float(item.get("score") or 0.0))
+        existing_scores = existing.setdefault("source_scores", {})
+        new_scores = item.get("source_scores") if isinstance(item.get("source_scores"), dict) else {}
+        for key, value in new_scores.items():
+            existing_scores[key] = max(float(existing_scores.get(key) or 0.0), float(value))
+        existing_ranks = existing.setdefault("source_ranks", {})
+        new_ranks = item.get("source_ranks") if isinstance(item.get("source_ranks"), dict) else {}
+        for key, value in new_ranks.items():
+            if key not in existing_ranks:
+                existing_ranks[key] = int(value)
+        existing_anchor_ids = {int(item_id) for item_id in existing.get("expansion_anchor_ids", [])}
+        existing_anchor_ids.update(int(item_id) for item_id in item.get("expansion_anchor_ids", []) if str(item_id).isdigit())
+        if existing_anchor_ids:
+            existing["expansion_anchor_ids"] = sorted(existing_anchor_ids)
+        existing_sources = {str(source) for source in existing.get("expansion_sources", [])}
+        existing_sources.update(str(source) for source in item.get("expansion_sources", []) if str(source).strip())
+        if existing_sources:
+            existing["expansion_sources"] = sorted(existing_sources)
+    ranked = list(merged.values())
+    ranked.sort(
+        key=lambda candidate: (
+            float(candidate.get("score") or 0.0),
+            max((float(score) for score in candidate.get("source_scores", {}).values()), default=0.0),
+        ),
+        reverse=True,
+    )
+    for rank, item in enumerate(ranked, start=1):
+        item["rank"] = rank
+    return ranked[:limit]
+
+
+def _expand_retrieval_candidates(
+    db: Session,
+    *,
+    query: str,
+    candidates: list[dict[str, Any]],
+    record_map: dict[int, tuple[PaperChunk, Paper]],
+    organization_id: int,
+    query_plan: RetrievalQueryPlan,
+    limit: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    stats: dict[str, Any] = {
+        "enabled": False,
+        "expanded_candidate_count": 0,
+        "expansion_added_ids": [],
+    }
+    if not candidates or not _should_expand_multi_span_candidates(query, query_plan=query_plan):
+        return candidates, stats
+
+    anchor_candidates: list[tuple[dict[str, Any], PaperChunk]] = []
+    parent_ids: set[int] = set()
+    for candidate in candidates:
+        record = record_map.get(int(candidate["chunk_id"]))
+        if record is None:
+            continue
+        chunk, _paper = record
+        if str(getattr(chunk, "chunk_role", "child") or "child") != "child":
+            continue
+        anchor_candidates.append((candidate, chunk))
+        if chunk.parent_chunk_id is not None:
+            parent_ids.add(int(chunk.parent_chunk_id))
+
+    if not anchor_candidates or not parent_ids:
+        return candidates, stats
+
+    stats["enabled"] = True
+    expanded_limit = min(max(limit + 6, limit), 24)
+    max_siblings_per_anchor = 2
+
+    related_rows = db.execute(
+        select(PaperChunk, Paper)
+        .join(Paper, Paper.id == PaperChunk.paper_id)
+        .where(
+            Paper.deleted_at.is_(None),
+            Paper.organization_id == organization_id,
+            (PaperChunk.parent_chunk_id.in_(parent_ids)) | (PaperChunk.id.in_(parent_ids)),
+        )
+    ).all()
+    related_record_map = {int(chunk.id): (chunk, paper) for chunk, paper in related_rows}
+
+    parent_rows: dict[int, PaperChunk] = {}
+    sibling_rows_by_parent: dict[int, list[PaperChunk]] = {}
+    for chunk, _paper in related_rows:
+        if int(chunk.id) in parent_ids and str(getattr(chunk, "chunk_role", "child") or "child") == "parent":
+            parent_rows[int(chunk.id)] = chunk
+            continue
+        if chunk.parent_chunk_id is None:
+            continue
+        sibling_rows_by_parent.setdefault(int(chunk.parent_chunk_id), []).append(chunk)
+
+    anchor_ids = {int(chunk.id) for _, chunk in anchor_candidates}
+    additional_candidates: list[dict[str, Any]] = []
+    for candidate, anchor_chunk in anchor_candidates:
+        anchor_score = float(candidate.get("score") or 0.0)
+        anchor_rank = int(candidate.get("rank") or 0)
+        parent_id = int(anchor_chunk.parent_chunk_id or 0)
+        if parent_id <= 0:
+            continue
+        sibling_rows = [
+            sibling
+            for sibling in sibling_rows_by_parent.get(parent_id, [])
+            if int(sibling.id) not in anchor_ids and int(sibling.id) != int(anchor_chunk.id)
+        ]
+        sibling_rows.sort(key=lambda sibling: (abs(int(sibling.chunk_index or 0) - int(anchor_chunk.chunk_index or 0)), int(sibling.chunk_index or 0)))
+        for sibling_rank, sibling in enumerate(sibling_rows[:max_siblings_per_anchor], start=1):
+            decay = max(0.62, 0.88 - (sibling_rank - 1) * 0.12)
+            additional_candidates.append(
+                {
+                    "chunk_id": int(sibling.id),
+                    "paper_id": int(sibling.paper_id),
+                    "score": anchor_score * decay,
+                    "source_scores": {"expansion_sibling": anchor_score * decay},
+                    "source_ranks": {"expansion_sibling": max(anchor_rank, 1)},
+                    "expansion_anchor_ids": [int(anchor_chunk.id)],
+                    "expansion_sources": ["sibling"],
+                }
+            )
+        parent_row = parent_rows.get(parent_id)
+        if parent_row is not None:
+            parent_score = anchor_score * 0.72
+            additional_candidates.append(
+                {
+                    "chunk_id": int(parent_row.id),
+                    "paper_id": int(parent_row.paper_id),
+                    "score": parent_score,
+                    "source_scores": {"expansion_parent": parent_score},
+                    "source_ranks": {"expansion_parent": max(anchor_rank, 1)},
+                    "expansion_anchor_ids": [int(anchor_chunk.id)],
+                    "expansion_sources": ["parent"],
+                }
+            )
+
+    if not additional_candidates:
+        return candidates, stats
+
+    merged = _merge_ranked_candidates(candidates, additional_candidates, limit=expanded_limit)
+    added_ids = [int(item["chunk_id"]) for item in merged if int(item["chunk_id"]) not in {int(candidate["chunk_id"]) for candidate in candidates}]
+    record_map.update(related_record_map)
+    stats["expanded_candidate_count"] = len(added_ids)
+    stats["expansion_added_ids"] = added_ids
+    return merged, stats
+
+
 def _serialize_ranked_trace_candidates(
     candidates: list[dict[str, Any]],
     record_map: dict[int, tuple[PaperChunk, Paper]],
@@ -1011,6 +1348,10 @@ def _serialize_ranked_trace_candidates(
             row["exact_match_bonus"] = round(float(item["exact_match_bonus"]), 4)
         if item.get("exact_match_terms"):
             row["exact_match_terms"] = [str(term) for term in item["exact_match_terms"]]
+        if item.get("expansion_sources"):
+            row["expansion_sources"] = [str(source) for source in item["expansion_sources"]]
+        if item.get("expansion_anchor_ids"):
+            row["expansion_anchor_ids"] = [int(anchor_id) for anchor_id in item["expansion_anchor_ids"]]
         if item.get("rerank_context_chars") is not None:
             row["rerank_context_chars"] = int(item["rerank_context_chars"])
         if item.get("rerank_evidence_blocks") is not None:
@@ -2164,7 +2505,10 @@ def _search_chunks(
     limit = top_k or settings.rag_top_k
     query_plan = _build_crosslingual_query_plan(query)
     exact_terms = list(query_plan.exact_terms)
-    exact_match_heavy = _is_exact_match_heavy_query(query_plan.rerank_query, exact_terms)
+    exact_match_heavy = query_plan.query_type == "exact_heavy_short" or _is_exact_match_heavy_query(
+        query_plan.original_query,
+        exact_terms,
+    )
     exact_terms_for_boost = exact_terms if exact_match_heavy or _is_table_or_figure_query(query) else []
     if not _is_postgres_session(db):
         variant_results: dict[str, list[RetrievalResult]] = {}
@@ -2327,10 +2671,26 @@ def _search_chunks(
         ],
         organization_id=organization_id,
     )
+    expanded_candidates = fused_candidates
+    expansion_stats: dict[str, Any] = {
+        "enabled": False,
+        "expanded_candidate_count": 0,
+        "expansion_added_ids": [],
+    }
+    if fused_candidates:
+        expanded_candidates, expansion_stats = _expand_retrieval_candidates(
+            db,
+            query=query,
+            candidates=fused_candidates,
+            record_map=record_map,
+            organization_id=organization_id,
+            query_plan=query_plan,
+            limit=fusion_limit,
+        )
     if exact_terms_for_boost:
-        fused_candidates = _boost_exact_match_candidates(query, candidates=fused_candidates, record_map=record_map)[:fusion_limit]
+        expanded_candidates = _boost_exact_match_candidates(query, candidates=expanded_candidates, record_map=record_map)[: max(fusion_limit, len(expanded_candidates))]
 
-    reranked_candidates = fused_candidates
+    reranked_candidates = expanded_candidates
     rerank_status = "skipped"
     rerank_error: str | None = None
     rerank_context_stats: dict[str, Any] = {
@@ -2339,12 +2699,12 @@ def _search_chunks(
         "max_document_chars": 0,
         "over_budget_truncated_count": 0,
     }
-    if fused_candidates:
+    if expanded_candidates:
         try:
             reranked_candidates, rerank_context_stats = _apply_reranking(
                 db,
                 query_plan.rerank_query,
-                fused_candidates=fused_candidates,
+                fused_candidates=expanded_candidates,
                 record_map=record_map,
                 limit=max(settings.rag_rerank_top_n, limit),
             )
@@ -2354,13 +2714,13 @@ def _search_chunks(
                 "Rerank failed, falling back to fused order: user_query=%s rerank_query=%s fused_count=%s rerank_limit=%s rerank_context_stats=%s error=%s",
                 _preview_log_text(query, limit=200),
                 _preview_log_text(query_plan.rerank_query, limit=200),
-                len(fused_candidates),
+                len(expanded_candidates),
                 max(settings.rag_rerank_top_n, limit),
                 rerank_context_stats,
                 exc,
                 exc_info=True,
             )
-            reranked_candidates = fused_candidates[: max(settings.rag_rerank_top_n, limit)]
+            reranked_candidates = expanded_candidates[: max(settings.rag_rerank_top_n, limit)]
             rerank_status = "fallback_to_fused"
             rerank_error = "rerank_failed"
 
@@ -2373,6 +2733,7 @@ def _search_chunks(
                 "sparse_candidates": _serialize_ranked_trace_candidates(sparse_hits, record_map),
                 "dense_candidates": _serialize_ranked_trace_candidates(dense_hits, record_map),
                 "fused_candidates": _serialize_ranked_trace_candidates(fused_candidates, record_map),
+                "expanded_candidates": _serialize_ranked_trace_candidates(expanded_candidates, record_map),
                 "reranked_candidates": _serialize_ranked_trace_candidates(reranked_candidates, record_map),
                 "retrieval_backend": "postgres_hybrid",
                 "exact_match_terms": exact_terms,
@@ -2383,6 +2744,7 @@ def _search_chunks(
                 "sparse_limit": sparse_limit,
                 "dense_limit": dense_limit,
                 "fusion_limit": fusion_limit,
+                "expansion_stats": expansion_stats,
                 "rerank_status": rerank_status,
                 "rerank_error": rerank_error,
                 "rerank_context_stats": rerank_context_stats,
