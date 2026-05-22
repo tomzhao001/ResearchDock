@@ -10,6 +10,7 @@ from app.evals.sample_data import (
     SampleQuestion,
     ResolvedQuestion,
     evaluate_retrieval,
+    _grade_heuristic,
     ingest_sample_data_papers,
     load_sample_data_paper_specs,
     load_sample_data_questions,
@@ -305,3 +306,104 @@ def test_evaluate_retrieval_uses_content_hit_instead_of_gold_chunk_id(db_session
     assert report["questions"][0]["mrr"] == 1.0
     assert report["questions"][0]["retrieved"][0]["chunk_id"] == 101
     assert report["questions"][0]["retrieved"][0]["matched_evidence_indexes"] == [0]
+
+
+def test_evaluate_retrieval_reports_gold_alignment_when_chunk_id_hits_but_text_does_not(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+    user,
+) -> None:
+    question = SampleQuestion(
+        q_id="table_alignment",
+        question="表格里这一行的 p-value 是多少？",
+        category="table_result",
+        difficulty="medium",
+        language="zh",
+        requires_multi_span=False,
+        needs_table_or_figure=True,
+        allow_fallback_general=False,
+        expected_abstention=False,
+        gold_evidence=(GoldEvidence(paper_key="paper", snippet="Time -0.192 0.092 35 -2.075 0.045"),),
+        expected_keywords=("0.045",),
+        keyword_hit_threshold=1,
+    )
+    resolved = ResolvedQuestion(
+        question=question,
+        gold_chunk_ids=(101,),
+        gold_chunk_indices=(3,),
+        gold_paper_ids=(7,),
+        gold_evidence_texts=("Time -0.192 0.092 35 -2.075 0.045",),
+        gold_evidence_refs=((7, "Time -0.192 0.092 35 -2.075 0.045"),),
+    )
+    paper = Paper(id=7, organization_id=user.organization_id, title="Demo Paper", status="completed")
+    chunk = PaperChunk(
+        id=101,
+        paper_id=7,
+        chunk_index=3,
+        content="Table 1\nTime row fragment",
+        embedding=None,
+        token_count=8,
+        page_from=1,
+        page_to=1,
+        metadata_json={"body_text": "Table 1\nTime row fragment"},
+    )
+
+    def fake_search(_db, *, query: str, organization_id: int, top_k: int | None = None, trace: dict | None = None):
+        assert query == question.question
+        assert organization_id == user.organization_id
+        if trace is not None:
+            trace.update(
+                {
+                    "retrieval_backend": "postgres_hybrid",
+                    "sparse_candidates": [{"chunk_id": 101, "paper_id": 7, "score": 0.9, "snippet": "Table 1 Time row fragment"}],
+                    "dense_candidates": [],
+                    "fused_candidates": [{"chunk_id": 101, "paper_id": 7, "score": 0.9, "snippet": "Table 1 Time row fragment"}],
+                    "reranked_candidates": [{"chunk_id": 101, "paper_id": 7, "score": 0.9, "snippet": "Table 1 Time row fragment"}],
+                }
+            )
+        return [RetrievalResult(chunk=chunk, paper=paper, score=0.9)]
+
+    monkeypatch.setattr("app.evals.sample_data._search_chunks", fake_search)
+    monkeypatch.setattr("app.evals.sample_data.ensure_sample_data_eval_user", lambda _db: user)
+
+    report = evaluate_retrieval(db_session, [resolved])
+
+    assert report["questions"][0]["hit@10"] is False
+    assert report["questions"][0]["stage_gold_chunk_ranks"]["reranked"] == 1
+    assert report["questions"][0]["likely_failure_stage"] == "gold_alignment"
+    assert report["questions"][0]["gold_alignment_detected"] is True
+
+
+def test_grade_heuristic_uses_citation_text_match_instead_of_gold_chunk_id() -> None:
+    question = SampleQuestion(
+        q_id="heuristic_alignment",
+        question="本文纳入研究对象总共多少例？",
+        category="single_fact",
+        difficulty="easy",
+        language="zh",
+        requires_multi_span=False,
+        needs_table_or_figure=False,
+        allow_fallback_general=False,
+        expected_abstention=False,
+        gold_evidence=(GoldEvidence(paper_key="paper", snippet="纳入109例患儿"),),
+        expected_keywords=("109例",),
+        keyword_hit_threshold=1,
+    )
+    resolved = ResolvedQuestion(
+        question=question,
+        gold_chunk_ids=(999,),
+        gold_chunk_indices=(0,),
+        gold_paper_ids=(7,),
+        gold_evidence_texts=("纳入109例患儿",),
+        gold_evidence_refs=((7, "纳入109例患儿"),),
+    )
+    heuristic = _grade_heuristic(
+        resolved,
+        "本文共纳入109例患儿，随机分组。",
+        citations=[{"chunk_id": 101, "paper_id": 7, "snippet": "本文共纳入109例患儿，随机分组。"}],
+        answer_mode="knowledge_base",
+    )
+
+    assert heuristic["cited_gold"] == 1
+    assert heuristic["citation_precision"] == 1.0
+    assert heuristic["grounded"] is True

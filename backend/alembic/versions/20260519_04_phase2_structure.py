@@ -1,7 +1,7 @@
 """phase2 structure-first schema
 
-Revision ID: 20260519_03
-Revises: 20260519_02
+Revision ID: 20260519_04
+Revises: 20260519_03
 Create Date: 2026-05-19 16:10:00
 """
 
@@ -12,8 +12,8 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 
-revision: str = "20260519_03"
-down_revision: Union[str, None] = "20260519_02"
+revision: str = "20260519_04"
+down_revision: Union[str, None] = "20260519_03"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

@@ -1223,13 +1223,21 @@ def _serialize_table_rows(data: object, *, max_rows: int = 8) -> str:
 
 
 def _compose_table_text(*, caption: str | None, markdown: str | None, data: object) -> str:
+    return _compose_table_text_with_mode(caption=caption, markdown=markdown, data=data)[0]
+
+
+def _compose_table_text_with_mode(*, caption: str | None, markdown: str | None, data: object) -> tuple[str, str]:
     parts = [str(caption or "").strip()]
     serialized_rows = _serialize_table_rows(data)
     if serialized_rows:
         parts.append(serialized_rows)
+        mode = "rows"
     elif str(markdown or "").strip():
         parts.append(str(markdown or "").strip())
-    return "\n".join(part for part in parts if part)
+        mode = "markdown"
+    else:
+        mode = "caption_only"
+    return "\n".join(part for part in parts if part), mode
 
 
 def _structure_sort_key(*, reading_order: int | None, page_number: int | None, fallback_group: int, fallback_index: int) -> tuple[int, int, int, int]:
@@ -1392,6 +1400,7 @@ def _make_chunk_record(
             "docling_labels": sorted({str(block.get("docling_label")) for block in block_rows if str(block.get("docling_label") or "").strip()}),
             "table_markdown": next((block.get("table_markdown") for block in block_rows if block.get("table_markdown")), None),
             "table_data_json": next((block.get("table_data_json") for block in block_rows if block.get("table_data_json") is not None), None),
+            "table_text_mode": next((str(block.get("table_text_mode")) for block in block_rows if str(block.get("table_text_mode") or "").strip()), None),
             "picture_description": next((block.get("picture_description") for block in block_rows if block.get("picture_description")), None),
         },
     }
@@ -1427,9 +1436,9 @@ def _split_text(
     document_text = " ".join(str(block.get("text") or "") for block in normalized_blocks[:80] if str(block.get("block_type") or "") != "heading")
     document_is_cjk_dominant = _is_cjk_dominant_text(document_text)
     child_chunk_size = (
-        min(chunk_size, max(int(chunk_size * 0.85), chunk_size - overlap, 320))
+        min(chunk_size, max(int(chunk_size * 0.85), chunk_size - overlap, 360))
         if document_is_cjk_dominant
-        else min(chunk_size, max(min(chunk_size // 2, 500), 220))
+        else min(chunk_size, max(int(chunk_size * 0.65), 420))
     )
     chunks: list[dict[str, Any]] = []
     parent_chunks_by_section: dict[str, dict[str, Any]] = {}
@@ -1516,8 +1525,11 @@ def _split_text(
                     supporting_context_rows=_select_supporting_context(normalized_blocks, table_blocks),
                 )
             else:
-                body_piece_size = max(chunk_size - len(block_text) - 2, min(chunk_size // 2, 220))
-                body_piece_size = max(body_piece_size, min(chunk_size, 220))
+                available_with_caption = max(chunk_size - len(block_text) - 2, 0)
+                body_piece_size = max(
+                    min(max(available_with_caption, child_chunk_size), chunk_size),
+                    min(chunk_size, 420),
+                )
                 windows = _window_text(table_body_text, chunk_size=body_piece_size, overlap=min(overlap, max(body_piece_size - 1, 0)))
                 if not windows:
                     append_chunk(
@@ -1532,8 +1544,8 @@ def _split_text(
                         piece_block["char_start"] = next_char_start + int(piece["char_start"])
                         piece_block["char_end"] = next_char_start + int(piece["char_end"])
                         piece_body_text = str(piece["content"])
-                        combined_blocks = [{**block, "text": block_text}, piece_block] if window_index == 0 else [piece_block]
-                        combined_body_text = f"{block_text}\n\n{piece_body_text}" if window_index == 0 else piece_body_text
+                        combined_blocks = [{**block, "text": block_text}, piece_block]
+                        combined_body_text = f"{block_text}\n\n{piece_body_text}"
                         append_chunk(
                             combined_blocks,
                             supporting_context_rows=_select_supporting_context(normalized_blocks, table_blocks),
@@ -1656,7 +1668,11 @@ def _build_preanalysis_from_document_structure(db: Session, *, paper_id: int) ->
         .order_by(PaperDocumentTable.table_index.asc(), PaperDocumentTable.id.asc())
     ).all()
     for fallback_index, table in enumerate(tables):
-        text_value = _compose_table_text(caption=table.caption, markdown=table.markdown, data=table.data_json)
+        text_value, table_text_mode = _compose_table_text_with_mode(
+            caption=table.caption,
+            markdown=table.markdown,
+            data=table.data_json,
+        )
         if not text_value:
             continue
         char_start = char_cursor
@@ -1678,6 +1694,7 @@ def _build_preanalysis_from_document_structure(db: Session, *, paper_id: int) ->
                 "text": text_value,
                 "table_markdown": table.markdown,
                 "table_data_json": table.data_json,
+                "table_text_mode": table_text_mode,
                 "bbox": table.bbox_json if isinstance(table.bbox_json, dict) else None,
                 "provenance": table.provenance_json if isinstance(table.provenance_json, dict) else None,
                 "_sort_key": _structure_sort_key(

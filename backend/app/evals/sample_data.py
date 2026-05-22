@@ -21,7 +21,7 @@ from app.permissions import ROLE_ORG_OWNER
 from app.services.document_extraction import DocumentExtractor
 from app.services.llm import chat_with_messages
 from app.services.papers import create_upload_artifacts, run_pdf_ingest_job
-from app.services.rag import _search_chunks, create_topic, send_topic_message
+from app.services.rag import _chunk_text_payload, _search_chunks, create_topic, send_topic_message
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _SAMPLE_DATA_DIR = _REPO_ROOT / "benchmarks" / "sample-data"
@@ -82,6 +82,22 @@ class ResolvedQuestion:
     gold_paper_ids: tuple[int, ...]
     gold_evidence_texts: tuple[str, ...]
     gold_evidence_refs: tuple[tuple[int, str], ...]
+    gold_evidence_matches: tuple["GoldEvidenceMatch", ...] = ()
+
+
+@dataclass(frozen=True)
+class GoldEvidenceMatch:
+    paper_id: int
+    snippet: str
+    canonical_text: str
+    match_mode: str
+    match_score: float | None = None
+    chunk_ids: tuple[int, ...] = ()
+    chunk_indices: tuple[int, ...] = ()
+    section_paths: tuple[str, ...] = ()
+    source_block_ids: tuple[int, ...] = ()
+    source_table_ids: tuple[int, ...] = ()
+    table_text_modes: tuple[str, ...] = ()
 
 
 def _read_json(path: Path) -> Any:
@@ -98,6 +114,40 @@ def _normalize_text(text: str) -> str:
     lowered = "".join(char for char in normalized.lower() if not unicodedata.combining(char))
     lowered = lowered.replace("–", "-").replace("—", "-").replace("−", "-")
     return re.sub(r"[^\w\u4e00-\u9fff]+", "", lowered)
+
+
+def _gold_ref_paper_id(ref: GoldEvidenceMatch | tuple[int, str]) -> int:
+    if isinstance(ref, GoldEvidenceMatch):
+        return int(ref.paper_id)
+    return int(ref[0])
+
+
+def _gold_ref_snippet(ref: GoldEvidenceMatch | tuple[int, str]) -> str:
+    if isinstance(ref, GoldEvidenceMatch):
+        return str(ref.snippet or "")
+    return str(ref[1] or "")
+
+
+def _gold_ref_canonical_text(ref: GoldEvidenceMatch | tuple[int, str]) -> str:
+    if isinstance(ref, GoldEvidenceMatch):
+        return str(ref.canonical_text or "")
+    return ""
+
+
+def _gold_ref_match_mode(ref: GoldEvidenceMatch | tuple[int, str]) -> str:
+    if isinstance(ref, GoldEvidenceMatch):
+        return str(ref.match_mode or "legacy")
+    return "legacy"
+
+
+def _gold_ref_match_score(ref: GoldEvidenceMatch | tuple[int, str]) -> float | None:
+    if isinstance(ref, GoldEvidenceMatch):
+        return float(ref.match_score) if ref.match_score is not None else None
+    return None
+
+
+def _resolved_gold_refs(resolved: ResolvedQuestion) -> tuple[GoldEvidenceMatch | tuple[int, str], ...]:
+    return resolved.gold_evidence_matches or resolved.gold_evidence_refs
 
 
 def _mean(values: list[float]) -> float:
@@ -175,10 +225,10 @@ def _evidence_matches_chunk(snippet: str, chunk_text: str) -> bool:
 def _best_effort_chunk_window_match(
     snippet: str,
     chunks: list[PaperChunk],
-) -> list[PaperChunk]:
+) -> tuple[list[PaperChunk], float]:
     normalized_snippet = _normalize_text(snippet)
     if not normalized_snippet or not chunks:
-        return []
+        return [], 0.0
 
     snippet_numbers = {token.lower() for token in re.findall(r"[-+]?\d+(?:\.\d+)?", snippet or "")}
     best_window: list[PaperChunk] = []
@@ -205,13 +255,24 @@ def _best_effort_chunk_window_match(
                 best_score = score
                 best_window = window
 
-    return best_window
+    return best_window, best_score
 
 
 def _chunk_match_text(chunk: PaperChunk) -> str:
     metadata = chunk.metadata_json if isinstance(chunk.metadata_json, dict) else {}
-    body_text = metadata.get("body_text") if isinstance(metadata, dict) else None
-    return str(body_text or chunk.content or "")
+    include_supporting_context = any(
+        metadata.get(key)
+        for key in ("supporting_context", "parent_text", "table_markdown", "table_data_json")
+    )
+    return _chunk_text_payload(chunk, include_supporting_context=include_supporting_context)
+
+
+def _build_gold_match_canonical_text(chunks: list[PaperChunk]) -> str:
+    return "\n\n".join(
+        text
+        for text in (_chunk_match_text(chunk).strip() for chunk in chunks)
+        if text
+    )
 
 
 def _summarize_groups(
@@ -257,18 +318,28 @@ def _match_evidence_indexes(
     *,
     paper_id: int | None,
     chunk_text: str,
-    gold_evidence_refs: tuple[tuple[int, str], ...],
+    gold_evidence_refs: tuple[GoldEvidenceMatch | tuple[int, str], ...],
 ) -> set[int]:
     if paper_id is None or not chunk_text:
         return set()
     return {
         index
-        for index, (gold_paper_id, snippet) in enumerate(gold_evidence_refs)
-        if gold_paper_id == paper_id and _evidence_matches_chunk(snippet, chunk_text)
+        for index, ref in enumerate(gold_evidence_refs)
+        if _gold_ref_paper_id(ref) == paper_id
+        and (
+            _evidence_matches_chunk(_gold_ref_snippet(ref), chunk_text)
+            or (
+                _gold_ref_canonical_text(ref)
+                and _evidence_matches_chunk(_gold_ref_canonical_text(ref), chunk_text)
+            )
+        )
     }
 
 
-def _result_match_indexes(result: Any, gold_evidence_refs: tuple[tuple[int, str], ...]) -> set[int]:
+def _result_match_indexes(
+    result: Any,
+    gold_evidence_refs: tuple[GoldEvidenceMatch | tuple[int, str], ...],
+) -> set[int]:
     chunk = getattr(result, "chunk", None)
     return _match_evidence_indexes(
         paper_id=int(getattr(getattr(result, "paper", None), "id", 0) or 0),
@@ -279,7 +350,7 @@ def _result_match_indexes(result: Any, gold_evidence_refs: tuple[tuple[int, str]
 
 def _trace_candidate_match_indexes(
     candidate: dict[str, Any],
-    gold_evidence_refs: tuple[tuple[int, str], ...],
+    gold_evidence_refs: tuple[GoldEvidenceMatch | tuple[int, str], ...],
     *,
     chunk_lookup: dict[int, PaperChunk] | None = None,
 ) -> set[int]:
@@ -299,6 +370,7 @@ def _trace_candidate_match_indexes(
 
 def _classify_retrieval_failure(
     stage_hit_ranks: dict[str, int | None],
+    stage_gold_chunk_ranks: dict[str, int | None],
     *,
     max_k: int,
     gold_chunk_count: int,
@@ -307,9 +379,20 @@ def _classify_retrieval_failure(
     fused_rank = stage_hit_ranks.get("fused")
     sparse_rank = stage_hit_ranks.get("sparse")
     dense_rank = stage_hit_ranks.get("dense")
+    reranked_gold_rank = stage_gold_chunk_ranks.get("reranked")
+    fused_gold_rank = stage_gold_chunk_ranks.get("fused")
+    sparse_gold_rank = stage_gold_chunk_ranks.get("sparse")
+    dense_gold_rank = stage_gold_chunk_ranks.get("dense")
 
     if reranked_rank is not None and reranked_rank <= max_k:
         return "retrieved"
+    if (
+        (reranked_gold_rank is not None and reranked_gold_rank <= max_k and (reranked_rank is None or reranked_rank > max_k))
+        or (fused_gold_rank is not None and fused_gold_rank <= max_k and (fused_rank is None or fused_rank > max_k))
+        or (sparse_gold_rank is not None and sparse_gold_rank <= max_k and (sparse_rank is None or sparse_rank > max_k))
+        or (dense_gold_rank is not None and dense_gold_rank <= max_k and (dense_rank is None or dense_rank > max_k))
+    ):
+        return "gold_alignment"
     if fused_rank is not None and fused_rank <= max_k and (reranked_rank is None or reranked_rank > max_k):
         return "rerank"
     if (
@@ -492,6 +575,7 @@ def resolve_question_gold(
         gold_paper_ids: list[int] = []
         gold_evidence_texts: list[str] = []
         gold_evidence_refs: list[tuple[int, str]] = []
+        gold_evidence_matches: list[GoldEvidenceMatch] = []
         for evidence in question.gold_evidence:
             chunks = chunk_cache.get(evidence.paper_key)
             if chunks is None:
@@ -506,6 +590,8 @@ def resolve_question_gold(
                 None,
             )
             matched_chunks: list[PaperChunk] = [match] if match is not None else []
+            match_mode = "exact" if match is not None else "unmatched"
+            match_score: float | None = 1.0 if match is not None else None
             if match is None:
                 for window_size in (2, 3, 4, 5, 6, 8, 10, 12, 16):
                     for start in range(0, max(len(chunks) - window_size + 1, 0)):
@@ -513,11 +599,15 @@ def resolve_question_gold(
                         combined_text = " ".join(_chunk_match_text(chunk) for chunk in window)
                         if _evidence_matches_chunk(evidence.snippet, combined_text):
                             matched_chunks = window
+                            match_mode = f"window_{window_size}"
+                            match_score = 1.0
                             break
                     if matched_chunks:
                         break
                 if not matched_chunks:
-                    matched_chunks = _best_effort_chunk_window_match(evidence.snippet, chunks)
+                    matched_chunks, match_score = _best_effort_chunk_window_match(evidence.snippet, chunks)
+                    if matched_chunks:
+                        match_mode = "best_effort"
             if not matched_chunks:
                 raise ValueError(f"Unable to resolve gold evidence for {question.q_id}: {evidence.snippet}")
             for matched_chunk in matched_chunks:
@@ -528,6 +618,60 @@ def resolve_question_gold(
                 gold_paper_ids.append(matched_chunk.paper_id)
             gold_evidence_texts.append(evidence.snippet)
             gold_evidence_refs.append((paper.id, evidence.snippet))
+            gold_evidence_matches.append(
+                GoldEvidenceMatch(
+                    paper_id=paper.id,
+                    snippet=evidence.snippet,
+                    canonical_text=_build_gold_match_canonical_text(matched_chunks),
+                    match_mode=match_mode,
+                    match_score=match_score,
+                    chunk_ids=tuple(int(chunk.id) for chunk in matched_chunks),
+                    chunk_indices=tuple(int(chunk.chunk_index) for chunk in matched_chunks),
+                    section_paths=tuple(
+                        str((chunk.metadata_json or {}).get("section_path") or "")
+                        for chunk in matched_chunks
+                        if isinstance(chunk.metadata_json, dict)
+                    ),
+                    source_block_ids=tuple(
+                        sorted(
+                            {
+                                int(item)
+                                for chunk in matched_chunks
+                                for item in (
+                                    ((chunk.metadata_json or {}).get("source_block_ids") or [])
+                                    if isinstance(chunk.metadata_json, dict)
+                                    else []
+                                )
+                                if str(item).isdigit()
+                            }
+                        )
+                    ),
+                    source_table_ids=tuple(
+                        sorted(
+                            {
+                                int(item)
+                                for chunk in matched_chunks
+                                for item in (
+                                    ((chunk.metadata_json or {}).get("source_table_ids") or [])
+                                    if isinstance(chunk.metadata_json, dict)
+                                    else []
+                                )
+                                if str(item).isdigit()
+                            }
+                        )
+                    ),
+                    table_text_modes=tuple(
+                        sorted(
+                            {
+                                str((chunk.metadata_json or {}).get("table_text_mode") or "").strip()
+                                for chunk in matched_chunks
+                                if isinstance(chunk.metadata_json, dict)
+                                and str((chunk.metadata_json or {}).get("table_text_mode") or "").strip()
+                            }
+                        )
+                    ),
+                )
+            )
         resolved.append(
             ResolvedQuestion(
                 question=question,
@@ -536,6 +680,7 @@ def resolve_question_gold(
                 gold_paper_ids=tuple(gold_paper_ids),
                 gold_evidence_texts=tuple(gold_evidence_texts),
                 gold_evidence_refs=tuple(gold_evidence_refs),
+                gold_evidence_matches=tuple(gold_evidence_matches),
             )
         )
     return resolved
@@ -563,6 +708,7 @@ def evaluate_retrieval(
             _preview_text(resolved.question.question),
         )
         retrieval_trace: dict[str, Any] = {}
+        gold_refs = _resolved_gold_refs(resolved)
         results = _search_chunks(
             db,
             query=resolved.question.question,
@@ -570,7 +716,7 @@ def evaluate_retrieval(
             top_k=max_k,
             trace=retrieval_trace,
         )
-        retrieved_match_sets = [_result_match_indexes(item, resolved.gold_evidence_refs) for item in results]
+        retrieved_match_sets = [_result_match_indexes(item, gold_refs) for item in results]
         first_hit_rank = _first_hit_rank_from_match_sets(retrieved_match_sets)
         trace_chunk_ids = {
             int(candidate.get("chunk_id") or -1)
@@ -587,33 +733,38 @@ def evaluate_retrieval(
         stage_hit_ranks = {
             "sparse": _first_hit_rank_from_match_sets(
                 [
-                    _trace_candidate_match_indexes(candidate, resolved.gold_evidence_refs, chunk_lookup=trace_chunk_lookup)
+                    _trace_candidate_match_indexes(candidate, gold_refs, chunk_lookup=trace_chunk_lookup)
                     for candidate in retrieval_trace.get("sparse_candidates", [])
                 ]
             ),
             "dense": _first_hit_rank_from_match_sets(
                 [
-                    _trace_candidate_match_indexes(candidate, resolved.gold_evidence_refs, chunk_lookup=trace_chunk_lookup)
+                    _trace_candidate_match_indexes(candidate, gold_refs, chunk_lookup=trace_chunk_lookup)
                     for candidate in retrieval_trace.get("dense_candidates", [])
                 ]
             ),
             "fused": _first_hit_rank_from_match_sets(
                 [
-                    _trace_candidate_match_indexes(candidate, resolved.gold_evidence_refs, chunk_lookup=trace_chunk_lookup)
+                    _trace_candidate_match_indexes(candidate, gold_refs, chunk_lookup=trace_chunk_lookup)
                     for candidate in retrieval_trace.get("fused_candidates", [])
                 ]
             ),
             "reranked": _first_hit_rank_from_match_sets(
                 [
-                    _trace_candidate_match_indexes(candidate, resolved.gold_evidence_refs, chunk_lookup=trace_chunk_lookup)
+                    _trace_candidate_match_indexes(candidate, gold_refs, chunk_lookup=trace_chunk_lookup)
                     for candidate in retrieval_trace.get("reranked_candidates", [])
                 ]
             ),
         }
+        gold_chunk_id_set = set(resolved.gold_chunk_ids)
+        stage_gold_chunk_ranks = {
+            stage_name: _first_hit_rank(retrieval_trace.get(f"{stage_name}_candidates", []), gold_chunk_id_set)
+            for stage_name in ("sparse", "dense", "fused", "reranked")
+        }
         variant_hit_ranks = {
             variant_name: _first_hit_rank_from_match_sets(
                 [
-                    _trace_candidate_match_indexes(candidate, resolved.gold_evidence_refs, chunk_lookup=trace_chunk_lookup)
+                    _trace_candidate_match_indexes(candidate, gold_refs, chunk_lookup=trace_chunk_lookup)
                     for candidate in variant_payload.get("fused_candidates", [])
                 ]
             )
@@ -622,6 +773,7 @@ def evaluate_retrieval(
         }
         likely_failure_stage = _classify_retrieval_failure(
             stage_hit_ranks,
+            stage_gold_chunk_ranks,
             max_k=max_k,
             gold_chunk_count=len(resolved.gold_chunk_ids),
         )
@@ -642,6 +794,22 @@ def evaluate_retrieval(
                 {"paper_id": paper_id, "snippet": snippet}
                 for paper_id, snippet in resolved.gold_evidence_refs
             ],
+            "gold_evidence_matches": [
+                {
+                    "paper_id": item.paper_id,
+                    "snippet": item.snippet,
+                    "canonical_preview": _preview_text(item.canonical_text, limit=180),
+                    "match_mode": item.match_mode,
+                    "match_score": round(float(item.match_score), 4) if item.match_score is not None else None,
+                    "chunk_ids": list(item.chunk_ids),
+                    "chunk_indices": list(item.chunk_indices),
+                    "section_paths": [path for path in item.section_paths if path],
+                    "source_block_ids": list(item.source_block_ids),
+                    "source_table_ids": list(item.source_table_ids),
+                    "table_text_modes": list(item.table_text_modes),
+                }
+                for item in resolved.gold_evidence_matches
+            ],
             "retrieved": [
                 {
                     "chunk_id": item.chunk.id,
@@ -649,14 +817,21 @@ def evaluate_retrieval(
                     "paper_id": item.paper.id,
                     "paper_title": item.paper.title,
                     "score": round(item.score, 4),
+                    "chunk_preview": _preview_text(_chunk_match_text(item.chunk), limit=180),
+                    "section_path": str(((item.chunk.metadata_json or {}).get("section_path") or "")) if isinstance(item.chunk.metadata_json, dict) else "",
+                    "source_block_ids": list(((item.chunk.metadata_json or {}).get("source_block_ids") or [])) if isinstance(item.chunk.metadata_json, dict) else [],
+                    "source_table_ids": list(((item.chunk.metadata_json or {}).get("source_table_ids") or [])) if isinstance(item.chunk.metadata_json, dict) else [],
+                    "table_text_mode": str(((item.chunk.metadata_json or {}).get("table_text_mode") or "")) if isinstance(item.chunk.metadata_json, dict) else "",
                     "matched_evidence_indexes": sorted(retrieved_match_sets[index]),
                 }
                 for index, item in enumerate(results)
             ],
             "mrr": round(1.0 / first_hit_rank, 4) if first_hit_rank else 0.0,
             "stage_hit_ranks": stage_hit_ranks,
+            "stage_gold_chunk_ranks": stage_gold_chunk_ranks,
             "variant_hit_ranks": variant_hit_ranks,
             "likely_failure_stage": likely_failure_stage,
+            "gold_alignment_detected": likely_failure_stage == "gold_alignment",
             "chunking_risk": len(resolved.gold_chunk_ids) > 1,
             "rewrite_status": rewrite_status,
             "llm_rewrite_status": llm_rewrite_status,
@@ -746,7 +921,12 @@ def _extract_json(content: str) -> dict[str, Any]:
 def _grade_heuristic(resolved: ResolvedQuestion, answer: str, citations: list[dict], answer_mode: str | None) -> dict[str, Any]:
     normalized_answer = _normalize_text(answer)
     keyword_hits = sum(1 for keyword in resolved.question.expected_keywords if _normalize_text(keyword) in normalized_answer)
-    cited_gold = sum(1 for citation in citations if citation.get("chunk_id") in resolved.gold_chunk_ids)
+    gold_refs = _resolved_gold_refs(resolved)
+    cited_gold = sum(
+        1
+        for citation in citations
+        if _trace_candidate_match_indexes(citation, gold_refs)
+    )
     citation_precision = cited_gold / len(citations) if citations else (1.0 if resolved.question.expected_abstention else 0.0)
     abstained = _ABSTAIN_PHRASE in (answer or "")
     abstention_accuracy = abstained == resolved.question.expected_abstention
@@ -859,8 +1039,9 @@ def evaluate_end_to_end(
             if isinstance(retrieval_metadata.get("sufficiency_decision"), dict)
             else {}
         )
+        gold_refs = _resolved_gold_refs(resolved)
         selected_match_sets = [
-            _trace_candidate_match_indexes(candidate, resolved.gold_evidence_refs)
+            _trace_candidate_match_indexes(candidate, gold_refs)
             for candidate in selected_evidence
             if isinstance(candidate, dict)
         ]
