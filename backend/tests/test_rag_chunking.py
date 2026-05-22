@@ -125,12 +125,20 @@ def test_split_text_emits_child_and_parent_chunks(monkeypatch: pytest.MonkeyPatc
 
     child_chunks = [chunk for chunk in chunks if chunk["chunk_role"] == "child"]
     parent_chunks = [chunk for chunk in chunks if chunk["chunk_role"] == "parent"]
+    section_summary_chunks = [chunk for chunk in chunks if chunk["chunk_role"] == "section_summary"]
+    paper_summary_chunks = [chunk for chunk in chunks if chunk["chunk_role"] == "paper_summary"]
 
     assert child_chunks
     assert len(parent_chunks) == 1
+    assert len(section_summary_chunks) == 1
+    assert len(paper_summary_chunks) == 1
     assert all(chunk["metadata_json"]["parent_text"] for chunk in child_chunks)
     assert parent_chunks[0]["metadata_json"]["chunk_role"] == "parent"
     assert "Results" in parent_chunks[0]["metadata_json"]["body_text"]
+    assert section_summary_chunks[0]["metadata_json"]["granularity"] == "section_summary"
+    assert section_summary_chunks[0]["metadata_json"]["source_kind"] == "heuristic_section_summary"
+    assert paper_summary_chunks[0]["metadata_json"]["granularity"] == "paper_summary"
+    assert paper_summary_chunks[0]["metadata_json"]["source_kind"] == "heuristic_paper_summary"
 
 
 def test_extract_exact_match_terms_prefers_table_and_hyphenated_terms() -> None:
@@ -271,8 +279,9 @@ def test_split_text_is_more_conservative_for_cjk_paragraphs(monkeypatch: pytest.
     }
 
     chunks = _split_text(preanalysis=preanalysis, paper_title="中文论文")
+    content_chunks = [chunk for chunk in chunks if chunk["chunk_role"] in {"child", "parent"}]
 
-    assert len(chunks) <= 2
+    assert len(content_chunks) <= 2
     assert chunks[0]["metadata_json"]["supporting_context"] is None
 
 

@@ -616,6 +616,7 @@ def _load_chunk_cache(db: Session, papers_by_key: dict[str, Paper]) -> dict[str,
         chunks = db.scalars(
             select(PaperChunk)
             .where(PaperChunk.paper_id == paper.id)
+            .where(PaperChunk.chunk_role.in_(("child", "parent")))
             .order_by(PaperChunk.chunk_index.asc(), PaperChunk.id.asc())
         ).all()
         cache[paper_key] = chunks
@@ -898,6 +899,9 @@ def evaluate_retrieval(
                     "paper_title": item.paper.title,
                     "score": round(item.score, 4),
                     "chunk_preview": _preview_text(_chunk_match_text(item.chunk), limit=180),
+                    "chunk_role": str(((item.chunk.metadata_json or {}).get("chunk_role") or item.chunk.chunk_role or "")) if isinstance(item.chunk.metadata_json, dict) else str(item.chunk.chunk_role or ""),
+                    "granularity": str(((item.chunk.metadata_json or {}).get("granularity") or (item.chunk.metadata_json or {}).get("chunk_role") or item.chunk.chunk_role or "")) if isinstance(item.chunk.metadata_json, dict) else str(item.chunk.chunk_role or ""),
+                    "source_kind": str(((item.chunk.metadata_json or {}).get("source_kind") or "")) if isinstance(item.chunk.metadata_json, dict) else "",
                     "section_path": str(((item.chunk.metadata_json or {}).get("section_path") or "")) if isinstance(item.chunk.metadata_json, dict) else "",
                     "source_block_ids": list(((item.chunk.metadata_json or {}).get("source_block_ids") or [])) if isinstance(item.chunk.metadata_json, dict) else [],
                     "source_table_ids": list(((item.chunk.metadata_json or {}).get("source_table_ids") or [])) if isinstance(item.chunk.metadata_json, dict) else [],
@@ -922,6 +926,11 @@ def evaluate_retrieval(
             "query_type": query_type,
             "short_query_slice_tags": short_query_slice_tags,
             "guardrail_variant_generated": guardrail_variant_generated,
+            "top_hit_granularity": (
+                str((((results[0].chunk.metadata_json or {}).get("granularity") or (results[0].chunk.metadata_json or {}).get("chunk_role") or results[0].chunk.chunk_role or "")))
+                if results and isinstance(results[0].chunk.metadata_json, dict)
+                else (str(results[0].chunk.chunk_role or "") if results else "")
+            ),
             "rewrite_backfilled_terms": [
                 str(term)
                 for term in (
@@ -996,6 +1005,11 @@ def evaluate_retrieval(
                 for stage in sorted({str(row.get("likely_failure_stage") or "unknown") for row in rows})
             }.items()
         },
+        "by_top_hit_granularity": _summarize_groups(
+            rows,
+            key_fn=lambda row: row.get("top_hit_granularity") or "none",
+            score_fns={"hit@10": lambda row: 1.0 if row.get("hit@10") else 0.0, "mrr": lambda row: float(row["mrr"])},
+        ),
         "rewrite_status_counts": _count_groups(rows, key_fn=lambda row: row.get("rewrite_status") or "unknown"),
         "llm_rewrite_status_counts": _count_groups(rows, key_fn=lambda row: row.get("llm_rewrite_status") or "unknown"),
         "short_query_slices": {

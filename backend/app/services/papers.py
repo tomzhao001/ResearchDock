@@ -961,6 +961,7 @@ def run_pdf_ingest_job(
             db,
             paper_id=paper.id,
             paper_title=paper.title,
+            structured_summary=_extract_structured_summary_from_asset(asset),
         )
         _raise_if_cancel_requested(db, job, paper)
         paper.status = "completed"
@@ -1039,6 +1040,12 @@ def run_paper_summary_job(
             paper.source_url = summary["source_url"]
         if paper.published_at is None and published_at is not None:
             paper.published_at = published_at
+        rebuild_paper_index_from_document_structure(
+            db,
+            paper_id=paper.id,
+            paper_title=paper.title,
+            structured_summary=summary,
+        )
         paper.status = "completed"
         paper.updated_at = datetime.now(timezone.utc)
         job.status = "completed"

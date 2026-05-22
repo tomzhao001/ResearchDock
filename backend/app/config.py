@@ -91,6 +91,11 @@ class Settings(BaseSettings):
     rag_fusion_window: int = 20
     rag_rrf_k: int = 60
     rag_rerank_top_n: int = 10
+    rag_searchable_chunk_roles: str = "child,section_summary,paper_summary"
+    rag_summary_anchor_limit: int = 4
+    rag_section_summary_max_sentences: int = 2
+    rag_section_summary_max_chars: int = 360
+    rag_paper_summary_max_chars: int = 1200
     rerank_max_context_chars: int = 3600
     rerank_max_evidence_blocks: int = 6
     rerank_neighbor_blocks: int = 1

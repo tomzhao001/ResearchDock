@@ -298,13 +298,19 @@ def test_upload_creates_records_and_completes_job(
     assert asset.metadata_json["question_set_extraction"]["questions"][0]["id"] == "q1"
     child_chunks = [chunk for chunk in chunks if chunk.chunk_role == "child"]
     parent_chunks = [chunk for chunk in chunks if chunk.chunk_role == "parent"]
-    assert child_chunks and parent_chunks
+    section_summary_chunks = [chunk for chunk in chunks if chunk.chunk_role == "section_summary"]
+    paper_summary_chunks = [chunk for chunk in chunks if chunk.chunk_role == "paper_summary"]
+    assert child_chunks and parent_chunks and section_summary_chunks and paper_summary_chunks
     assert child_chunks[0].content
     assert child_chunks[0].page_from == 1
     assert child_chunks[0].parent_chunk_id is not None
     assert isinstance(child_chunks[0].metadata_json, dict)
     assert child_chunks[0].metadata_json["section_title"] in {"Front Matter", "Document"}
     assert child_chunks[0].metadata_json["context_header"]
+    assert any(
+        isinstance(chunk.metadata_json, dict) and chunk.metadata_json.get("source_kind") == "structured_summary"
+        for chunk in paper_summary_chunks
+    )
 
     job_response = client.get(f"/api/jobs/{job.id}")
     assert job_response.status_code == 200

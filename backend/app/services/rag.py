@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_TOPIC_TITLE = "新话题"
 MAX_HISTORY_MESSAGES = 8
 MIN_RELEVANCE_SCORE = 0.12
+SUMMARY_CHUNK_ROLES = {"section_summary", "paper_summary"}
+DEFAULT_SEARCHABLE_CHUNK_ROLES = ("child", "section_summary", "paper_summary")
 
 RAG_SYSTEM_PROMPT = (
     "你是 ResearchDock 的论文知识库助理。"
@@ -393,6 +395,60 @@ def _chunk_text_payload(chunk: PaperChunk, *, include_supporting_context: bool =
     if include_supporting_context and parent_context:
         parts.append(f"章节上下文: {parent_context}")
     return "\n\n".join(parts) if parts else str(chunk.content or "")
+
+
+def _chunk_metadata(chunk: PaperChunk) -> dict[str, Any]:
+    return chunk.metadata_json if isinstance(chunk.metadata_json, dict) else {}
+
+
+def _chunk_role(chunk: PaperChunk) -> str:
+    metadata = _chunk_metadata(chunk)
+    return str(metadata.get("chunk_role") or getattr(chunk, "chunk_role", "child") or "child")
+
+
+def _chunk_granularity(chunk: PaperChunk) -> str:
+    metadata = _chunk_metadata(chunk)
+    return str(metadata.get("granularity") or _chunk_role(chunk) or "child")
+
+
+def _chunk_source_kind(chunk: PaperChunk) -> str | None:
+    metadata = _chunk_metadata(chunk)
+    source_kind = str(metadata.get("source_kind") or "").strip()
+    return source_kind or None
+
+
+def _is_summary_chunk_role(role: str | None) -> bool:
+    return str(role or "").strip() in SUMMARY_CHUNK_ROLES
+
+
+def _searchable_chunk_roles() -> tuple[str, ...]:
+    configured = [
+        item.strip()
+        for item in str(settings.rag_searchable_chunk_roles or "").split(",")
+        if item.strip()
+    ]
+    sanitized: list[str] = []
+    for role in configured or list(DEFAULT_SEARCHABLE_CHUNK_ROLES):
+        normalized = str(role).strip()
+        if normalized not in {"child", *SUMMARY_CHUNK_ROLES}:
+            continue
+        if normalized not in sanitized:
+            sanitized.append(normalized)
+    if "child" not in sanitized:
+        sanitized.insert(0, "child")
+    return tuple(sanitized)
+
+
+def _chunk_anchor_ids(chunk: PaperChunk, *, limit: int | None = None) -> list[int]:
+    metadata = _chunk_metadata(chunk)
+    raw_ids = metadata.get("anchor_chunk_ids")
+    if not isinstance(raw_ids, list):
+        resolved = metadata.get("resolved_chunk_id")
+        return [int(resolved)] if str(resolved or "").isdigit() else []
+    anchors = [int(item) for item in raw_ids if str(item or "").isdigit()]
+    if limit is not None:
+        return anchors[: max(limit, 0)]
+    return anchors
 
 
 def _clip_snippet(text: str, *, max_length: int) -> str:
@@ -881,10 +937,15 @@ def _normalize_embedding(value: Any) -> list[float] | None:
 
 
 def _search_chunks_legacy(db: Session, *, query: str, top_k: int, organization_id: int) -> list[RetrievalResult]:
+    searchable_roles = _searchable_chunk_roles()
     rows = db.execute(
         select(PaperChunk, Paper)
         .join(Paper, Paper.id == PaperChunk.paper_id)
-        .where(Paper.deleted_at.is_(None), Paper.organization_id == organization_id, PaperChunk.chunk_role == "child")
+        .where(
+            Paper.deleted_at.is_(None),
+            Paper.organization_id == organization_id,
+            PaperChunk.chunk_role.in_(searchable_roles),
+        )
         .order_by(PaperChunk.paper_id.asc(), PaperChunk.chunk_index.asc())
     ).all()
     if not rows:
@@ -928,6 +989,8 @@ def _search_sparse_chunks_postgres(
 ) -> list[dict[str, Any]]:
     if not query.strip():
         return []
+    searchable_roles = _searchable_chunk_roles()
+    role_sql = ", ".join(f"'{role}'" for role in searchable_roles)
     search_config = re.sub(r"[^a-zA-Z0-9_]+", "", settings.rag_text_search_config) or "simple"
     body_text_expr = "LOWER(COALESCE(pc.metadata_json->>'body_text', pc.content))"
     exact_terms = exact_terms if exact_terms is not None else _extract_exact_match_terms(query)
@@ -957,7 +1020,7 @@ def _search_sparse_chunks_postgres(
             JOIN papers AS p ON p.id = pc.paper_id
             WHERE p.deleted_at IS NULL
               AND p.organization_id = :organization_id
-              AND pc.chunk_role = 'child'
+              AND pc.chunk_role IN ({role_sql})
               AND (
                     pc.search_vector @@ plainto_tsquery('{search_config}', :query)
                     OR {exact_match_sql}
@@ -987,6 +1050,7 @@ def _search_dense_chunks_postgres(
 ) -> list[dict[str, Any]]:
     if query_embedding is None:
         return []
+    searchable_roles = _searchable_chunk_roles()
     distance = PaperChunk.embedding.cosine_distance(query_embedding)
     rows = db.execute(
         select(
@@ -999,7 +1063,7 @@ def _search_dense_chunks_postgres(
             Paper.deleted_at.is_(None),
             Paper.organization_id == organization_id,
             PaperChunk.embedding.is_not(None),
-            PaperChunk.chunk_role == "child",
+            PaperChunk.chunk_role.in_(searchable_roles),
         )
         .order_by(distance.asc(), PaperChunk.id.asc())
         .limit(limit)
@@ -1216,23 +1280,34 @@ def _expand_retrieval_candidates(
         "expanded_candidate_count": 0,
         "expansion_added_ids": [],
     }
-    if not candidates or not _should_expand_multi_span_candidates(query, query_plan=query_plan):
+    if not candidates:
         return candidates, stats
 
+    enable_multi_span_expansion = _should_expand_multi_span_candidates(query, query_plan=query_plan)
     anchor_candidates: list[tuple[dict[str, Any], PaperChunk]] = []
     parent_ids: set[int] = set()
+    summary_candidates: list[tuple[dict[str, Any], PaperChunk, list[int]]] = []
+    summary_anchor_ids: set[int] = set()
     for candidate in candidates:
         record = record_map.get(int(candidate["chunk_id"]))
         if record is None:
             continue
         chunk, _paper = record
-        if str(getattr(chunk, "chunk_role", "child") or "child") != "child":
+        chunk_role = _chunk_role(chunk)
+        if chunk_role == "child" and enable_multi_span_expansion:
+            anchor_candidates.append((candidate, chunk))
+            if chunk.parent_chunk_id is not None:
+                parent_ids.add(int(chunk.parent_chunk_id))
             continue
-        anchor_candidates.append((candidate, chunk))
-        if chunk.parent_chunk_id is not None:
-            parent_ids.add(int(chunk.parent_chunk_id))
+        if not _is_summary_chunk_role(chunk_role):
+            continue
+        anchor_ids = _chunk_anchor_ids(chunk, limit=settings.rag_summary_anchor_limit)
+        if not anchor_ids:
+            continue
+        summary_candidates.append((candidate, chunk, anchor_ids))
+        summary_anchor_ids.update(anchor_ids)
 
-    if not anchor_candidates or not parent_ids:
+    if (not anchor_candidates or not parent_ids) and not summary_anchor_ids:
         return candidates, stats
 
     stats["enabled"] = True
@@ -1245,7 +1320,7 @@ def _expand_retrieval_candidates(
         .where(
             Paper.deleted_at.is_(None),
             Paper.organization_id == organization_id,
-            (PaperChunk.parent_chunk_id.in_(parent_ids)) | (PaperChunk.id.in_(parent_ids)),
+            (PaperChunk.parent_chunk_id.in_(parent_ids)) | (PaperChunk.id.in_(parent_ids | summary_anchor_ids)),
         )
     ).all()
     related_record_map = {int(chunk.id): (chunk, paper) for chunk, paper in related_rows}
@@ -1262,43 +1337,70 @@ def _expand_retrieval_candidates(
 
     anchor_ids = {int(chunk.id) for _, chunk in anchor_candidates}
     additional_candidates: list[dict[str, Any]] = []
-    for candidate, anchor_chunk in anchor_candidates:
-        anchor_score = float(candidate.get("score") or 0.0)
-        anchor_rank = int(candidate.get("rank") or 0)
-        parent_id = int(anchor_chunk.parent_chunk_id or 0)
-        if parent_id <= 0:
-            continue
-        sibling_rows = [
-            sibling
-            for sibling in sibling_rows_by_parent.get(parent_id, [])
-            if int(sibling.id) not in anchor_ids and int(sibling.id) != int(anchor_chunk.id)
-        ]
-        sibling_rows.sort(key=lambda sibling: (abs(int(sibling.chunk_index or 0) - int(anchor_chunk.chunk_index or 0)), int(sibling.chunk_index or 0)))
-        for sibling_rank, sibling in enumerate(sibling_rows[:max_siblings_per_anchor], start=1):
-            decay = max(0.62, 0.88 - (sibling_rank - 1) * 0.12)
-            additional_candidates.append(
-                {
-                    "chunk_id": int(sibling.id),
-                    "paper_id": int(sibling.paper_id),
-                    "score": anchor_score * decay,
-                    "source_scores": {"expansion_sibling": anchor_score * decay},
-                    "source_ranks": {"expansion_sibling": max(anchor_rank, 1)},
-                    "expansion_anchor_ids": [int(anchor_chunk.id)],
-                    "expansion_sources": ["sibling"],
-                }
+    if enable_multi_span_expansion:
+        for candidate, anchor_chunk in anchor_candidates:
+            anchor_score = float(candidate.get("score") or 0.0)
+            anchor_rank = int(candidate.get("rank") or 0)
+            parent_id = int(anchor_chunk.parent_chunk_id or 0)
+            if parent_id <= 0:
+                continue
+            sibling_rows = [
+                sibling
+                for sibling in sibling_rows_by_parent.get(parent_id, [])
+                if int(sibling.id) not in anchor_ids and int(sibling.id) != int(anchor_chunk.id)
+            ]
+            sibling_rows.sort(
+                key=lambda sibling: (
+                    abs(int(sibling.chunk_index or 0) - int(anchor_chunk.chunk_index or 0)),
+                    int(sibling.chunk_index or 0),
+                )
             )
-        parent_row = parent_rows.get(parent_id)
-        if parent_row is not None:
-            parent_score = anchor_score * 0.72
+            for sibling_rank, sibling in enumerate(sibling_rows[:max_siblings_per_anchor], start=1):
+                decay = max(0.62, 0.88 - (sibling_rank - 1) * 0.12)
+                additional_candidates.append(
+                    {
+                        "chunk_id": int(sibling.id),
+                        "paper_id": int(sibling.paper_id),
+                        "score": anchor_score * decay,
+                        "source_scores": {"expansion_sibling": anchor_score * decay},
+                        "source_ranks": {"expansion_sibling": max(anchor_rank, 1)},
+                        "expansion_anchor_ids": [int(anchor_chunk.id)],
+                        "expansion_sources": ["sibling"],
+                    }
+                )
+            parent_row = parent_rows.get(parent_id)
+            if parent_row is not None:
+                parent_score = anchor_score * 0.72
+                additional_candidates.append(
+                    {
+                        "chunk_id": int(parent_row.id),
+                        "paper_id": int(parent_row.paper_id),
+                        "score": parent_score,
+                        "source_scores": {"expansion_parent": parent_score},
+                        "source_ranks": {"expansion_parent": max(anchor_rank, 1)},
+                        "expansion_anchor_ids": [int(anchor_chunk.id)],
+                        "expansion_sources": ["parent"],
+                    }
+                )
+
+    for candidate, summary_chunk, anchor_chunk_ids in summary_candidates:
+        summary_score = float(candidate.get("score") or 0.0)
+        summary_rank = int(candidate.get("rank") or 0)
+        for anchor_rank, anchor_chunk_id in enumerate(anchor_chunk_ids[: settings.rag_summary_anchor_limit], start=1):
+            record = related_record_map.get(int(anchor_chunk_id)) or record_map.get(int(anchor_chunk_id))
+            if record is None:
+                continue
+            anchor_chunk, _paper = record
+            decay = max(0.58, 0.92 - (anchor_rank - 1) * 0.12)
             additional_candidates.append(
                 {
-                    "chunk_id": int(parent_row.id),
-                    "paper_id": int(parent_row.paper_id),
-                    "score": parent_score,
-                    "source_scores": {"expansion_parent": parent_score},
-                    "source_ranks": {"expansion_parent": max(anchor_rank, 1)},
-                    "expansion_anchor_ids": [int(anchor_chunk.id)],
-                    "expansion_sources": ["parent"],
+                    "chunk_id": int(anchor_chunk.id),
+                    "paper_id": int(anchor_chunk.paper_id),
+                    "score": summary_score * decay,
+                    "source_scores": {"expansion_summary_anchor": summary_score * decay},
+                    "source_ranks": {"expansion_summary_anchor": max(summary_rank, 1)},
+                    "expansion_anchor_ids": [int(summary_chunk.id)],
+                    "expansion_sources": ["summary_anchor"],
                 }
             )
 
@@ -1333,7 +1435,12 @@ def _serialize_ranked_trace_candidates(
             "page_from": chunk.page_from,
             "page_to": chunk.page_to,
             "snippet": snippet,
+            "chunk_role": _chunk_role(chunk),
+            "granularity": _chunk_granularity(chunk),
         }
+        source_kind = _chunk_source_kind(chunk)
+        if source_kind:
+            row["source_kind"] = source_kind
         source_scores = item.get("source_scores")
         if isinstance(source_scores, dict) and source_scores:
             row["source_scores"] = {key: round(float(value), 4) for key, value in source_scores.items()}
@@ -1390,11 +1497,16 @@ def _build_retrieval_results(
     record_map: dict[int, tuple[PaperChunk, Paper]],
 ) -> list[RetrievalResult]:
     results: list[RetrievalResult] = []
+    seen_chunk_ids: set[int] = set()
     for item in candidates:
-        record = record_map.get(int(item["chunk_id"]))
+        resolved_chunk_id = _resolve_candidate_chunk_id(item, record_map=record_map)
+        if resolved_chunk_id in seen_chunk_ids:
+            continue
+        record = record_map.get(resolved_chunk_id) or record_map.get(int(item["chunk_id"]))
         if record is None:
             continue
         chunk, paper = record
+        seen_chunk_ids.add(int(chunk.id))
         results.append(RetrievalResult(chunk=chunk, paper=paper, score=float(item.get("score") or 0.0)))
     return results
 
@@ -1408,6 +1520,28 @@ def _results_to_ranked_hits(results: list[RetrievalResult]) -> list[dict[str, An
         }
         for result in results
     ]
+
+
+def _resolve_candidate_chunk_id(
+    item: dict[str, Any],
+    *,
+    record_map: dict[int, tuple[PaperChunk, Paper]],
+) -> int:
+    chunk_id = int(item["chunk_id"])
+    record = record_map.get(chunk_id)
+    if record is None:
+        return chunk_id
+    chunk, _paper = record
+    if not _is_summary_chunk_role(_chunk_role(chunk)):
+        return chunk_id
+    metadata = _chunk_metadata(chunk)
+    resolved_chunk_id = metadata.get("resolved_chunk_id")
+    if str(resolved_chunk_id or "").isdigit() and int(resolved_chunk_id) in record_map:
+        return int(resolved_chunk_id)
+    for anchor_chunk_id in _chunk_anchor_ids(chunk, limit=settings.rag_summary_anchor_limit):
+        if int(anchor_chunk_id) in record_map:
+            return int(anchor_chunk_id)
+    return chunk_id
 
 
 def _extract_query_numbers(text: str) -> tuple[str, ...]:
@@ -1425,6 +1559,66 @@ def _truncate_for_budget(text: str, *, max_chars: int) -> str:
     if max_chars <= 3:
         return compact[:max_chars]
     return f"{compact[: max_chars - 3].rstrip()}..."
+
+
+def _summarize_text_excerpt(text: str, *, max_sentences: int, max_chars: int) -> str:
+    compact = _compact_text(text)
+    if not compact:
+        return ""
+    sentence_candidates = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[。！？.!?])\s+", compact)
+        if sentence.strip()
+    ]
+    if not sentence_candidates:
+        sentence_candidates = [compact]
+    selected = " ".join(sentence_candidates[: max(max_sentences, 1)])
+    return _truncate_for_budget(selected or compact, max_chars=max_chars)
+
+
+def _serialize_structured_summary_for_chunk(summary: dict[str, Any] | None) -> str:
+    if not isinstance(summary, dict):
+        return ""
+    parts: list[str] = []
+    abstract_cn = _compact_text(str(summary.get("abstract_cn") or ""))
+    if abstract_cn:
+        parts.append(f"摘要：{abstract_cn}")
+    research_question = _compact_text(str(summary.get("research_question") or ""))
+    if research_question:
+        parts.append(f"研究问题：{research_question}")
+    method = _compact_text(str(summary.get("method") or ""))
+    if method:
+        parts.append(f"方法：{method}")
+    findings = _compact_text(str(summary.get("findings") or ""))
+    if findings:
+        parts.append(f"发现：{findings}")
+    limitations = _compact_text(str(summary.get("limitations") or ""))
+    if limitations:
+        parts.append(f"局限：{limitations}")
+    key_points = [
+        _compact_text(str(item))
+        for item in (summary.get("key_points") if isinstance(summary.get("key_points"), list) else [])
+        if _compact_text(str(item))
+    ]
+    if key_points:
+        parts.append("要点：" + "；".join(key_points[:4]))
+    return _truncate_for_budget("\n".join(parts), max_chars=settings.rag_paper_summary_max_chars) if parts else ""
+
+
+def _build_fallback_paper_summary_text(
+    section_summaries: list[str],
+    *,
+    normalized_blocks: list[dict[str, Any]],
+) -> str:
+    compact_summaries = [_compact_text(item) for item in section_summaries if _compact_text(item)]
+    if compact_summaries:
+        return _truncate_for_budget("\n".join(compact_summaries[:3]), max_chars=settings.rag_paper_summary_max_chars)
+    fallback_text = "\n".join(
+        _compact_text(str(block.get("text") or ""))
+        for block in normalized_blocks[:6]
+        if _compact_text(str(block.get("text") or ""))
+    )
+    return _truncate_for_budget(fallback_text, max_chars=settings.rag_paper_summary_max_chars) if fallback_text else ""
 
 
 def _build_rerank_block_catalog(
@@ -1997,6 +2191,8 @@ def _make_chunk_record(
     paper_title: str | None,
     supporting_context_rows: list[dict[str, Any]] | None = None,
     chunk_role: str = "child",
+    granularity: str | None = None,
+    source_kind: str | None = None,
     parent_key: str | None = None,
     parent_text: str | None = None,
 ) -> dict[str, Any]:
@@ -2055,9 +2251,13 @@ def _make_chunk_record(
             "block_types": sorted({str(block.get("block_type") or "paragraph") for block in block_rows}),
             "block_count": len(block_rows),
             "chunk_role": chunk_role,
+            "granularity": granularity or chunk_role,
+            "source_kind": source_kind or None,
             "body_text": body_text,
             "supporting_context": supporting_context or None,
             "parent_text": parent_text or None,
+            "resolved_chunk_id": None,
+            "anchor_chunk_ids": [],
             "reading_order_start": min(
                 (int(block.get("reading_order")) for block in block_rows if isinstance(block.get("reading_order"), int) or str(block.get("reading_order") or "").isdigit()),
                 default=None,
@@ -2084,6 +2284,7 @@ def _split_text(
     *,
     preanalysis: dict[str, Any] | None = None,
     paper_title: str | None = None,
+    structured_summary: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     chunk_size = max(settings.rag_chunk_size, 200)
     overlap = max(min(settings.rag_chunk_overlap, chunk_size - 1), 0)
@@ -2261,6 +2462,8 @@ def _split_text(
     if not chunks:
         raise RuntimeError("Structured blocks unavailable for chunking")
     parent_records: list[dict[str, Any]] = []
+    section_summary_records: list[dict[str, Any]] = []
+    section_summary_texts: list[str] = []
     for section_id, rows in section_blocks.items():
         parent_rows = [row for row in rows if str(row.get("text") or "").strip()]
         if not parent_rows:
@@ -2278,6 +2481,24 @@ def _split_text(
         parent_record["section_key"] = section_id
         parent_chunks_by_section[section_id] = parent_record
         parent_records.append(parent_record)
+        section_summary_text = _summarize_text_excerpt(
+            parent_body_text,
+            max_sentences=settings.rag_section_summary_max_sentences,
+            max_chars=settings.rag_section_summary_max_chars,
+        )
+        if section_summary_text and (len(parent_rows) > 1 or len(parent_body_text) > settings.rag_section_summary_max_chars):
+            section_summary_record = _make_chunk_record(
+                chunk_index=len(chunks) + len(parent_records) + len(section_summary_records),
+                body_text=section_summary_text,
+                block_rows=parent_rows,
+                paper_title=paper_title,
+                chunk_role="section_summary",
+                granularity="section_summary",
+                source_kind="heuristic_section_summary",
+            )
+            section_summary_record["section_key"] = section_id
+            section_summary_records.append(section_summary_record)
+            section_summary_texts.append(section_summary_text)
     parent_text_by_section = {
         section_id: str(parent_record["metadata_json"].get("body_text") or "")[:2200]
         for section_id, parent_record in parent_chunks_by_section.items()
@@ -2290,6 +2511,28 @@ def _split_text(
         if parent_text:
             chunk["metadata_json"]["parent_text"] = parent_text
     chunks.extend(parent_records)
+    chunks.extend(section_summary_records)
+
+    paper_summary_text = _serialize_structured_summary_for_chunk(structured_summary)
+    paper_summary_source_kind = "structured_summary"
+    if not paper_summary_text:
+        paper_summary_text = _build_fallback_paper_summary_text(
+            section_summary_texts,
+            normalized_blocks=normalized_blocks,
+        )
+        paper_summary_source_kind = "heuristic_paper_summary"
+    if paper_summary_text:
+        representative_rows = [rows[0] for rows in section_blocks.values() if rows] or normalized_blocks[:1]
+        paper_summary_record = _make_chunk_record(
+            chunk_index=len(chunks),
+            body_text=paper_summary_text,
+            block_rows=representative_rows,
+            paper_title=paper_title,
+            chunk_role="paper_summary",
+            granularity="paper_summary",
+            source_kind=paper_summary_source_kind,
+        )
+        chunks.append(paper_summary_record)
     return chunks
 
 
@@ -2431,8 +2674,13 @@ def rebuild_paper_index(
     paper_id: int,
     preanalysis: dict[str, Any] | None = None,
     paper_title: str | None = None,
+    structured_summary: dict[str, Any] | None = None,
 ) -> int:
-    chunks = _split_text(preanalysis=preanalysis, paper_title=paper_title)
+    chunks = _split_text(
+        preanalysis=preanalysis,
+        paper_title=paper_title,
+        structured_summary=structured_summary,
+    )
     embeddings: list[list[float]] = []
     if chunks and (settings.glm_api_key.strip() or settings.openai_api_key.strip()):
         try:
@@ -2442,7 +2690,10 @@ def rebuild_paper_index(
 
     db.execute(delete(PaperChunk).where(PaperChunk.paper_id == paper_id))
     parent_chunk_ids_by_section: dict[str, int] = {}
+    child_chunk_ids_by_section: dict[str, list[int]] = {}
     child_rows: list[tuple[PaperChunk, str]] = []
+    section_summary_rows: list[tuple[PaperChunk, str]] = []
+    paper_summary_rows: list[PaperChunk] = []
     for index, chunk in enumerate(chunks):
         record = PaperChunk(
             paper_id=paper_id,
@@ -2462,12 +2713,42 @@ def rebuild_paper_index(
             section_key = str(chunk.get("section_key") or chunk["metadata_json"].get("section_id") or "")
             if section_key:
                 parent_chunk_ids_by_section[section_key] = int(record.id)
-        else:
+        elif record.chunk_role == "child":
             child_rows.append((record, str(chunk.get("parent_key") or "")))
+            section_key = str(chunk.get("parent_key") or chunk["metadata_json"].get("section_id") or "")
+            if section_key:
+                child_chunk_ids_by_section.setdefault(section_key, []).append(int(record.id))
+        elif record.chunk_role == "section_summary":
+            section_summary_rows.append((record, str(chunk.get("section_key") or chunk["metadata_json"].get("section_id") or "")))
+        elif record.chunk_role == "paper_summary":
+            paper_summary_rows.append(record)
     for record, section_key in child_rows:
         parent_chunk_id = parent_chunk_ids_by_section.get(section_key)
         if parent_chunk_id is not None:
             record.parent_chunk_id = parent_chunk_id
+    anchor_limit = max(settings.rag_summary_anchor_limit, 1)
+    for record, section_key in section_summary_rows:
+        metadata = dict(record.metadata_json or {})
+        parent_chunk_id = parent_chunk_ids_by_section.get(section_key)
+        anchor_chunk_ids: list[int] = []
+        if parent_chunk_id is not None:
+            anchor_chunk_ids.append(parent_chunk_id)
+            metadata["resolved_chunk_id"] = parent_chunk_id
+        anchor_chunk_ids.extend(child_chunk_ids_by_section.get(section_key, [])[:anchor_limit])
+        metadata["anchor_chunk_ids"] = anchor_chunk_ids
+        metadata["anchor_section_id"] = section_key or None
+        record.metadata_json = metadata
+    ordered_parent_ids = [
+        chunk_id
+        for section_key, chunk_id in parent_chunk_ids_by_section.items()
+        if section_key
+    ]
+    for record in paper_summary_rows:
+        metadata = dict(record.metadata_json or {})
+        metadata["anchor_chunk_ids"] = ordered_parent_ids[:anchor_limit]
+        metadata["resolved_chunk_id"] = ordered_parent_ids[0] if ordered_parent_ids else None
+        metadata["anchor_section_ids"] = list(parent_chunk_ids_by_section.keys())[:anchor_limit]
+        record.metadata_json = metadata
     db.commit()
     if _is_postgres_session(db):
         db.execute(
@@ -2489,9 +2770,16 @@ def rebuild_paper_index_from_document_structure(
     *,
     paper_id: int,
     paper_title: str | None = None,
+    structured_summary: dict[str, Any] | None = None,
 ) -> int:
     preanalysis = _build_preanalysis_from_document_structure(db, paper_id=paper_id)
-    return rebuild_paper_index(db, paper_id=paper_id, preanalysis=preanalysis, paper_title=paper_title)
+    return rebuild_paper_index(
+        db,
+        paper_id=paper_id,
+        preanalysis=preanalysis,
+        paper_title=paper_title,
+        structured_summary=structured_summary,
+    )
 
 
 def _search_chunks(

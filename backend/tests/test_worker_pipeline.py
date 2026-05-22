@@ -185,9 +185,18 @@ def test_worker_persists_docling_structure_and_picture_descriptions(
     assert pictures[0].description == "图表显示 A 组分数随时间上升。"
     assert pictures[0].description_model == "glm-4.6v"
     assert chunks
-    assert {chunk.chunk_role for chunk in chunks} == {"child", "parent"}
+    assert {chunk.chunk_role for chunk in chunks} == {"child", "parent", "section_summary", "paper_summary"}
     child_chunks = [chunk for chunk in chunks if chunk.chunk_role == "child"]
+    section_summary_chunks = [chunk for chunk in chunks if chunk.chunk_role == "section_summary"]
+    paper_summary_chunks = [chunk for chunk in chunks if chunk.chunk_role == "paper_summary"]
     assert child_chunks and all(chunk.parent_chunk_id is not None for chunk in child_chunks)
+    assert section_summary_chunks
+    assert paper_summary_chunks
+    assert all(isinstance(chunk.metadata_json, dict) and chunk.metadata_json.get("granularity") == "section_summary" for chunk in section_summary_chunks)
+    assert any(
+        isinstance(chunk.metadata_json, dict) and chunk.metadata_json.get("granularity") == "paper_summary"
+        for chunk in paper_summary_chunks
+    )
     assert any("Table 1. Accuracy" in chunk.content for chunk in chunks)
     assert any("图表显示 A 组分数随时间上升" in chunk.content for chunk in chunks)
 
