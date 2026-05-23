@@ -13,6 +13,7 @@ import {
   subscribeChatProgressEvents,
   type ChatProgressEvent,
   type ChatMessage,
+  type ChatSufficiencyDecision,
   type ChatTopic,
 } from "@/lib/chat";
 import { cn } from "@/lib/utils";
@@ -25,6 +26,42 @@ function formatTime(value: string | null): string {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+function getAnswerBadge(usedKnowledgeBase: boolean): string {
+  return usedKnowledgeBase ? "知识库回答" : "保守回答（含通用补充）";
+}
+
+function summarizeReasonCodes(decision: ChatSufficiencyDecision | null | undefined): string | null {
+  if (!decision?.reason_codes?.length) {
+    return null;
+  }
+  const mapping: Record<string, string> = {
+    sufficient: "证据较充足",
+    no_evidence_selected: "未选中可直接支撑回答的证据",
+    top_support_below_threshold: "最高证据支持度偏低",
+    total_support_below_threshold: "总体证据支持度偏低",
+    llm_marked_insufficient: "模型判定证据仍不足",
+    llm_marked_insufficient_advisory: "模型曾判定不足，已按对话模式放宽",
+    relaxed_chat_policy: "当前使用对话放宽模式",
+  };
+  const labels = decision.reason_codes
+    .map((code) => mapping[code] ?? code)
+    .filter((value, index, list) => value && list.indexOf(value) === index);
+  return labels.join("；") || null;
+}
+
+function renderSufficiencyHint(
+  decision: ChatSufficiencyDecision | null | undefined,
+  missingInformation?: string | null
+): { title: string; detail: string | null } | null {
+  if (!decision) {
+    return null;
+  }
+  const title = decision.is_sufficient ? "系统判定：证据较充足，请结合引用自行核验。" : "系统判定：证据不足，请自行判断。";
+  const reasonSummary = summarizeReasonCodes(decision);
+  const detail = decision.is_sufficient ? reasonSummary : missingInformation || reasonSummary;
+  return { title, detail: detail || null };
 }
 
 export function ChatPanel() {
@@ -42,6 +79,8 @@ export function ChatPanel() {
     content: string;
     answerMode: string | null;
     usedKnowledgeBase: boolean;
+    sufficiencyDecision: ChatSufficiencyDecision | null;
+    missingInformation: string | null;
   } | null>(null);
   const messageViewportRef = useRef<HTMLDivElement | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
@@ -181,11 +220,13 @@ export function ChatPanel() {
           setInput("");
           setMessages((current) => [...current, userMessage]);
         },
-        onAssistantStart: ({ answer_mode, used_knowledge_base }) => {
+        onAssistantStart: ({ answer_mode, used_knowledge_base, sufficiency_decision, missing_information }) => {
           setStreamingAssistantDraft({
             content: "",
             answerMode: answer_mode,
             usedKnowledgeBase: used_knowledge_base,
+            sufficiencyDecision: sufficiency_decision ?? null,
+            missingInformation: missing_information ?? null,
           });
         },
         onAssistantDelta: (delta) => {
@@ -196,6 +237,8 @@ export function ChatPanel() {
                   content: delta,
                   answerMode: null,
                   usedKnowledgeBase: false,
+                  sufficiencyDecision: null,
+                  missingInformation: null,
                 }
           );
         },
@@ -293,65 +336,77 @@ export function ChatPanel() {
                 当前话题还没有消息，试着问一个和已归档论文相关的问题。
               </div>
             ) : null}
-            {messages.map((message) => (
-              <div
-                key={message.id}
-                className={cn(
-                  "max-w-[92%] rounded-3xl px-4 py-4 shadow-sm",
-                  message.role === "assistant"
-                    ? "bg-white text-slate-800 ring-1 ring-slate-200"
-                    : "ml-auto bg-slate-950 text-slate-50"
-                )}
-              >
-                <div className="mb-2 flex flex-wrap items-center gap-2 text-xs font-medium">
-                  {message.role === "assistant" ? <Bot className="size-3.5" /> : <User2 className="size-3.5" />}
-                  <span>{message.role === "assistant" ? "助手" : "你"}</span>
-                  {message.model ? <span className="text-slate-400">· {message.model}</span> : null}
-                  <span className={cn(message.role === "assistant" ? "text-slate-400" : "text-slate-300")}>
-                    · {formatTime(message.created_at)}
-                  </span>
+            {messages.map((message) => {
+              const sufficiencyHint =
+                message.role === "assistant"
+                  ? renderSufficiencyHint(message.sufficiency_decision, message.missing_information)
+                  : null;
+              return (
+                <div
+                  key={message.id}
+                  className={cn(
+                    "max-w-[92%] rounded-3xl px-4 py-4 shadow-sm",
+                    message.role === "assistant"
+                      ? "bg-white text-slate-800 ring-1 ring-slate-200"
+                      : "ml-auto bg-slate-950 text-slate-50"
+                  )}
+                >
+                  <div className="mb-2 flex flex-wrap items-center gap-2 text-xs font-medium">
+                    {message.role === "assistant" ? <Bot className="size-3.5" /> : <User2 className="size-3.5" />}
+                    <span>{message.role === "assistant" ? "助手" : "你"}</span>
+                    {message.model ? <span className="text-slate-400">· {message.model}</span> : null}
+                    <span className={cn(message.role === "assistant" ? "text-slate-400" : "text-slate-300")}>
+                      · {formatTime(message.created_at)}
+                    </span>
+                  </div>
+                  {message.role === "assistant" ? (
+                    <div className="mb-3 flex flex-wrap gap-2">
+                      {message.used_knowledge_base ? (
+                        <span className="rounded-full bg-emerald-500/10 px-2.5 py-1 text-xs text-emerald-700 ring-1 ring-emerald-500/20">
+                          {getAnswerBadge(message.used_knowledge_base)}
+                        </span>
+                      ) : (
+                        <span className="rounded-full bg-amber-500/10 px-2.5 py-1 text-xs text-amber-700 ring-1 ring-amber-500/20">
+                          {getAnswerBadge(message.used_knowledge_base)}
+                        </span>
+                      )}
+                    </div>
+                  ) : null}
+                  {message.role === "assistant" && sufficiencyHint ? (
+                    <div className="mb-3 rounded-2xl bg-slate-50 px-3 py-2 text-xs text-slate-600 ring-1 ring-slate-200">
+                      <div className="font-medium text-slate-700">{sufficiencyHint.title}</div>
+                      {sufficiencyHint.detail ? <div className="mt-1 text-slate-500">{sufficiencyHint.detail}</div> : null}
+                    </div>
+                  ) : null}
+                  <p className="whitespace-pre-wrap text-sm leading-7">{message.content}</p>
+                  {message.role === "assistant" && message.citations.length > 0 ? (
+                    <div className="mt-4 grid gap-2">
+                      {message.citations.map((citation) => (
+                        <div key={citation.chunk_id} className="rounded-2xl bg-slate-50 px-4 py-3 text-sm text-slate-600 ring-1 ring-slate-200">
+                          <p className="font-medium text-slate-700">{citation.paper_title || `论文 #${citation.paper_id}`}</p>
+                          <div className="mt-1 flex flex-wrap gap-3 text-xs text-slate-500">
+                            {citation.section_path ? <span>章节：{citation.section_path}</span> : null}
+                            {citation.page_from !== null ? (
+                              <span>
+                                页码：
+                                {citation.page_to !== null && citation.page_to !== citation.page_from
+                                  ? `${citation.page_from}-${citation.page_to}`
+                                  : citation.page_from}
+                              </span>
+                            ) : null}
+                          </div>
+                          <p className="mt-1 whitespace-pre-wrap leading-6">{citation.snippet}</p>
+                          <div className="mt-2 flex flex-wrap gap-3 text-xs text-slate-500">
+                            {citation.source_url ? <span>{citation.source_url}</span> : null}
+                            {citation.score !== null ? <span>相关度 {citation.score.toFixed(2)}</span> : null}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
-                {message.role === "assistant" ? (
-                  <div className="mb-3 flex flex-wrap gap-2">
-                    {message.used_knowledge_base ? (
-                      <span className="rounded-full bg-emerald-500/10 px-2.5 py-1 text-xs text-emerald-700 ring-1 ring-emerald-500/20">
-                        知识库回答
-                      </span>
-                    ) : (
-                      <span className="rounded-full bg-amber-500/10 px-2.5 py-1 text-xs text-amber-700 ring-1 ring-amber-500/20">
-                        知识库未命中，以下为通用补充
-                      </span>
-                    )}
-                  </div>
-                ) : null}
-                <p className="whitespace-pre-wrap text-sm leading-7">{message.content}</p>
-                {message.role === "assistant" && message.citations.length > 0 ? (
-                  <div className="mt-4 grid gap-2">
-                    {message.citations.map((citation) => (
-                      <div key={citation.chunk_id} className="rounded-2xl bg-slate-50 px-4 py-3 text-sm text-slate-600 ring-1 ring-slate-200">
-                        <p className="font-medium text-slate-700">{citation.paper_title || `论文 #${citation.paper_id}`}</p>
-                        <div className="mt-1 flex flex-wrap gap-3 text-xs text-slate-500">
-                          {citation.section_path ? <span>章节：{citation.section_path}</span> : null}
-                          {citation.page_from !== null ? (
-                            <span>
-                              页码：
-                              {citation.page_to !== null && citation.page_to !== citation.page_from
-                                ? `${citation.page_from}-${citation.page_to}`
-                                : citation.page_from}
-                            </span>
-                          ) : null}
-                        </div>
-                        <p className="mt-1 whitespace-pre-wrap leading-6">{citation.snippet}</p>
-                        <div className="mt-2 flex flex-wrap gap-3 text-xs text-slate-500">
-                          {citation.source_url ? <span>{citation.source_url}</span> : null}
-                          {citation.score !== null ? <span>相关度 {citation.score.toFixed(2)}</span> : null}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                ) : null}
-              </div>
-            ))}
+              );
+            })}
             {submitting ? (
               <div className="max-w-[92%] rounded-3xl bg-white px-4 py-4 text-sm text-slate-500 shadow-sm ring-1 ring-slate-200">
                 <div className="flex items-center gap-2">
@@ -370,20 +425,38 @@ export function ChatPanel() {
                 ) : null}
                 {streamingAssistantDraft ? (
                   <div className="mt-3">
+                    {(() => {
+                      const sufficiencyHint = renderSufficiencyHint(
+                        streamingAssistantDraft.sufficiencyDecision,
+                        streamingAssistantDraft.missingInformation
+                      );
+                      return (
+                        <>
                     <div className="mb-3 flex flex-wrap gap-2">
                       {streamingAssistantDraft.usedKnowledgeBase ? (
                         <span className="rounded-full bg-emerald-500/10 px-2.5 py-1 text-xs text-emerald-700 ring-1 ring-emerald-500/20">
-                          知识库回答
+                          {getAnswerBadge(streamingAssistantDraft.usedKnowledgeBase)}
                         </span>
                       ) : (
                         <span className="rounded-full bg-amber-500/10 px-2.5 py-1 text-xs text-amber-700 ring-1 ring-amber-500/20">
-                          保守回答
+                          {getAnswerBadge(streamingAssistantDraft.usedKnowledgeBase)}
                         </span>
                       )}
                     </div>
+                    {sufficiencyHint ? (
+                      <div className="mb-3 rounded-2xl bg-slate-50 px-3 py-2 text-xs text-slate-600 ring-1 ring-slate-200">
+                        <div className="font-medium text-slate-700">
+                          {sufficiencyHint.title}
+                        </div>
+                        {sufficiencyHint.detail ? <div className="mt-1 text-slate-500">{sufficiencyHint.detail}</div> : null}
+                      </div>
+                    ) : null}
                     <p className="whitespace-pre-wrap text-sm leading-7 text-slate-700">
                       {streamingAssistantDraft.content || "正在准备输出..."}
                     </p>
+                        </>
+                      );
+                    })()}
                   </div>
                 ) : null}
               </div>

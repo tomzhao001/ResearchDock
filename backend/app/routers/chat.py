@@ -5,9 +5,9 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.database import get_db
+from app.database import get_db, open_session
 from app.deps import get_current_user
-from app.models import User
+from app.models import ChatTopic, User
 from app.schemas import (
     ChatMessageCreateRequest,
     ChatMessageListResponse,
@@ -19,6 +19,7 @@ from app.schemas import (
 )
 from app.services.chat_events import publish_chat_progress_event
 from app.services.rag import (
+    StartedChatTurn,
     build_topic_assistant_draft,
     create_topic,
     get_topic,
@@ -45,6 +46,13 @@ def _serialize_topic(topic_summary) -> ChatTopicPublic:
 
 def _serialize_message(message) -> ChatMessagePublic:
     citations = message.citations_json if isinstance(message.citations_json, list) else []
+    retrieval = message.metadata_json.get("retrieval") if isinstance(message.metadata_json, dict) else {}
+    sufficiency_decision = retrieval.get("sufficiency_decision") if isinstance(retrieval, dict) else None
+    missing_information = None
+    if isinstance(retrieval, dict):
+        evidence_trace = retrieval.get("evidence_selection_trace")
+        if isinstance(evidence_trace, dict):
+            missing_information = evidence_trace.get("missing_information")
     return ChatMessagePublic(
         id=message.id,
         topic_id=message.topic_id,
@@ -54,6 +62,8 @@ def _serialize_message(message) -> ChatMessagePublic:
         answer_mode=message.answer_mode,
         used_knowledge_base=message.used_knowledge_base,
         citations=citations,
+        sufficiency_decision=sufficiency_decision,
+        missing_information=missing_information,
         created_at=message.created_at,
     )
 
@@ -107,7 +117,7 @@ def create_chat_completion(
     user: Annotated[User, Depends(get_current_user)],
 ):
     try:
-        result = send_topic_message(db, user=user, topic_id=topic_id, prompt=payload.message)
+        result = send_topic_message(db, user=user, topic_id=topic_id, prompt=payload.message, relaxed_chat_rag=True)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -126,52 +136,94 @@ def create_chat_completion(
 def stream_chat_completion(
     topic_id: int,
     payload: ChatMessageCreateRequest,
-    db: Annotated[Session, Depends(get_db)],
     user: Annotated[User, Depends(get_current_user)],
 ):
     def event_stream():
         try:
-            started_turn = start_topic_message(
-                db,
-                user=user,
-                topic_id=topic_id,
-                prompt=payload.message,
-            )
-            yield _sse_event(
-                "user_message",
-                {"user_message": _serialize_message(started_turn.user_message).model_dump(mode="json")},
-            )
-            assistant_draft = build_topic_assistant_draft(
-                db,
-                user=user,
-                started_turn=started_turn,
-                progress_callback=lambda phase, progress_status, message, detail=None: publish_chat_progress_event(
-                    user_id=user.id,
+            db = open_session()
+            try:
+                started_turn = start_topic_message(
+                    db,
+                    user=user,
                     topic_id=topic_id,
-                    phase=phase,
-                    status=progress_status,
-                    message=message,
-                    detail=detail,
-                ),
-            )
+                    prompt=payload.message,
+                )
+                user_message_payload = _serialize_message(started_turn.user_message).model_dump(mode="json")
+                prompt = started_turn.prompt
+            finally:
+                db.close()
+
+            yield _sse_event("user_message", {"user_message": user_message_payload})
+
+            db = open_session()
+            try:
+                topic = db.get(ChatTopic, topic_id)
+                if topic is None or topic.user_id != user.id:
+                    raise ValueError("Topic not found")
+                db_user = db.get(User, user.id)
+                if db_user is None:
+                    raise ValueError("Topic not found")
+                records = list_topic_messages(db, topic_id=topic_id)
+                started_turn = StartedChatTurn(
+                    topic=topic,
+                    user_message=records[-1],
+                    records=records,
+                    prompt=prompt,
+                )
+                assistant_draft = build_topic_assistant_draft(
+                    db,
+                    user=db_user,
+                    started_turn=started_turn,
+                    relaxed_chat_rag=True,
+                    progress_callback=lambda phase, progress_status, message, detail=None: publish_chat_progress_event(
+                        user_id=user.id,
+                        topic_id=topic_id,
+                        phase=phase,
+                        status=progress_status,
+                        message=message,
+                        detail=detail,
+                    ),
+                )
+            finally:
+                db.close()
+
             yield _sse_event(
                 "assistant_start",
                 {
                     "answer_mode": assistant_draft.answer_mode,
                     "used_knowledge_base": assistant_draft.used_knowledge_base,
+                    "sufficiency_decision": (
+                        assistant_draft.metadata_json.get("retrieval", {}).get("sufficiency_decision")
+                        if isinstance(assistant_draft.metadata_json, dict)
+                        else None
+                    ),
+                    "missing_information": (
+                        assistant_draft.metadata_json.get("retrieval", {})
+                        .get("evidence_selection_trace", {})
+                        .get("missing_information")
+                        if isinstance(assistant_draft.metadata_json, dict)
+                        else None
+                    ),
                 },
             )
             for chunk in _iter_answer_chunks(assistant_draft.content):
                 yield _sse_event("assistant_delta", {"delta": chunk})
-            assistant_message = persist_topic_assistant_message(
-                db,
-                topic=started_turn.topic,
-                assistant_draft=assistant_draft,
-            )
-            yield _sse_event(
-                "assistant_complete",
-                {"assistant_message": _serialize_message(assistant_message).model_dump(mode="json")},
-            )
+
+            db = open_session()
+            try:
+                topic = db.get(ChatTopic, topic_id)
+                if topic is None:
+                    raise ValueError("Topic not found")
+                assistant_message = persist_topic_assistant_message(
+                    db,
+                    topic=topic,
+                    assistant_draft=assistant_draft,
+                )
+                assistant_message_payload = _serialize_message(assistant_message).model_dump(mode="json")
+            finally:
+                db.close()
+
+            yield _sse_event("assistant_complete", {"assistant_message": assistant_message_payload})
             yield _sse_event("done", {"ok": True})
         except ValueError as exc:
             yield _sse_event("error", {"detail": str(exc) or "Topic not found"})

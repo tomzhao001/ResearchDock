@@ -4,11 +4,11 @@ from dataclasses import dataclass
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, WebSocket, status
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, make_transient
 
 from app.auth import decode_access_token
 from app.config import settings
-from app.database import get_db
+from app.database import open_session
 from app.models import Organization, User
 from app.permissions import list_permissions
 
@@ -55,18 +55,25 @@ def resolve_current_user(db: Session, token: str | None) -> User:
     return resolve_current_user_context(db, token).user
 
 
-def get_current_user_context(
-    request: Request,
-    db: Annotated[Session, Depends(get_db)],
-) -> AuthContext:
-    return resolve_current_user_context(db, get_token_from_cookie(request))
+def _detach_auth_context(db: Session, context: AuthContext) -> AuthContext:
+    db.expunge(context.user)
+    db.expunge(context.organization)
+    make_transient(context.user)
+    make_transient(context.organization)
+    return context
 
 
-def get_current_user(
-    request: Request,
-    db: Annotated[Session, Depends(get_db)],
-) -> User:
-    return resolve_current_user(db, get_token_from_cookie(request))
+def get_current_user_context(request: Request) -> AuthContext:
+    db = open_session()
+    try:
+        context = resolve_current_user_context(db, get_token_from_cookie(request))
+        return _detach_auth_context(db, context)
+    finally:
+        db.close()
+
+
+def get_current_user(request: Request) -> User:
+    return get_current_user_context(request).user
 
 
 def require_permission(permission: str):

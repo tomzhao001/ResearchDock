@@ -1,7 +1,7 @@
 import os
 
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, DeclarativeBase
+from sqlalchemy.orm import Session, sessionmaker, DeclarativeBase
 
 from app.config import settings
 
@@ -12,6 +12,7 @@ os.environ.setdefault("PGCLIENTENCODING", "UTF8")
 engine = create_engine(
     settings.database_url,
     pool_pre_ping=True,
+    pool_timeout=30,
     connect_args={"client_encoding": "utf8"},
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -19,6 +20,10 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 class Base(DeclarativeBase):
     pass
+
+
+def open_session() -> Session:
+    return SessionLocal()
 
 
 def get_db():

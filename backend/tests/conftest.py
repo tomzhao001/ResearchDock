@@ -47,6 +47,7 @@ def client(
 
     monkeypatch.setattr("app.config.settings.file_storage_path", storage_path)
     monkeypatch.setattr("app.config.settings.db_auto_migrate_on_startup", False)
+    monkeypatch.setattr("app.database.SessionLocal", session_factory)
     app.dependency_overrides[get_db] = override_get_db
     with TestClient(app) as test_client:
         yield test_client

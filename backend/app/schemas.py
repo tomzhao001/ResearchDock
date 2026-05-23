@@ -222,6 +222,19 @@ class ChatMessageCreateRequest(BaseModel):
     message: str
 
 
+class ChatSufficiencyDecision(BaseModel):
+    is_sufficient: bool
+    llm_sufficient: bool | None = None
+    evidence_count: int = 0
+    top_support_score: float = 0.0
+    total_support_score: float = 0.0
+    overall_support_score: float = 0.0
+    min_support_score_threshold: float = 0.0
+    min_total_support_score_threshold: float = 0.0
+    policy_name: str | None = None
+    reason_codes: list[str] = []
+
+
 class ChatMessagePublic(BaseModel):
     id: int
     topic_id: int
@@ -231,6 +244,8 @@ class ChatMessagePublic(BaseModel):
     answer_mode: str | None = None
     used_knowledge_base: bool = False
     citations: list[ChatCitation] = []
+    sufficiency_decision: ChatSufficiencyDecision | None = None
+    missing_information: str | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}

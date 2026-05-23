@@ -4,6 +4,7 @@ import pytest
 from sqlalchemy import select
 
 from app.models import ChatMessage, Paper, PaperChunk
+from app.services.rag import create_topic, send_topic_message
 
 
 def login(client) -> None:
@@ -208,8 +209,10 @@ def test_chat_falls_back_to_general_answer_when_no_kb_match(
     assert body["assistant_message"]["answer_mode"] == "kb_insufficient_evidence"
     assert body["assistant_message"]["used_knowledge_base"] is False
     assert body["assistant_message"]["citations"] == []
-    assert body["assistant_message"]["content"] == "知识库中未找到确切依据。"
-    assert body["assistant_message"]["model"] is None
+    assert body["assistant_message"]["content"] == "知识库中未找到确切依据。基于通用知识，CRISPR 是一种基因编辑技术。"
+    assert body["assistant_message"]["model"] == "fallback-model"
+    assert body["assistant_message"]["sufficiency_decision"]["is_sufficient"] is False
+    assert "no_evidence_selected" in body["assistant_message"]["sufficiency_decision"]["reason_codes"]
 
     assistant_message = db_session.scalar(
         select(ChatMessage)
@@ -220,6 +223,7 @@ def test_chat_falls_back_to_general_answer_when_no_kb_match(
     assert assistant_message.metadata_json is not None
     assert assistant_message.metadata_json["retrieval"]["retrieval_backend"] == "legacy"
     assert assistant_message.metadata_json["retrieval"]["answer_mode"] == "kb_insufficient_evidence"
+    assert assistant_message.metadata_json["retrieval"]["fallback_used"] is True
 
 
 def test_chat_abstains_when_verifier_rejects_answer(client, user, db_session, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -230,6 +234,189 @@ def test_chat_abstains_when_verifier_rejects_answer(client, user, db_session, mo
         organization_id=user.organization_id,
         title="Crosslingual Paper",
         source_url="https://example.com/cross",
+        status="completed",
+    )
+    db_session.add(paper)
+    db_session.flush()
+    chunk = PaperChunk(
+        paper_id=paper.id,
+        chunk_index=0,
+        content="Table 1 reports that tES stands for transcranial electrical stimulation.",
+        embedding=None,
+        token_count=11,
+        page_from=2,
+        page_to=2,
+        metadata_json={"section_path": "Results > Table 1", "body_text": "Table 1 reports that tES stands for transcranial electrical stimulation."},
+    )
+    db_session.add(chunk)
+    db_session.commit()
+
+    def fake_chat(messages: list[dict[str, str]], *, temperature: float = 0.3) -> tuple[str, str | None]:
+        system = messages[0]["content"]
+        user_content = messages[1]["content"] if len(messages) > 1 else ""
+        if "supporting_evidence_ids" in user_content and "selected_evidence" in user_content:
+            return (
+                """
+                {
+                  "claims": [
+                    {
+                      "claim_text": "tES 指 transcranial electrical stimulation",
+                      "supporting_evidence_ids": ["chunk-%s"],
+                      "support_score": 0.92,
+                      "selection_reason": "表 1 明确给出了术语全称"
+                    }
+                  ],
+                  "selected_evidence": [
+                    {
+                      "evidence_id": "chunk-%s",
+                      "support_score": 0.92,
+                      "selection_reason": "直接定义了术语"
+                    }
+                  ],
+                  "overall_support_score": 0.92,
+                  "is_sufficient": true,
+                  "missing_information": ""
+                }
+                """.strip() % (chunk.id, chunk.id),
+                "selector-model",
+            )
+        if "groundedness verifier" in system:
+            return (
+                """
+                {
+                  "supported": false,
+                  "support_score": 0.12,
+                  "unsupported_claims": ["答案添加了证据中没有的疗效结论"],
+                  "notes": "verifier rejected"
+                }
+                """.strip(),
+                "verifier-model",
+            )
+        if "当前知识库没有找到足够证据" in system:
+            return "知识库中未找到确切依据。可先把 tES 理解为经颅电刺激相关术语，但该疗效结论不能采信。", "fallback-model"
+        return "基于知识库，tES 不仅是 transcranial electrical stimulation，而且显著提升了疗效。", "rag-model"
+
+    monkeypatch.setattr("app.services.rag.chat_with_messages", fake_chat)
+
+    topic_response = client.post("/api/chat/topics", json={})
+    assert topic_response.status_code == 201
+    topic_id = topic_response.json()["id"]
+
+    response = client.post(
+        f"/api/chat/topics/{topic_id}/messages",
+        json={"message": "文中的 tES 指什么？"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["assistant_message"]["answer_mode"] == "kb_insufficient_evidence"
+    assert body["assistant_message"]["content"] == "知识库中未找到确切依据。可先把 tES 理解为经颅电刺激相关术语，但该疗效结论不能采信。"
+    assert len(body["assistant_message"]["citations"]) == 1
+    assert body["assistant_message"]["model"] == "fallback-model"
+
+    assistant_message = db_session.scalar(
+        select(ChatMessage)
+        .where(ChatMessage.topic_id == topic_id, ChatMessage.role == "assistant")
+        .order_by(ChatMessage.id.desc())
+    )
+    assert assistant_message is not None
+    assert assistant_message.metadata_json is not None
+    assert assistant_message.metadata_json["retrieval"]["selected_evidence"][0]["evidence_id"] == f"chunk-{chunk.id}"
+    assert assistant_message.metadata_json["retrieval"]["verifier_result"]["supported"] is False
+    assert assistant_message.metadata_json["retrieval"]["fallback_used"] is True
+
+
+def test_chat_returns_fallback_answer_when_selector_marks_evidence_insufficient(
+    client,
+    user,
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    login(client)
+    monkeypatch.setattr("app.config.settings.openai_api_key", "test-key")
+    monkeypatch.setattr("app.services.rag._llm_available_for_query_rewrite", lambda: False)
+
+    paper = Paper(
+        organization_id=user.organization_id,
+        title="Fallback Paper",
+        source_url="https://example.com/fallback",
+        status="completed",
+    )
+    db_session.add(paper)
+    db_session.flush()
+    chunk = PaperChunk(
+        paper_id=paper.id,
+        chunk_index=0,
+        content="tES is short for transcranial electrical stimulation.",
+        embedding=None,
+        token_count=7,
+        page_from=1,
+        page_to=1,
+        metadata_json={"section_path": "Introduction", "body_text": "tES is short for transcranial electrical stimulation."},
+    )
+    db_session.add(chunk)
+    db_session.commit()
+
+    def fake_chat(messages: list[dict[str, str]], *, temperature: float = 0.3) -> tuple[str, str | None]:
+        user_content = messages[1]["content"] if len(messages) > 1 else ""
+        if "supporting_evidence_ids" in user_content and "selected_evidence" in user_content:
+            return (
+                """
+                {
+                  "claims": [
+                    {
+                      "claim_text": "tES 指 transcranial electrical stimulation",
+                      "supporting_evidence_ids": ["chunk-%s"],
+                      "support_score": 0.82,
+                      "selection_reason": "术语定义相关"
+                    }
+                  ],
+                  "selected_evidence": [
+                    {
+                      "evidence_id": "chunk-%s",
+                      "support_score": 0.82,
+                      "selection_reason": "可作为部分线索"
+                    }
+                  ],
+                  "overall_support_score": 0.82,
+                  "is_sufficient": false,
+                  "missing_information": "证据能说明术语含义，但不足以回答更广泛的背景问题。"
+                }
+                """.strip() % (chunk.id, chunk.id),
+                "selector-model",
+            )
+        if "fallback_reason:" in user_content:
+            return "知识库中未找到确切依据。结合通用知识，tES 通常指经颅电刺激相关概念，可先把该定义作为参考。", "fallback-model"
+        raise AssertionError("不应在证据不足路径中进入知识库主生成或 verifier")
+
+    monkeypatch.setattr("app.services.rag.chat_with_messages", fake_chat)
+
+    topic_response = client.post("/api/chat/topics", json={})
+    assert topic_response.status_code == 201
+    topic_id = topic_response.json()["id"]
+
+    response = client.post(
+        f"/api/chat/topics/{topic_id}/messages",
+        json={"message": "文中的 tES 指什么？顺便解释一下背景含义"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["assistant_message"]["answer_mode"] == "kb_insufficient_evidence"
+    assert body["assistant_message"]["used_knowledge_base"] is False
+    assert body["assistant_message"]["model"] == "fallback-model"
+    assert body["assistant_message"]["sufficiency_decision"]["is_sufficient"] is False
+    assert "llm_marked_insufficient" in body["assistant_message"]["sufficiency_decision"]["reason_codes"]
+    assert body["assistant_message"]["missing_information"] == "证据能说明术语含义，但不足以回答更广泛的背景问题。"
+    assert len(body["assistant_message"]["citations"]) == 1
+
+
+def test_send_topic_message_keeps_strict_behavior_by_default(user, db_session, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.config.settings.openai_api_key", "test-key")
+    monkeypatch.setattr("app.services.rag._llm_available_for_query_rewrite", lambda: False)
+
+    paper = Paper(
+        organization_id=user.organization_id,
+        title="Strict Paper",
+        source_url="https://example.com/strict",
         status="completed",
     )
     db_session.add(paper)
@@ -287,33 +474,18 @@ def test_chat_abstains_when_verifier_rejects_answer(client, user, db_session, mo
                 """.strip(),
                 "verifier-model",
             )
+        if "当前知识库没有找到足够证据" in system:
+            raise AssertionError("strict 默认路径不应调用 fallback")
         return "基于知识库，tES 不仅是 transcranial electrical stimulation，而且显著提升了疗效。", "rag-model"
 
     monkeypatch.setattr("app.services.rag.chat_with_messages", fake_chat)
 
-    topic_response = client.post("/api/chat/topics", json={})
-    assert topic_response.status_code == 201
-    topic_id = topic_response.json()["id"]
+    topic = create_topic(db_session, user=user, title="严格模式")
+    result = send_topic_message(db_session, user=user, topic_id=topic.topic.id, prompt="文中的 tES 指什么？")
 
-    response = client.post(
-        f"/api/chat/topics/{topic_id}/messages",
-        json={"message": "文中的 tES 指什么？"},
-    )
-    assert response.status_code == 200
-    body = response.json()
-    assert body["assistant_message"]["answer_mode"] == "kb_insufficient_evidence"
-    assert body["assistant_message"]["content"] == "知识库中未找到确切依据。"
-    assert body["assistant_message"]["citations"] == []
-
-    assistant_message = db_session.scalar(
-        select(ChatMessage)
-        .where(ChatMessage.topic_id == topic_id, ChatMessage.role == "assistant")
-        .order_by(ChatMessage.id.desc())
-    )
-    assert assistant_message is not None
-    assert assistant_message.metadata_json is not None
-    assert assistant_message.metadata_json["retrieval"]["selected_evidence"][0]["evidence_id"] == f"chunk-{chunk.id}"
-    assert assistant_message.metadata_json["retrieval"]["verifier_result"]["supported"] is False
+    assert result.assistant_message.answer_mode == "kb_insufficient_evidence"
+    assert result.assistant_message.used_knowledge_base is False
+    assert result.assistant_message.content == "知识库中未找到确切依据。"
 
 
 def test_chat_retrieval_is_limited_to_users_organization(

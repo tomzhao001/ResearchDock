@@ -188,7 +188,36 @@ class EvidenceSelectionResult:
     method: str
 
 
+@dataclass(frozen=True)
+class ChatAttributionPolicy:
+    name: str
+    min_support_score: float
+    min_total_support_score: float
+    verifier_min_support_score: float
+    llm_insufficient_hard_gate: bool
+    allow_fallback_generation: bool
+
+
 ChatProgressCallback = Callable[[str, str, str, str | None], None]
+
+
+STRICT_CHAT_ATTRIBUTION_POLICY = ChatAttributionPolicy(
+    name="strict",
+    min_support_score=settings.rag_attribution_min_support_score,
+    min_total_support_score=settings.rag_attribution_min_total_support_score,
+    verifier_min_support_score=settings.rag_attribution_verifier_min_support_score,
+    llm_insufficient_hard_gate=True,
+    allow_fallback_generation=False,
+)
+
+RELAXED_CHAT_ATTRIBUTION_POLICY = ChatAttributionPolicy(
+    name="relaxed_chat",
+    min_support_score=0.45,
+    min_total_support_score=0.75,
+    verifier_min_support_score=0.35,
+    llm_insufficient_hard_gate=True,
+    allow_fallback_generation=True,
+)
 
 
 def _normalize_title(title: str | None) -> str:
@@ -3135,26 +3164,36 @@ def _build_sufficiency_decision(
     *,
     overall_support_score: float,
     llm_sufficient: bool | None,
+    policy: ChatAttributionPolicy = STRICT_CHAT_ATTRIBUTION_POLICY,
 ) -> dict[str, Any]:
     support_scores = [float(item.get("support_score") or 0.0) for item in selected_evidence]
     top_support = max(support_scores, default=0.0)
     total_support = sum(support_scores)
     threshold_passed = bool(selected_evidence) and (
-        top_support >= settings.rag_attribution_min_support_score
-        and total_support >= settings.rag_attribution_min_total_support_score
+        top_support >= policy.min_support_score
+        and total_support >= policy.min_total_support_score
     )
-    is_sufficient = threshold_passed if llm_sufficient is None else bool(llm_sufficient and threshold_passed)
+    if llm_sufficient is None:
+        is_sufficient = threshold_passed
+    elif policy.llm_insufficient_hard_gate:
+        is_sufficient = bool(llm_sufficient and threshold_passed)
+    else:
+        is_sufficient = threshold_passed
     reason_codes: list[str] = []
     if not selected_evidence:
         reason_codes.append("no_evidence_selected")
-    if top_support < settings.rag_attribution_min_support_score:
+    if top_support < policy.min_support_score:
         reason_codes.append("top_support_below_threshold")
-    if total_support < settings.rag_attribution_min_total_support_score:
+    if total_support < policy.min_total_support_score:
         reason_codes.append("total_support_below_threshold")
     if llm_sufficient is False:
         reason_codes.append("llm_marked_insufficient")
     if is_sufficient:
         reason_codes = ["sufficient"]
+        if llm_sufficient is False and not policy.llm_insufficient_hard_gate:
+            reason_codes.append("llm_marked_insufficient_advisory")
+        if policy.name != "strict":
+            reason_codes.append("relaxed_chat_policy")
     return {
         "is_sufficient": is_sufficient,
         "llm_sufficient": llm_sufficient,
@@ -3162,8 +3201,9 @@ def _build_sufficiency_decision(
         "top_support_score": round(top_support, 4),
         "total_support_score": round(total_support, 4),
         "overall_support_score": round(float(overall_support_score or 0.0), 4),
-        "min_support_score_threshold": settings.rag_attribution_min_support_score,
-        "min_total_support_score_threshold": settings.rag_attribution_min_total_support_score,
+        "min_support_score_threshold": policy.min_support_score,
+        "min_total_support_score_threshold": policy.min_total_support_score,
+        "policy_name": policy.name,
         "reason_codes": reason_codes,
     }
 
@@ -3173,6 +3213,7 @@ def _heuristic_select_claim_supporting_evidence(
     question: str,
     query_plan: dict[str, Any] | None,
     evidence_candidates: list[dict[str, Any]],
+    policy: ChatAttributionPolicy = STRICT_CHAT_ATTRIBUTION_POLICY,
     reason_suffix: str = "",
 ) -> EvidenceSelectionResult:
     selected: list[dict[str, Any]] = []
@@ -3193,7 +3234,7 @@ def _heuristic_select_claim_supporting_evidence(
         if (
             len(selected) >= 2
             and sum(float(item.get("support_score") or 0.0) for item in selected)
-            >= settings.rag_attribution_min_total_support_score
+            >= policy.min_total_support_score
         ):
             break
     overall_support_score = round(_mean([float(item.get("support_score") or 0.0) for item in selected]), 4)
@@ -3209,7 +3250,12 @@ def _heuristic_select_claim_supporting_evidence(
         if selected
         else []
     )
-    sufficiency_decision = _build_sufficiency_decision(selected, overall_support_score=overall_support_score, llm_sufficient=None)
+    sufficiency_decision = _build_sufficiency_decision(
+        selected,
+        overall_support_score=overall_support_score,
+        llm_sufficient=None,
+        policy=policy,
+    )
     missing_information = "" if sufficiency_decision["is_sufficient"] else "未找到足以稳定支撑回答的知识库证据。"
     return EvidenceSelectionResult(
         selected_evidence=tuple(selected),
@@ -3226,11 +3272,13 @@ def _select_claim_supporting_evidence(
     question: str,
     query_plan: dict[str, Any] | None,
     evidence_candidates: list[dict[str, Any]],
+    policy: ChatAttributionPolicy = STRICT_CHAT_ATTRIBUTION_POLICY,
 ) -> EvidenceSelectionResult:
     fallback = _heuristic_select_claim_supporting_evidence(
         question=question,
         query_plan=query_plan,
         evidence_candidates=evidence_candidates,
+        policy=policy,
     )
     if not evidence_candidates or not _llm_available_for_grounding():
         logger.info(
@@ -3360,6 +3408,7 @@ def _select_claim_supporting_evidence(
                 question=question,
                 query_plan=query_plan,
                 evidence_candidates=evidence_candidates,
+                policy=policy,
                 reason_suffix="LLM 选择为空，已回退到启发式",
             )
         overall_support_score = round(
@@ -3371,6 +3420,7 @@ def _select_claim_supporting_evidence(
             selected,
             overall_support_score=overall_support_score,
             llm_sufficient=bool(llm_sufficient) if llm_sufficient is not None else None,
+            policy=policy,
         )
         missing_information = _normalize_query_text(str(payload.get("missing_information") or ""))
         return EvidenceSelectionResult(
@@ -3595,6 +3645,91 @@ def _emit_chat_progress(
     progress_callback(phase, status, message, detail)
 
 
+def _fallback_intro_text(*, has_evidence: bool) -> str:
+    if has_evidence:
+        return "知识库中未找到确切依据。以下补充结合了通用知识与部分相关证据线索，请自行判断。"
+    return "知识库中未找到确切依据。以下为通用补充，请自行判断。"
+
+
+def _normalize_fallback_answer(answer: str, *, has_evidence: bool) -> str:
+    normalized = (answer or "").strip()
+    if not normalized:
+        return _fallback_intro_text(has_evidence=has_evidence)
+    if "知识库中未找到确切依据" in normalized:
+        return normalized
+    return f"{_fallback_intro_text(has_evidence=has_evidence)}\n\n{normalized}"
+
+
+def _generate_fallback_chat_answer(
+    *,
+    records: list[ChatMessage],
+    message: str,
+    selected_evidence: list[dict[str, Any]],
+    selection_result: EvidenceSelectionResult,
+    retrieval_debug: dict[str, Any],
+    fallback_reason: str,
+    prior_answer: str | None = None,
+    progress_callback: ChatProgressCallback | None = None,
+) -> tuple[str, str | None]:
+    has_evidence = bool(selected_evidence)
+    evidence_text = _build_evidence_prompt_text(selected_evidence) if has_evidence else "无可引用知识库证据。"
+    sufficiency = selection_result.sufficiency_decision or {}
+    reason_codes = ", ".join(str(code) for code in (sufficiency.get("reason_codes") or []) if str(code).strip()) or "none"
+    missing_information = selection_result.missing_information or "未提供"
+    prior_answer_text = (prior_answer or "").strip() or "无"
+    generation_instruction = retrieval_debug.get("generation_instruction") or "请用中文回答，保留关键英文术语原文。"
+    _emit_chat_progress(
+        progress_callback,
+        phase="fallback_generation",
+        status="started",
+        message="正在生成保守补充回答",
+        detail=fallback_reason,
+    )
+    try:
+        answer, model = chat_with_messages(
+            [
+                {"role": "system", "content": FALLBACK_SYSTEM_PROMPT},
+                *_history_messages(records),
+                {
+                    "role": "user",
+                    "content": (
+                        f"用户问题：{message}\n\n"
+                        f"回答要求：{generation_instruction}\n"
+                        f"fallback_reason: {fallback_reason}\n"
+                        f"is_sufficient: {bool(sufficiency.get('is_sufficient'))}\n"
+                        f"reason_codes: {reason_codes}\n"
+                        f"missing_information: {missing_information}\n\n"
+                        "请先明确说明“知识库中未找到确切依据”。\n"
+                        "如果存在部分相关证据，可说明这些证据只是线索，不能当作充分结论。\n"
+                        "随后给出简短通用补充，并避免伪造具体论文结论、数值或引用。\n\n"
+                        f"可参考的知识库证据（可能不足）：\n{evidence_text}\n\n"
+                        f"上一阶段答案草稿（如有，可用于纠偏，不可照搬无依据内容）：\n{prior_answer_text}"
+                    ),
+                },
+            ],
+            temperature=0.3,
+        )
+        normalized = _normalize_fallback_answer(answer, has_evidence=has_evidence)
+        _emit_chat_progress(
+            progress_callback,
+            phase="fallback_generation",
+            status="finished",
+            message="保守补充回答已生成",
+            detail=model,
+        )
+        return normalized, model
+    except Exception as exc:
+        logger.warning("Fallback generation failed: reason=%s error=%s", fallback_reason, exc)
+        _emit_chat_progress(
+            progress_callback,
+            phase="fallback_generation",
+            status="failed",
+            message="保守补充回答生成失败，已使用默认提示",
+            detail=str(exc),
+        )
+        return _normalize_fallback_answer("", has_evidence=has_evidence), None
+
+
 def _build_assistant_message_draft(
     db: Session,
     *,
@@ -3603,8 +3738,10 @@ def _build_assistant_message_draft(
     records: list[ChatMessage],
     message: str,
     progress_callback: ChatProgressCallback | None = None,
+    relaxed_chat_rag: bool = False,
 ) -> AssistantMessageDraft:
     started_at = time.perf_counter()
+    chat_policy = RELAXED_CHAT_ATTRIBUTION_POLICY if relaxed_chat_rag else STRICT_CHAT_ATTRIBUTION_POLICY
     retrieval_query = _build_retrieval_query(records, message)
     candidate_limit = max(settings.rag_top_k, settings.rag_rerank_top_n, 10)
     retrieval_debug: dict[str, Any] = {}
@@ -3655,6 +3792,7 @@ def _build_assistant_message_draft(
         question=message,
         query_plan=retrieval_debug.get("query_plan") if isinstance(retrieval_debug.get("query_plan"), dict) else {},
         evidence_candidates=evidence_candidates,
+        policy=chat_policy,
     )
     selected_evidence = [dict(item) for item in selection_result.selected_evidence]
     citations = _serialize_evidence_list(selected_evidence)
@@ -3696,6 +3834,12 @@ def _build_assistant_message_draft(
         "sufficiency_decision": selection_result.sufficiency_decision,
         "verifier_result": None,
         "answer_mode": "knowledge_base" if selection_result.sufficiency_decision.get("is_sufficient") else "kb_insufficient_evidence",
+        "chat_response_policy": {
+            "name": chat_policy.name,
+            "allow_fallback_generation": chat_policy.allow_fallback_generation,
+            "llm_insufficient_hard_gate": chat_policy.llm_insufficient_hard_gate,
+            "verifier_min_support_score": chat_policy.verifier_min_support_score,
+        },
         "generation_instruction": retrieval_debug.get("generation_instruction"),
         "rerank_query": retrieval_debug.get("rerank_query"),
         "search_ms": round((time.perf_counter() - started_at) * 1000, 2),
@@ -3717,6 +3861,8 @@ def _build_assistant_message_draft(
             len(selected_evidence),
         )
         model: str | None = None
+        final_model: str | None = None
+        fallback_reason: str | None = None
         try:
             answer_started_at = time.perf_counter()
             logger.info(
@@ -3772,8 +3918,14 @@ def _build_assistant_message_draft(
             use_abstain_path = (
                 "知识库中未找到确切依据" in (answer or "")
                 or not verifier_result.get("supported")
-                or float(verifier_result.get("support_score") or 0.0) < settings.rag_attribution_verifier_min_support_score
+                or float(verifier_result.get("support_score") or 0.0) < chat_policy.verifier_min_support_score
             )
+            if "知识库中未找到确切依据" in (answer or ""):
+                fallback_reason = "generation_abstained"
+            elif not verifier_result.get("supported"):
+                fallback_reason = "verifier_rejected"
+            elif float(verifier_result.get("support_score") or 0.0) < chat_policy.verifier_min_support_score:
+                fallback_reason = "verifier_low_support"
             _emit_chat_progress(
                 progress_callback,
                 phase="verification",
@@ -3806,14 +3958,37 @@ def _build_assistant_message_draft(
                 detail=str(exc),
             )
             use_abstain_path = True
-        final_answer = answer if not use_abstain_path else "知识库中未找到确切依据。"
-        final_citations = citations if not use_abstain_path else []
-        answer_mode = "knowledge_base" if not use_abstain_path else "kb_insufficient_evidence"
-        used_knowledge_base = not use_abstain_path
+            fallback_reason = "generation_failed"
+        if use_abstain_path and chat_policy.allow_fallback_generation:
+            fallback_answer, fallback_model = _generate_fallback_chat_answer(
+                records=records,
+                message=message,
+                selected_evidence=selected_evidence,
+                selection_result=selection_result,
+                retrieval_debug=retrieval_debug,
+                fallback_reason=fallback_reason or "fallback_requested",
+                prior_answer=answer,
+                progress_callback=progress_callback,
+            )
+            final_answer = fallback_answer
+            final_citations = citations if selected_evidence else []
+            final_model = fallback_model
+            answer_mode = "kb_insufficient_evidence"
+            used_knowledge_base = False
+            retrieval_trace["fallback_reason"] = fallback_reason or "fallback_requested"
+            retrieval_trace["fallback_model"] = fallback_model
+            retrieval_trace["fallback_used"] = True
+        else:
+            final_answer = answer if not use_abstain_path else "知识库中未找到确切依据。"
+            final_citations = citations if not use_abstain_path else []
+            final_model = model
+            answer_mode = "knowledge_base" if not use_abstain_path else "kb_insufficient_evidence"
+            used_knowledge_base = not use_abstain_path
+            retrieval_trace["fallback_used"] = False
         logger.info(
             "RAG generation finished: topic_id=%s mode=knowledge_base model=%s elapsed=%.2fs",
             topic.id,
-            model,
+            final_model,
             time.perf_counter() - generation_started_at,
         )
         retrieval_trace["generation_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
@@ -3821,7 +3996,7 @@ def _build_assistant_message_draft(
         logger.info("rag_trace %s", retrieval_trace)
         draft = AssistantMessageDraft(
             content=final_answer,
-            model=model,
+            model=final_model,
             answer_mode=answer_mode,
             used_knowledge_base=used_knowledge_base,
             citations_json=final_citations,
@@ -3830,16 +4005,40 @@ def _build_assistant_message_draft(
     else:
         logger.info("RAG abstain path: topic_id=%s selected_evidence=%s", topic.id, len(selected_evidence))
         retrieval_trace["generation_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
-        retrieval_trace["answer_mode"] = "kb_insufficient_evidence"
-        logger.info("rag_trace %s", retrieval_trace)
-        draft = AssistantMessageDraft(
-            content="知识库中未找到确切依据。",
-            model=None,
-            answer_mode="kb_insufficient_evidence",
-            used_knowledge_base=False,
-            citations_json=[],
-            metadata_json={"retrieval": retrieval_trace},
-        )
+        retrieval_trace["fallback_used"] = bool(chat_policy.allow_fallback_generation)
+        retrieval_trace["fallback_reason"] = "insufficient_evidence"
+        if chat_policy.allow_fallback_generation:
+            fallback_answer, fallback_model = _generate_fallback_chat_answer(
+                records=records,
+                message=message,
+                selected_evidence=selected_evidence,
+                selection_result=selection_result,
+                retrieval_debug=retrieval_debug,
+                fallback_reason="insufficient_evidence",
+                progress_callback=progress_callback,
+            )
+            retrieval_trace["fallback_model"] = fallback_model
+            retrieval_trace["answer_mode"] = "kb_insufficient_evidence"
+            logger.info("rag_trace %s", retrieval_trace)
+            draft = AssistantMessageDraft(
+                content=fallback_answer,
+                model=fallback_model,
+                answer_mode="kb_insufficient_evidence",
+                used_knowledge_base=False,
+                citations_json=citations if selected_evidence else [],
+                metadata_json={"retrieval": retrieval_trace},
+            )
+        else:
+            retrieval_trace["answer_mode"] = "kb_insufficient_evidence"
+            logger.info("rag_trace %s", retrieval_trace)
+            draft = AssistantMessageDraft(
+                content="知识库中未找到确切依据。",
+                model=None,
+                answer_mode="kb_insufficient_evidence",
+                used_knowledge_base=False,
+                citations_json=[],
+                metadata_json={"retrieval": retrieval_trace},
+            )
 
     _emit_chat_progress(
         progress_callback,
@@ -3876,6 +4075,7 @@ def build_topic_assistant_draft(
     user: User,
     started_turn: StartedChatTurn,
     progress_callback: ChatProgressCallback | None = None,
+    relaxed_chat_rag: bool = False,
 ) -> AssistantMessageDraft:
     return _build_assistant_message_draft(
         db,
@@ -3884,6 +4084,7 @@ def build_topic_assistant_draft(
         records=started_turn.records,
         message=started_turn.prompt,
         progress_callback=progress_callback,
+        relaxed_chat_rag=relaxed_chat_rag,
     )
 
 
@@ -3894,6 +4095,7 @@ def prepare_topic_message(
     topic_id: int,
     prompt: str,
     progress_callback: ChatProgressCallback | None = None,
+    relaxed_chat_rag: bool = False,
 ) -> PreparedChatTurn:
     started_turn = start_topic_message(db, user=user, topic_id=topic_id, prompt=prompt)
     assistant_draft = build_topic_assistant_draft(
@@ -3901,6 +4103,7 @@ def prepare_topic_message(
         user=user,
         started_turn=started_turn,
         progress_callback=progress_callback,
+        relaxed_chat_rag=relaxed_chat_rag,
     )
     return PreparedChatTurn(
         topic=started_turn.topic,
@@ -3923,8 +4126,21 @@ def persist_topic_assistant_message(db: Session, *, topic: ChatTopic, assistant_
     )
 
 
-def send_topic_message(db: Session, *, user: User, topic_id: int, prompt: str) -> ChatTurnResult:
-    prepared_turn = prepare_topic_message(db, user=user, topic_id=topic_id, prompt=prompt)
+def send_topic_message(
+    db: Session,
+    *,
+    user: User,
+    topic_id: int,
+    prompt: str,
+    relaxed_chat_rag: bool = False,
+) -> ChatTurnResult:
+    prepared_turn = prepare_topic_message(
+        db,
+        user=user,
+        topic_id=topic_id,
+        prompt=prompt,
+        relaxed_chat_rag=relaxed_chat_rag,
+    )
     assistant_message = persist_topic_assistant_message(
         db,
         topic=prepared_turn.topic,
