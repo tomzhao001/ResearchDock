@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import re
 import time
 from collections.abc import Callable, Iterable
@@ -10,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -703,188 +702,15 @@ def _query_variants_for_plan(
 
 
 def _serialize_query_plan(plan: RetrievalQueryPlan) -> dict[str, Any]:
-    return {
-        "original_query": plan.original_query,
-        "detected_language": plan.detected_language,
-        "query_type": plan.query_type,
-        "generation_instruction": plan.generation_instruction,
-        "rerank_query": plan.rerank_query,
-        "exact_terms": list(plan.exact_terms),
-        "retrieval_query_en": plan.retrieval_query_en,
-        "exact_guardrail_query_en": plan.exact_guardrail_query_en,
-        "subqueries_en": list(plan.subqueries_en),
-        "rewrite_status": plan.rewrite_status,
-        "llm_rewrite_status": plan.llm_rewrite_status,
-        "used_llm": plan.used_llm,
-        "llm_attempted": plan.llm_attempted,
-        "rewrite_provider": plan.rewrite_provider,
-        "rewrite_model": plan.rewrite_model,
-        "fallback_source": plan.fallback_source,
-        "rewrite_error": plan.rewrite_error,
-        "rewrite_backfilled_terms": list(plan.rewrite_backfilled_terms),
-        "variants": [
-            {
-                "name": variant.name,
-                "query": variant.query,
-                "language": variant.language,
-                "use_sparse": variant.use_sparse,
-                "use_dense": variant.use_dense,
-                "role": variant.role,
-            }
-            for variant in plan.variants
-        ],
-    }
+    from app.services.chat_rag.query_planning import serialize_query_plan
+
+    return serialize_query_plan(plan)
 
 
 def _build_crosslingual_query_plan(query: str) -> RetrievalQueryPlan:
-    original_query = _normalize_query_text(query)
-    detected_language = _detect_query_language(original_query)
-    retrieval_query_en = ""
-    exact_guardrail_query_en = ""
-    subqueries_en: list[str] = []
-    exact_terms = _sanitize_exact_terms(_extract_exact_match_terms(original_query))
-    query_type = _classify_query_type(original_query, exact_terms)
-    generation_instruction = _default_generation_instruction(detected_language)
-    rewrite_status = "not_needed"
-    llm_rewrite_status = "not_needed"
-    used_llm = False
-    llm_attempted = False
-    rewrite_provider: str | None = None
-    rewrite_model: str | None = None
-    fallback_source: str | None = None
-    rewrite_error: str | None = None
-    rewrite_backfilled_terms: list[str] = []
+    from app.services.chat_rag.query_planning import build_crosslingual_query_plan
 
-    if detected_language in {"zh", "mixed"}:
-        exact_guardrail_query_en, fallback_source = _build_heuristic_retrieval_query_en(original_query, exact_terms)
-        llm_config = get_chat_llm_configuration()
-        rewrite_provider = str(llm_config.get("provider") or "") or None
-        llm_rewrite_status = "not_attempted_config_unavailable"
-        if _llm_available_for_query_rewrite():
-            llm_attempted = True
-            rewrite_started_at = time.perf_counter()
-            logger.info(
-                "RAG query rewrite started: language=%s provider=%s query=%s",
-                detected_language,
-                rewrite_provider or "-",
-                _preview_log_text(original_query),
-            )
-            try:
-                content, rewrite_model = chat_with_messages(
-                    [
-                        {"role": "system", "content": QUERY_PLAN_SYSTEM_PROMPT},
-                        {
-                            "role": "user",
-                            "content": QUERY_PLAN_USER_TEMPLATE.format(
-                                query=original_query,
-                                max_subqueries=settings.rag_crosslingual_max_subqueries,
-                            ),
-                        },
-                    ],
-                    temperature=0.0,
-                )
-            except Exception as exc:
-                llm_rewrite_status = "llm_failed_http_or_provider"
-                rewrite_error = _summarize_exception_message(exc)
-                logger.warning(
-                    "RAG query rewrite request failed: language=%s provider=%s error=%s elapsed=%.2fs",
-                    detected_language,
-                    rewrite_provider or "-",
-                    rewrite_error,
-                    time.perf_counter() - rewrite_started_at,
-                )
-            else:
-                try:
-                    payload = _parse_json_object(content)
-                except Exception as exc:
-                    llm_rewrite_status = "llm_failed_parse"
-                    rewrite_error = _summarize_exception_message(exc)
-                    logger.warning(
-                        "RAG query rewrite parse failed: language=%s provider=%s error=%s elapsed=%.2fs",
-                        detected_language,
-                        rewrite_provider or "-",
-                        rewrite_error,
-                        time.perf_counter() - rewrite_started_at,
-                    )
-                else:
-                    retrieval_query_en = _sanitize_sparse_query_text(str(payload.get("retrieval_query_en") or ""))
-                    subqueries_en = [_sanitize_sparse_query_text(item) for item in _unique_strings(payload.get("subqueries_en") or [])][
-                        : settings.rag_crosslingual_max_subqueries
-                    ]
-                    exact_terms = _sanitize_exact_terms(
-                        [
-                            *exact_terms,
-                            *(payload.get("exact_terms") or []),
-                            *_extract_exact_match_terms(retrieval_query_en),
-                        ]
-                    )
-                    query_type = _classify_query_type(original_query, exact_terms)
-                    if query_type != "complex_multi_query":
-                        subqueries_en = []
-                    retrieval_query_en, rewrite_backfilled_terms = _backfill_exact_terms_into_query(
-                        retrieval_query_en,
-                        exact_terms=exact_terms,
-                        query_type=query_type,
-                    )
-                    exact_guardrail_query_en, fallback_source = _build_heuristic_retrieval_query_en(original_query, exact_terms)
-                    generation_instruction = _normalize_query_text(
-                        str(payload.get("generation_instruction") or generation_instruction)
-                    ) or generation_instruction
-                    rewrite_status = "llm_rewritten"
-                    llm_rewrite_status = "llm_rewritten"
-                    used_llm = True
-                    rewrite_error = None
-                    logger.info(
-                        "RAG query rewrite finished: language=%s provider=%s status=%s retrieval_query_en=%s subqueries=%s elapsed=%.2fs",
-                        detected_language,
-                        rewrite_provider or "-",
-                        rewrite_status,
-                        _preview_log_text(retrieval_query_en),
-                        len(subqueries_en),
-                        time.perf_counter() - rewrite_started_at,
-                    )
-        if not retrieval_query_en:
-            retrieval_query_en = exact_guardrail_query_en
-            if retrieval_query_en:
-                rewrite_status = "heuristic_template" if fallback_source == "template_rules" else "heuristic_terms"
-            else:
-                fallback_source = "none"
-                rewrite_status = "fallback_empty"
-
-    rerank_query = retrieval_query_en or original_query
-    guardrail_query_en = ""
-    if detected_language in {"zh", "mixed"} and exact_guardrail_query_en:
-        if not retrieval_query_en or exact_guardrail_query_en.lower() != retrieval_query_en.lower():
-            guardrail_query_en = exact_guardrail_query_en
-    variants = _query_variants_for_plan(
-        original_query=original_query,
-        detected_language=detected_language,
-        query_type=query_type,
-        exact_guardrail_query_en=guardrail_query_en,
-        retrieval_query_en=retrieval_query_en,
-        subqueries_en=subqueries_en,
-    )
-    return RetrievalQueryPlan(
-        original_query=original_query,
-        detected_language=detected_language,
-        query_type=query_type,
-        generation_instruction=generation_instruction,
-        rerank_query=rerank_query,
-        exact_terms=tuple(exact_terms),
-        retrieval_query_en=retrieval_query_en or None,
-        exact_guardrail_query_en=guardrail_query_en or None,
-        subqueries_en=tuple(subqueries_en),
-        variants=tuple(variants),
-        rewrite_status=rewrite_status,
-        llm_rewrite_status=llm_rewrite_status,
-        used_llm=used_llm,
-        llm_attempted=llm_attempted,
-        rewrite_provider=rewrite_provider,
-        rewrite_model=rewrite_model,
-        fallback_source=fallback_source,
-        rewrite_error=rewrite_error,
-        rewrite_backfilled_terms=tuple(rewrite_backfilled_terms),
-    )
+    return build_crosslingual_query_plan(query)
 
 
 def _looks_like_table_body_text(text: str) -> bool:
@@ -926,86 +752,33 @@ def _chunk_is_caption_only(chunk: PaperChunk) -> bool:
 
 
 def _cosine_similarity(left: list[float], right: list[float]) -> float:
-    if len(left) != len(right) or not left:
-        return 0.0
-    numerator = sum(a * b for a, b in zip(left, right, strict=False))
-    left_norm = math.sqrt(sum(a * a for a in left))
-    right_norm = math.sqrt(sum(b * b for b in right))
-    if left_norm == 0 or right_norm == 0:
-        return 0.0
-    return numerator / (left_norm * right_norm)
+    from app.services.chat_rag.retrieval_low_level import cosine_similarity
+
+    return cosine_similarity(left, right)
 
 
 def _lexical_score(query_tokens: set[str], content: str) -> float:
-    if not query_tokens:
-        return 0.0
-    chunk_tokens = set(_tokenize(content))
-    if not chunk_tokens:
-        return 0.0
-    overlap = query_tokens & chunk_tokens
-    return len(overlap) / len(query_tokens)
+    from app.services.chat_rag.retrieval_low_level import lexical_score
+
+    return lexical_score(query_tokens, content)
 
 
 def _is_postgres_session(db: Session) -> bool:
-    bind = db.get_bind()
-    return bool(bind and bind.dialect.name == "postgresql")
+    from app.services.chat_rag.retrieval_low_level import is_postgres_session
+
+    return is_postgres_session(db)
 
 
 def _normalize_embedding(value: Any) -> list[float] | None:
-    if value is None:
-        return None
-    if isinstance(value, list) and all(isinstance(item, (int, float)) for item in value):
-        return [float(item) for item in value]
-    if isinstance(value, tuple) and all(isinstance(item, (int, float)) for item in value):
-        return [float(item) for item in value]
-    if hasattr(value, "tolist"):
-        items = value.tolist()
-        if isinstance(items, list) and all(isinstance(item, (int, float)) for item in items):
-            return [float(item) for item in items]
-    return None
+    from app.services.chat_rag.retrieval_low_level import normalize_embedding
+
+    return normalize_embedding(value)
 
 
 def _search_chunks_legacy(db: Session, *, query: str, top_k: int, organization_id: int) -> list[RetrievalResult]:
-    searchable_roles = _searchable_chunk_roles()
-    rows = db.execute(
-        select(PaperChunk, Paper)
-        .join(Paper, Paper.id == PaperChunk.paper_id)
-        .where(
-            Paper.deleted_at.is_(None),
-            Paper.organization_id == organization_id,
-            PaperChunk.chunk_role.in_(searchable_roles),
-        )
-        .order_by(PaperChunk.paper_id.asc(), PaperChunk.chunk_index.asc())
-    ).all()
-    if not rows:
-        return []
+    from app.services.chat_rag.retrieval_low_level import search_chunks_legacy
 
-    query_tokens = set(_tokenize(query))
-    query_embedding: list[float] | None = None
-    if (settings.glm_api_key.strip() or settings.openai_api_key.strip()) and any(chunk.embedding for chunk, _ in rows):
-        try:
-            query_embedding = embed_texts([query])[0]
-        except Exception:
-            query_embedding = None
-
-    scored: list[RetrievalResult] = []
-    for chunk, paper in rows:
-        lexical_score = _lexical_score(query_tokens, chunk.content)
-        chunk_embedding = _normalize_embedding(chunk.embedding)
-        embedding_score = (
-            _cosine_similarity(query_embedding, chunk_embedding)
-            if query_embedding is not None and chunk_embedding is not None
-            else 0.0
-        )
-        score = embedding_score if embedding_score > 0 else lexical_score
-        if embedding_score > 0 and lexical_score > 0:
-            score = embedding_score * 0.8 + lexical_score * 0.2
-        if score < MIN_RELEVANCE_SCORE:
-            continue
-        scored.append(RetrievalResult(chunk=chunk, paper=paper, score=score))
-
-    scored.sort(key=lambda item: item.score, reverse=True)
-    return scored[:top_k]
+    return search_chunks_legacy(db, query=query, top_k=top_k, organization_id=organization_id)
 
 
 def _search_sparse_chunks_postgres(
@@ -1016,58 +789,15 @@ def _search_sparse_chunks_postgres(
     organization_id: int,
     exact_terms: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    if not query.strip():
-        return []
-    searchable_roles = _searchable_chunk_roles()
-    role_sql = ", ".join(f"'{role}'" for role in searchable_roles)
-    search_config = re.sub(r"[^a-zA-Z0-9_]+", "", settings.rag_text_search_config) or "simple"
-    body_text_expr = "LOWER(COALESCE(pc.metadata_json->>'body_text', pc.content))"
-    exact_terms = exact_terms if exact_terms is not None else _extract_exact_match_terms(query)
-    exact_match_clauses: list[str] = []
-    exact_bonus_clauses: list[str] = []
-    params: dict[str, Any] = {"query": query.strip(), "limit": limit, "organization_id": organization_id}
-    for index, term in enumerate(exact_terms):
-        term_key = f"exact_term_{index}"
-        bonus_key = f"exact_bonus_{index}"
-        params[term_key] = f"%{term.lower()}%"
-        params[bonus_key] = round(min(0.35, 0.08 + len(term) * 0.01), 4)
-        exact_match_clauses.append(f"{body_text_expr} LIKE :{term_key}")
-        exact_bonus_clauses.append(f"CASE WHEN {body_text_expr} LIKE :{term_key} THEN :{bonus_key} ELSE 0 END")
-    exact_match_sql = " OR ".join(exact_match_clauses) or "FALSE"
-    exact_bonus_sql = " + ".join(exact_bonus_clauses) or "0"
-    rows = db.execute(
-        text(
-            f"""
-            SELECT
-                pc.id AS chunk_id,
-                pc.paper_id AS paper_id,
-                (
-                    ts_rank_cd(pc.search_vector, plainto_tsquery('{search_config}', :query))
-                    + ({exact_bonus_sql})
-                ) AS score
-            FROM paper_chunks AS pc
-            JOIN papers AS p ON p.id = pc.paper_id
-            WHERE p.deleted_at IS NULL
-              AND p.organization_id = :organization_id
-              AND pc.chunk_role IN ({role_sql})
-              AND (
-                    pc.search_vector @@ plainto_tsquery('{search_config}', :query)
-                    OR {exact_match_sql}
-              )
-            ORDER BY score DESC, pc.id ASC
-            LIMIT :limit
-            """
-        ),
-        params,
-    ).mappings().all()
-    return [
-        {
-            "chunk_id": int(row["chunk_id"]),
-            "paper_id": int(row["paper_id"]),
-            "score": float(row["score"] or 0.0),
-        }
-        for row in rows
-    ]
+    from app.services.chat_rag.retrieval_low_level import search_sparse_chunks_postgres
+
+    return search_sparse_chunks_postgres(
+        db,
+        query=query,
+        limit=limit,
+        organization_id=organization_id,
+        exact_terms=exact_terms,
+    )
 
 
 def _search_dense_chunks_postgres(
@@ -1077,34 +807,14 @@ def _search_dense_chunks_postgres(
     limit: int,
     organization_id: int,
 ) -> list[dict[str, Any]]:
-    if query_embedding is None:
-        return []
-    searchable_roles = _searchable_chunk_roles()
-    distance = PaperChunk.embedding.cosine_distance(query_embedding)
-    rows = db.execute(
-        select(
-            PaperChunk.id.label("chunk_id"),
-            PaperChunk.paper_id.label("paper_id"),
-            (1 - distance).label("score"),
-        )
-        .join(Paper, Paper.id == PaperChunk.paper_id)
-        .where(
-            Paper.deleted_at.is_(None),
-            Paper.organization_id == organization_id,
-            PaperChunk.embedding.is_not(None),
-            PaperChunk.chunk_role.in_(searchable_roles),
-        )
-        .order_by(distance.asc(), PaperChunk.id.asc())
-        .limit(limit)
-    ).all()
-    return [
-        {
-            "chunk_id": int(row.chunk_id),
-            "paper_id": int(row.paper_id),
-            "score": float(row.score or 0.0),
-        }
-        for row in rows
-    ]
+    from app.services.chat_rag.retrieval_low_level import search_dense_chunks_postgres
+
+    return search_dense_chunks_postgres(
+        db,
+        query_embedding=query_embedding,
+        limit=limit,
+        organization_id=organization_id,
+    )
 
 
 def _fuse_ranked_candidate_sources(
@@ -1112,33 +822,9 @@ def _fuse_ranked_candidate_sources(
     *,
     limit: int,
 ) -> list[dict[str, Any]]:
-    merged: dict[int, dict[str, Any]] = {}
-    for source_name, hits in source_hits.items():
-        for rank, item in enumerate(hits, start=1):
-            candidate = merged.setdefault(
-                int(item["chunk_id"]),
-                {
-                    "chunk_id": int(item["chunk_id"]),
-                    "paper_id": int(item["paper_id"]),
-                    "source_scores": {},
-                    "source_ranks": {},
-                    "score": 0.0,
-                },
-            )
-            candidate["source_scores"][source_name] = float(item["score"])
-            candidate["source_ranks"][source_name] = rank
-            candidate["score"] += 1.0 / (settings.rag_rrf_k + rank)
-    fused = list(merged.values())
-    fused.sort(
-        key=lambda item: (
-            float(item["score"]),
-            max((float(score) for score in item["source_scores"].values()), default=0.0),
-        ),
-        reverse=True,
-    )
-    for rank, item in enumerate(fused, start=1):
-        item["rank"] = rank
-    return fused[:limit]
+    from app.services.chat_rag.retrieval_low_level import fuse_ranked_candidate_sources
+
+    return fuse_ranked_candidate_sources(source_hits, limit=limit)
 
 
 def _fuse_ranked_candidates(
@@ -1147,7 +833,9 @@ def _fuse_ranked_candidates(
     *,
     limit: int,
 ) -> list[dict[str, Any]]:
-    return _fuse_ranked_candidate_sources({"sparse": sparse_hits, "dense": dense_hits}, limit=limit)
+    from app.services.chat_rag.retrieval_low_level import fuse_ranked_candidates
+
+    return fuse_ranked_candidates(sparse_hits, dense_hits, limit=limit)
 
 
 def _boost_exact_match_candidates(
@@ -1156,57 +844,9 @@ def _boost_exact_match_candidates(
     candidates: list[dict[str, Any]],
     record_map: dict[int, tuple[PaperChunk, Paper]],
 ) -> list[dict[str, Any]]:
-    exact_terms = _extract_exact_match_terms(query)
-    prefers_table = _is_table_or_figure_query(query)
-    table_focus_terms = _extract_table_focus_terms(query) if prefers_table else []
-    if not exact_terms and not table_focus_terms:
-        return candidates
+    from app.services.chat_rag.retrieval_low_level import boost_exact_match_candidates
 
-    boosted: list[dict[str, Any]] = []
-    allow_general_exact_boost = not _is_cjk_dominant_text(query)
-    for candidate in candidates:
-        record = record_map.get(int(candidate["chunk_id"]))
-        if record is None:
-            boosted.append(dict(candidate))
-            continue
-        chunk, _ = record
-        metadata = chunk.metadata_json if isinstance(chunk.metadata_json, dict) else {}
-        haystack = _chunk_text_payload(chunk, include_supporting_context=True).lower()
-        matched_terms = [term for term in exact_terms if term.lower() in haystack]
-        matched_focus_terms = [term for term in table_focus_terms if term.lower() in haystack]
-        block_types = {str(item).lower() for item in metadata.get("block_types", [])} if isinstance(metadata, dict) else set()
-        body_text = str(metadata.get("body_text") or chunk.content or "")
-        has_table_body = _chunk_has_table_body(chunk)
-        caption_only = _chunk_is_caption_only(chunk)
-        bonus = 0.0
-        if allow_general_exact_boost:
-            bonus += sum(min(0.12, 0.04 + len(term) * 0.003) for term in matched_terms)
-        if prefers_table:
-            if has_table_body:
-                bonus += 0.05
-                bonus += sum(min(0.06, 0.02 + len(term) * 0.002) for term in matched_terms)
-                bonus += sum(min(0.04, 0.015 + len(term) * 0.0015) for term in matched_focus_terms)
-                if matched_focus_terms and re.search(r"\d", body_text):
-                    bonus += 0.05
-            elif "table_caption" in block_types and not caption_only:
-                bonus += 0.03 + sum(min(0.03, 0.01 + len(term) * 0.0015) for term in matched_terms)
-        boosted_candidate = dict(candidate)
-        boosted_candidate["exact_match_terms"] = matched_terms
-        boosted_candidate["exact_match_bonus"] = round(bonus, 4)
-        boosted_candidate["score"] = float(candidate.get("score") or 0.0) + bonus
-        boosted.append(boosted_candidate)
-
-    boosted.sort(
-        key=lambda item: (
-            float(item.get("score") or 0.0),
-            float(item.get("exact_match_bonus") or 0.0),
-            max((float(score) for score in item.get("source_scores", {}).values()), default=0.0),
-        ),
-        reverse=True,
-    )
-    for rank, item in enumerate(boosted, start=1):
-        item["rank"] = rank
-    return boosted
+    return boost_exact_match_candidates(query, candidates=candidates, record_map=record_map)
 
 
 def _load_chunk_record_map(
@@ -1215,39 +855,15 @@ def _load_chunk_record_map(
     chunk_ids: Iterable[int],
     organization_id: int,
 ) -> dict[int, tuple[PaperChunk, Paper]]:
-    ids = [int(chunk_id) for chunk_id in chunk_ids]
-    if not ids:
-        return {}
-    rows = db.execute(
-        select(PaperChunk, Paper)
-        .join(Paper, Paper.id == PaperChunk.paper_id)
-        .where(Paper.deleted_at.is_(None), Paper.organization_id == organization_id, PaperChunk.id.in_(ids))
-    ).all()
-    return {int(chunk.id): (chunk, paper) for chunk, paper in rows}
+    from app.services.chat_rag.retrieval_low_level import load_chunk_record_map
+
+    return load_chunk_record_map(db, chunk_ids=chunk_ids, organization_id=organization_id)
 
 
 def _should_expand_multi_span_candidates(query: str, *, query_plan: RetrievalQueryPlan) -> bool:
-    if not query.strip() or _is_table_or_figure_query(query):
-        return False
-    if query_plan.query_type in {"exact_heavy_short", "decontextualization_short"}:
-        return False
-    if query_plan.subqueries_en:
-        return True
-    normalized_query = re.sub(r"\s+", " ", query).strip().lower()
-    patterns = (
-        r"分别",
-        r"各自",
-        r"哪些",
-        r"以及",
-        r"同时",
-        r"原因",
-        r"退出",
-        r"why .* reasons?",
-        r"reasons? for",
-        r"respectively",
-        r"\bboth\b",
-    )
-    return any(re.search(pattern, normalized_query, re.IGNORECASE) for pattern in patterns)
+    from app.services.chat_rag.retrieval_low_level import should_expand_multi_span_candidates
+
+    return should_expand_multi_span_candidates(query, query_plan=query_plan)
 
 
 def _merge_ranked_candidates(
@@ -1256,42 +872,9 @@ def _merge_ranked_candidates(
     *,
     limit: int,
 ) -> list[dict[str, Any]]:
-    merged: dict[int, dict[str, Any]] = {int(item["chunk_id"]): dict(item) for item in primary}
-    for item in additional:
-        chunk_id = int(item["chunk_id"])
-        existing = merged.get(chunk_id)
-        if existing is None:
-            merged[chunk_id] = dict(item)
-            continue
-        existing["score"] = max(float(existing.get("score") or 0.0), float(item.get("score") or 0.0))
-        existing_scores = existing.setdefault("source_scores", {})
-        new_scores = item.get("source_scores") if isinstance(item.get("source_scores"), dict) else {}
-        for key, value in new_scores.items():
-            existing_scores[key] = max(float(existing_scores.get(key) or 0.0), float(value))
-        existing_ranks = existing.setdefault("source_ranks", {})
-        new_ranks = item.get("source_ranks") if isinstance(item.get("source_ranks"), dict) else {}
-        for key, value in new_ranks.items():
-            if key not in existing_ranks:
-                existing_ranks[key] = int(value)
-        existing_anchor_ids = {int(item_id) for item_id in existing.get("expansion_anchor_ids", [])}
-        existing_anchor_ids.update(int(item_id) for item_id in item.get("expansion_anchor_ids", []) if str(item_id).isdigit())
-        if existing_anchor_ids:
-            existing["expansion_anchor_ids"] = sorted(existing_anchor_ids)
-        existing_sources = {str(source) for source in existing.get("expansion_sources", [])}
-        existing_sources.update(str(source) for source in item.get("expansion_sources", []) if str(source).strip())
-        if existing_sources:
-            existing["expansion_sources"] = sorted(existing_sources)
-    ranked = list(merged.values())
-    ranked.sort(
-        key=lambda candidate: (
-            float(candidate.get("score") or 0.0),
-            max((float(score) for score in candidate.get("source_scores", {}).values()), default=0.0),
-        ),
-        reverse=True,
-    )
-    for rank, item in enumerate(ranked, start=1):
-        item["rank"] = rank
-    return ranked[:limit]
+    from app.services.chat_rag.retrieval_low_level import merge_ranked_candidates
+
+    return merge_ranked_candidates(primary, additional, limit=limit)
 
 
 def _expand_retrieval_candidates(
@@ -1304,200 +887,26 @@ def _expand_retrieval_candidates(
     query_plan: RetrievalQueryPlan,
     limit: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    stats: dict[str, Any] = {
-        "enabled": False,
-        "expanded_candidate_count": 0,
-        "expansion_added_ids": [],
-    }
-    if not candidates:
-        return candidates, stats
+    from app.services.chat_rag.retrieval_low_level import expand_retrieval_candidates
 
-    enable_multi_span_expansion = _should_expand_multi_span_candidates(query, query_plan=query_plan)
-    anchor_candidates: list[tuple[dict[str, Any], PaperChunk]] = []
-    parent_ids: set[int] = set()
-    summary_candidates: list[tuple[dict[str, Any], PaperChunk, list[int]]] = []
-    summary_anchor_ids: set[int] = set()
-    for candidate in candidates:
-        record = record_map.get(int(candidate["chunk_id"]))
-        if record is None:
-            continue
-        chunk, _paper = record
-        chunk_role = _chunk_role(chunk)
-        if chunk_role == "child" and enable_multi_span_expansion:
-            anchor_candidates.append((candidate, chunk))
-            if chunk.parent_chunk_id is not None:
-                parent_ids.add(int(chunk.parent_chunk_id))
-            continue
-        if not _is_summary_chunk_role(chunk_role):
-            continue
-        anchor_ids = _chunk_anchor_ids(chunk, limit=settings.rag_summary_anchor_limit)
-        if not anchor_ids:
-            continue
-        summary_candidates.append((candidate, chunk, anchor_ids))
-        summary_anchor_ids.update(anchor_ids)
-
-    if (not anchor_candidates or not parent_ids) and not summary_anchor_ids:
-        return candidates, stats
-
-    stats["enabled"] = True
-    expanded_limit = min(max(limit + 6, limit), 24)
-    max_siblings_per_anchor = 2
-
-    related_rows = db.execute(
-        select(PaperChunk, Paper)
-        .join(Paper, Paper.id == PaperChunk.paper_id)
-        .where(
-            Paper.deleted_at.is_(None),
-            Paper.organization_id == organization_id,
-            (PaperChunk.parent_chunk_id.in_(parent_ids)) | (PaperChunk.id.in_(parent_ids | summary_anchor_ids)),
-        )
-    ).all()
-    related_record_map = {int(chunk.id): (chunk, paper) for chunk, paper in related_rows}
-
-    parent_rows: dict[int, PaperChunk] = {}
-    sibling_rows_by_parent: dict[int, list[PaperChunk]] = {}
-    for chunk, _paper in related_rows:
-        if int(chunk.id) in parent_ids and str(getattr(chunk, "chunk_role", "child") or "child") == "parent":
-            parent_rows[int(chunk.id)] = chunk
-            continue
-        if chunk.parent_chunk_id is None:
-            continue
-        sibling_rows_by_parent.setdefault(int(chunk.parent_chunk_id), []).append(chunk)
-
-    anchor_ids = {int(chunk.id) for _, chunk in anchor_candidates}
-    additional_candidates: list[dict[str, Any]] = []
-    if enable_multi_span_expansion:
-        for candidate, anchor_chunk in anchor_candidates:
-            anchor_score = float(candidate.get("score") or 0.0)
-            anchor_rank = int(candidate.get("rank") or 0)
-            parent_id = int(anchor_chunk.parent_chunk_id or 0)
-            if parent_id <= 0:
-                continue
-            sibling_rows = [
-                sibling
-                for sibling in sibling_rows_by_parent.get(parent_id, [])
-                if int(sibling.id) not in anchor_ids and int(sibling.id) != int(anchor_chunk.id)
-            ]
-            sibling_rows.sort(
-                key=lambda sibling: (
-                    abs(int(sibling.chunk_index or 0) - int(anchor_chunk.chunk_index or 0)),
-                    int(sibling.chunk_index or 0),
-                )
-            )
-            for sibling_rank, sibling in enumerate(sibling_rows[:max_siblings_per_anchor], start=1):
-                decay = max(0.62, 0.88 - (sibling_rank - 1) * 0.12)
-                additional_candidates.append(
-                    {
-                        "chunk_id": int(sibling.id),
-                        "paper_id": int(sibling.paper_id),
-                        "score": anchor_score * decay,
-                        "source_scores": {"expansion_sibling": anchor_score * decay},
-                        "source_ranks": {"expansion_sibling": max(anchor_rank, 1)},
-                        "expansion_anchor_ids": [int(anchor_chunk.id)],
-                        "expansion_sources": ["sibling"],
-                    }
-                )
-            parent_row = parent_rows.get(parent_id)
-            if parent_row is not None:
-                parent_score = anchor_score * 0.72
-                additional_candidates.append(
-                    {
-                        "chunk_id": int(parent_row.id),
-                        "paper_id": int(parent_row.paper_id),
-                        "score": parent_score,
-                        "source_scores": {"expansion_parent": parent_score},
-                        "source_ranks": {"expansion_parent": max(anchor_rank, 1)},
-                        "expansion_anchor_ids": [int(anchor_chunk.id)],
-                        "expansion_sources": ["parent"],
-                    }
-                )
-
-    for candidate, summary_chunk, anchor_chunk_ids in summary_candidates:
-        summary_score = float(candidate.get("score") or 0.0)
-        summary_rank = int(candidate.get("rank") or 0)
-        for anchor_rank, anchor_chunk_id in enumerate(anchor_chunk_ids[: settings.rag_summary_anchor_limit], start=1):
-            record = related_record_map.get(int(anchor_chunk_id)) or record_map.get(int(anchor_chunk_id))
-            if record is None:
-                continue
-            anchor_chunk, _paper = record
-            decay = max(0.58, 0.92 - (anchor_rank - 1) * 0.12)
-            additional_candidates.append(
-                {
-                    "chunk_id": int(anchor_chunk.id),
-                    "paper_id": int(anchor_chunk.paper_id),
-                    "score": summary_score * decay,
-                    "source_scores": {"expansion_summary_anchor": summary_score * decay},
-                    "source_ranks": {"expansion_summary_anchor": max(summary_rank, 1)},
-                    "expansion_anchor_ids": [int(summary_chunk.id)],
-                    "expansion_sources": ["summary_anchor"],
-                }
-            )
-
-    if not additional_candidates:
-        return candidates, stats
-
-    merged = _merge_ranked_candidates(candidates, additional_candidates, limit=expanded_limit)
-    added_ids = [int(item["chunk_id"]) for item in merged if int(item["chunk_id"]) not in {int(candidate["chunk_id"]) for candidate in candidates}]
-    record_map.update(related_record_map)
-    stats["expanded_candidate_count"] = len(added_ids)
-    stats["expansion_added_ids"] = added_ids
-    return merged, stats
+    return expand_retrieval_candidates(
+        db,
+        query=query,
+        candidates=candidates,
+        record_map=record_map,
+        organization_id=organization_id,
+        query_plan=query_plan,
+        limit=limit,
+    )
 
 
 def _serialize_ranked_trace_candidates(
     candidates: list[dict[str, Any]],
     record_map: dict[int, tuple[PaperChunk, Paper]],
 ) -> list[dict]:
-    serialized: list[dict] = []
-    for item in candidates:
-        record = record_map.get(int(item["chunk_id"]))
-        if record is None:
-            continue
-        chunk, paper = record
-        snippet = _clip_snippet(_chunk_text_payload(chunk), max_length=180)
-        row = {
-            "chunk_id": chunk.id,
-            "chunk_index": chunk.chunk_index,
-            "paper_id": paper.id,
-            "paper_title": paper.title,
-            "score": round(float(item.get("score") or 0.0), 4),
-            "page_from": chunk.page_from,
-            "page_to": chunk.page_to,
-            "snippet": snippet,
-            "chunk_role": _chunk_role(chunk),
-            "granularity": _chunk_granularity(chunk),
-        }
-        source_kind = _chunk_source_kind(chunk)
-        if source_kind:
-            row["source_kind"] = source_kind
-        source_scores = item.get("source_scores")
-        if isinstance(source_scores, dict) and source_scores:
-            row["source_scores"] = {key: round(float(value), 4) for key, value in source_scores.items()}
-        source_ranks = item.get("source_ranks")
-        if isinstance(source_ranks, dict) and source_ranks:
-            row["source_ranks"] = {key: int(value) for key, value in source_ranks.items()}
-        if item.get("rerank_score") is not None:
-            row["rerank_score"] = round(float(item["rerank_score"]), 4)
-        if item.get("rerank_rank") is not None:
-            row["rerank_rank"] = int(item["rerank_rank"])
-        if item.get("exact_match_bonus") is not None:
-            row["exact_match_bonus"] = round(float(item["exact_match_bonus"]), 4)
-        if item.get("exact_match_terms"):
-            row["exact_match_terms"] = [str(term) for term in item["exact_match_terms"]]
-        if item.get("expansion_sources"):
-            row["expansion_sources"] = [str(source) for source in item["expansion_sources"]]
-        if item.get("expansion_anchor_ids"):
-            row["expansion_anchor_ids"] = [int(anchor_id) for anchor_id in item["expansion_anchor_ids"]]
-        if item.get("rerank_context_chars") is not None:
-            row["rerank_context_chars"] = int(item["rerank_context_chars"])
-        if item.get("rerank_evidence_blocks") is not None:
-            row["rerank_evidence_blocks"] = int(item["rerank_evidence_blocks"])
-        if item.get("rerank_context_truncated") is not None:
-            row["rerank_context_truncated"] = bool(item["rerank_context_truncated"])
-        if item.get("rerank_evidence_types"):
-            row["rerank_evidence_types"] = [str(kind) for kind in item["rerank_evidence_types"]]
-        serialized.append(row)
-    return serialized
+    from app.services.chat_rag.tracing import serialize_ranked_trace_candidates
+
+    return serialize_ranked_trace_candidates(candidates, record_map)
 
 
 def _serialize_variant_traces(
@@ -1505,19 +914,9 @@ def _serialize_variant_traces(
     *,
     record_map: dict[int, tuple[PaperChunk, Paper]],
 ) -> dict[str, dict[str, Any]]:
-    serialized: dict[str, dict[str, Any]] = {}
-    for name, variant in variant_traces.items():
-        serialized[name] = {
-            "query": variant.get("query"),
-            "language": variant.get("language"),
-            "role": variant.get("role"),
-            "use_sparse": bool(variant.get("use_sparse")),
-            "use_dense": bool(variant.get("use_dense")),
-            "sparse_candidates": _serialize_ranked_trace_candidates(variant.get("sparse_hits", []), record_map),
-            "dense_candidates": _serialize_ranked_trace_candidates(variant.get("dense_hits", []), record_map),
-            "fused_candidates": _serialize_ranked_trace_candidates(variant.get("fused_hits", []), record_map),
-        }
-    return serialized
+    from app.services.chat_rag.tracing import serialize_variant_traces
+
+    return serialize_variant_traces(variant_traces, record_map=record_map)
 
 
 def _build_retrieval_results(
@@ -1525,30 +924,15 @@ def _build_retrieval_results(
     *,
     record_map: dict[int, tuple[PaperChunk, Paper]],
 ) -> list[RetrievalResult]:
-    results: list[RetrievalResult] = []
-    seen_chunk_ids: set[int] = set()
-    for item in candidates:
-        resolved_chunk_id = _resolve_candidate_chunk_id(item, record_map=record_map)
-        if resolved_chunk_id in seen_chunk_ids:
-            continue
-        record = record_map.get(resolved_chunk_id) or record_map.get(int(item["chunk_id"]))
-        if record is None:
-            continue
-        chunk, paper = record
-        seen_chunk_ids.add(int(chunk.id))
-        results.append(RetrievalResult(chunk=chunk, paper=paper, score=float(item.get("score") or 0.0)))
-    return results
+    from app.services.chat_rag.tracing import build_retrieval_results
+
+    return build_retrieval_results(candidates, record_map=record_map)
 
 
 def _results_to_ranked_hits(results: list[RetrievalResult]) -> list[dict[str, Any]]:
-    return [
-        {
-            "chunk_id": int(result.chunk.id),
-            "paper_id": int(result.paper.id),
-            "score": float(result.score),
-        }
-        for result in results
-    ]
+    from app.services.chat_rag.tracing import results_to_ranked_hits
+
+    return results_to_ranked_hits(results)
 
 
 def _resolve_candidate_chunk_id(
@@ -1574,64 +958,33 @@ def _resolve_candidate_chunk_id(
 
 
 def _extract_query_numbers(text: str) -> tuple[str, ...]:
-    return tuple(sorted({match.group(0) for match in re.finditer(r"[-+]?\d+(?:\.\d+)?", text or "")}))
+    from app.services.chat_rag.retrieval_low_level import extract_query_numbers
+
+    return extract_query_numbers(text)
 
 
 def _compact_text(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").strip())
+    from app.services.chat_rag.retrieval_low_level import compact_text
+
+    return compact_text(text)
 
 
 def _truncate_for_budget(text: str, *, max_chars: int) -> str:
-    compact = _compact_text(text)
-    if len(compact) <= max_chars:
-        return compact
-    if max_chars <= 3:
-        return compact[:max_chars]
-    return f"{compact[: max_chars - 3].rstrip()}..."
+    from app.services.chat_rag.retrieval_low_level import truncate_for_budget
+
+    return truncate_for_budget(text, max_chars=max_chars)
 
 
 def _summarize_text_excerpt(text: str, *, max_sentences: int, max_chars: int) -> str:
-    compact = _compact_text(text)
-    if not compact:
-        return ""
-    sentence_candidates = [
-        sentence.strip()
-        for sentence in re.split(r"(?<=[。！？.!?])\s+", compact)
-        if sentence.strip()
-    ]
-    if not sentence_candidates:
-        sentence_candidates = [compact]
-    selected = " ".join(sentence_candidates[: max(max_sentences, 1)])
-    return _truncate_for_budget(selected or compact, max_chars=max_chars)
+    from app.services.chat_rag.retrieval_low_level import summarize_text_excerpt
+
+    return summarize_text_excerpt(text, max_sentences=max_sentences, max_chars=max_chars)
 
 
 def _serialize_structured_summary_for_chunk(summary: dict[str, Any] | None) -> str:
-    if not isinstance(summary, dict):
-        return ""
-    parts: list[str] = []
-    abstract_cn = _compact_text(str(summary.get("abstract_cn") or ""))
-    if abstract_cn:
-        parts.append(f"摘要：{abstract_cn}")
-    research_question = _compact_text(str(summary.get("research_question") or ""))
-    if research_question:
-        parts.append(f"研究问题：{research_question}")
-    method = _compact_text(str(summary.get("method") or ""))
-    if method:
-        parts.append(f"方法：{method}")
-    findings = _compact_text(str(summary.get("findings") or ""))
-    if findings:
-        parts.append(f"发现：{findings}")
-    limitations = _compact_text(str(summary.get("limitations") or ""))
-    if limitations:
-        parts.append(f"局限：{limitations}")
-    key_points = [
-        _compact_text(str(item))
-        for item in (summary.get("key_points") if isinstance(summary.get("key_points"), list) else [])
-        if _compact_text(str(item))
-    ]
-    if key_points:
-        parts.append("要点：" + "；".join(key_points[:4]))
-    return _truncate_for_budget("\n".join(parts), max_chars=settings.rag_paper_summary_max_chars) if parts else ""
+    from app.services.chat_rag.retrieval_low_level import serialize_structured_summary_for_chunk
+
+    return serialize_structured_summary_for_chunk(summary)
 
 
 def _build_fallback_paper_summary_text(
@@ -1639,15 +992,9 @@ def _build_fallback_paper_summary_text(
     *,
     normalized_blocks: list[dict[str, Any]],
 ) -> str:
-    compact_summaries = [_compact_text(item) for item in section_summaries if _compact_text(item)]
-    if compact_summaries:
-        return _truncate_for_budget("\n".join(compact_summaries[:3]), max_chars=settings.rag_paper_summary_max_chars)
-    fallback_text = "\n".join(
-        _compact_text(str(block.get("text") or ""))
-        for block in normalized_blocks[:6]
-        if _compact_text(str(block.get("text") or ""))
-    )
-    return _truncate_for_budget(fallback_text, max_chars=settings.rag_paper_summary_max_chars) if fallback_text else ""
+    from app.services.chat_rag.retrieval_low_level import build_fallback_paper_summary_text
+
+    return build_fallback_paper_summary_text(section_summaries, normalized_blocks=normalized_blocks)
 
 
 def _build_rerank_block_catalog(
@@ -1655,36 +1002,9 @@ def _build_rerank_block_catalog(
     *,
     paper_ids: Iterable[int],
 ) -> dict[int, dict[str, Any]]:
-    catalogs: dict[int, dict[str, Any]] = {}
-    for paper_id in sorted({int(item) for item in paper_ids if int(item)}):
-        preanalysis = _build_preanalysis_from_document_structure(db, paper_id=paper_id) or {}
-        blocks = preanalysis.get("blocks") if isinstance(preanalysis, dict) else []
-        if not isinstance(blocks, list):
-            blocks = []
-        catalogs[paper_id] = {
-            "blocks": blocks,
-            "by_block_index": {
-                int(block.get("block_index")): block
-                for block in blocks
-                if isinstance(block, dict) and (isinstance(block.get("block_index"), int) or str(block.get("block_index") or "").isdigit())
-            },
-            "by_source_block_id": {
-                int(block.get("source_block_id")): block
-                for block in blocks
-                if isinstance(block, dict) and (isinstance(block.get("source_block_id"), int) or str(block.get("source_block_id") or "").isdigit())
-            },
-            "by_source_table_id": {
-                int(block.get("source_table_id")): block
-                for block in blocks
-                if isinstance(block, dict) and (isinstance(block.get("source_table_id"), int) or str(block.get("source_table_id") or "").isdigit())
-            },
-            "by_source_picture_id": {
-                int(block.get("source_picture_id")): block
-                for block in blocks
-                if isinstance(block, dict) and (isinstance(block.get("source_picture_id"), int) or str(block.get("source_picture_id") or "").isdigit())
-            },
-        }
-    return catalogs
+    from app.services.chat_rag.retrieval_low_level import build_rerank_block_catalog
+
+    return build_rerank_block_catalog(db, paper_ids=paper_ids)
 
 
 def _score_rerank_text(
@@ -1698,28 +1018,18 @@ def _score_rerank_text(
     is_primary: bool,
     section_path: str,
 ) -> float:
-    compact = _compact_text(text).lower()
-    if not compact:
-        return 0.0
-    score = 0.0
-    query_token_set = set(query_tokens)
-    unit_token_set = set(_tokenize(compact))
-    score += float(len(query_token_set & unit_token_set))
-    exact_hits = sum(1 for term in exact_terms if term.lower() in compact)
-    score += exact_hits * 4.0
-    if section_path:
-        section_compact = section_path.lower()
-        score += sum(1.5 for term in exact_terms if term.lower() in section_compact)
-    if query_numbers:
-        text_numbers = {match.group(0) for match in re.finditer(r"[-+]?\d+(?:\.\d+)?", compact)}
-        score += float(len(set(query_numbers) & text_numbers)) * 3.0
-    if prefers_table and unit_type in {"table_caption", "table_row"}:
-        score += 1.5
-    if is_primary:
-        score += 2.0
-    if unit_type == "neighbor_context":
-        score -= 0.25
-    return score
+    from app.services.chat_rag.retrieval_low_level import score_rerank_text
+
+    return score_rerank_text(
+        text,
+        query_tokens=query_tokens,
+        exact_terms=exact_terms,
+        query_numbers=query_numbers,
+        prefers_table=prefers_table,
+        unit_type=unit_type,
+        is_primary=is_primary,
+        section_path=section_path,
+    )
 
 
 def _neighbor_blocks_for_rerank(
@@ -1728,42 +1038,15 @@ def _neighbor_blocks_for_rerank(
     catalog: dict[str, Any],
     neighbor_count: int,
 ) -> list[dict[str, Any]]:
-    if neighbor_count <= 0:
-        return []
-    block_index = int(block.get("block_index") or -1)
-    if block_index < 0:
-        return []
-    by_block_index = catalog.get("by_block_index") if isinstance(catalog, dict) else {}
-    section_id = str(block.get("section_id") or "")
-    neighbors: list[dict[str, Any]] = []
-    for distance in range(1, neighbor_count + 1):
-        for candidate_index in (block_index - distance, block_index + distance):
-            candidate = by_block_index.get(candidate_index) if isinstance(by_block_index, dict) else None
-            if not isinstance(candidate, dict):
-                continue
-            if str(candidate.get("section_id") or "") != section_id:
-                continue
-            neighbors.append(candidate)
-    return neighbors
+    from app.services.chat_rag.retrieval_low_level import neighbor_blocks_for_rerank
+
+    return neighbor_blocks_for_rerank(block, catalog=catalog, neighbor_count=neighbor_count)
 
 
 def _table_evidence_units(block: dict[str, Any]) -> list[dict[str, Any]]:
-    units: list[dict[str, Any]] = []
-    table_text = str(block.get("text") or "").strip()
-    lines = [line.strip() for line in table_text.splitlines() if line.strip()]
-    if lines:
-        units.append({"text": lines[0], "unit_type": "table_caption"})
-    serialized_rows = _serialize_table_rows(block.get("table_data_json"), max_rows=16)
-    row_lines = [line.strip() for line in serialized_rows.splitlines() if line.strip()]
-    if row_lines:
-        for row_line in row_lines:
-            units.append({"text": row_line, "unit_type": "table_row"})
-    elif len(lines) > 1:
-        for row_line in lines[1:9]:
-            units.append({"text": row_line, "unit_type": "table_row"})
-    if not units and table_text:
-        units.append({"text": table_text, "unit_type": "table_row"})
-    return units
+    from app.services.chat_rag.retrieval_low_level import table_evidence_units
+
+    return table_evidence_units(block)
 
 
 def _candidate_rerank_units(
@@ -1772,80 +1055,9 @@ def _candidate_rerank_units(
     catalog: dict[str, Any],
     query: str,
 ) -> list[dict[str, Any]]:
-    metadata = chunk.metadata_json if isinstance(chunk.metadata_json, dict) else {}
-    source_blocks = metadata.get("source_block_ids") if isinstance(metadata.get("source_block_ids"), list) else []
-    source_tables = metadata.get("source_table_ids") if isinstance(metadata.get("source_table_ids"), list) else []
-    source_pictures = metadata.get("source_picture_ids") if isinstance(metadata.get("source_picture_ids"), list) else []
-    prefers_table = _is_table_or_figure_query(query)
-    query_tokens = _tokenize(query)
-    exact_terms = _extract_exact_match_terms(query)
-    query_numbers = _extract_query_numbers(query)
-    units: list[dict[str, Any]] = []
-    seen_texts: set[str] = set()
-    source_candidates: list[tuple[dict[str, Any], bool]] = []
-    for block_id in source_blocks:
-        block = catalog.get("by_source_block_id", {}).get(int(block_id))
-        if isinstance(block, dict):
-            source_candidates.append((block, True))
-    for table_id in source_tables:
-        block = catalog.get("by_source_table_id", {}).get(int(table_id))
-        if isinstance(block, dict):
-            source_candidates.append((block, True))
-    for picture_id in source_pictures:
-        block = catalog.get("by_source_picture_id", {}).get(int(picture_id))
-        if isinstance(block, dict):
-            source_candidates.append((block, True))
-    for block, is_primary in list(source_candidates):
-        for neighbor in _neighbor_blocks_for_rerank(
-            block,
-            catalog=catalog,
-            neighbor_count=settings.rerank_neighbor_blocks,
-        ):
-            source_candidates.append((neighbor, False))
-    for block, is_primary in source_candidates:
-        block_type = str(block.get("block_type") or "paragraph")
-        unit_specs = (
-            _table_evidence_units(block)
-            if block_type == "table_like"
-            else [{"text": str(block.get("text") or "").strip(), "unit_type": "primary_block" if is_primary else "neighbor_context"}]
-        )
-        for unit_spec in unit_specs:
-            text = _compact_text(unit_spec.get("text") or "")
-            if not text or text in seen_texts:
-                continue
-            unit_type = str(unit_spec.get("unit_type") or "primary_block")
-            section_path = str(block.get("section_path") or "")
-            score = _score_rerank_text(
-                text,
-                query_tokens=query_tokens,
-                exact_terms=exact_terms,
-                query_numbers=query_numbers,
-                prefers_table=prefers_table,
-                unit_type=unit_type,
-                is_primary=is_primary,
-                section_path=section_path,
-            )
-            units.append(
-                {
-                    "text": text,
-                    "unit_type": unit_type,
-                    "score": score,
-                    "is_primary": is_primary,
-                    "block_index": int(block.get("block_index") or -1),
-                    "section_path": section_path,
-                    "source_key": (
-                        f"block:{block.get('source_block_id')}"
-                        if block.get("source_block_id") is not None
-                        else f"table:{block.get('source_table_id')}"
-                        if block.get("source_table_id") is not None
-                        else f"picture:{block.get('source_picture_id')}"
-                        if block.get("source_picture_id") is not None
-                        else f"idx:{int(block.get('block_index') or -1)}"
-                    ),
-                }
-            )
-            seen_texts.add(text)
-    return units
+    from app.services.chat_rag.retrieval_low_level import candidate_rerank_units
+
+    return candidate_rerank_units(chunk, catalog=catalog, query=query)
 
 
 def _build_rerank_context_for_chunk(
@@ -1854,84 +1066,9 @@ def _build_rerank_context_for_chunk(
     chunk: PaperChunk,
     catalog: dict[str, Any] | None,
 ) -> tuple[str, dict[str, Any]]:
-    metadata = chunk.metadata_json if isinstance(chunk.metadata_json, dict) else {}
-    header = str(metadata.get("context_header") or "").strip()
-    if not isinstance(catalog, dict):
-        fallback = _truncate_for_budget(
-            _chunk_text_payload(chunk, include_supporting_context=False),
-            max_chars=settings.rerank_max_context_chars,
-        )
-        return fallback, {
-            "rerank_context_chars": len(fallback),
-            "rerank_evidence_blocks": 0,
-            "rerank_context_truncated": len(fallback) < len(_compact_text(_chunk_text_payload(chunk, include_supporting_context=False))),
-            "rerank_evidence_types": [],
-        }
+    from app.services.chat_rag.retrieval_low_level import build_rerank_context_for_chunk
 
-    units = _candidate_rerank_units(chunk, catalog=catalog, query=query)
-    grouped_primary: dict[str, dict[str, Any]] = {}
-    others: list[dict[str, Any]] = []
-    for unit in sorted(
-        units,
-        key=lambda item: (-float(item.get("score") or 0.0), not bool(item.get("is_primary")), int(item.get("block_index") or -1)),
-    ):
-        source_key = str(unit.get("source_key") or "")
-        if unit.get("is_primary") and source_key and source_key not in grouped_primary:
-            grouped_primary[source_key] = unit
-            continue
-        others.append(unit)
-    ordered_units = list(grouped_primary.values()) + others
-
-    pieces: list[str] = []
-    used_types: list[str] = []
-    total_chars = 0
-    max_chars = max(int(settings.rerank_max_context_chars), 200)
-    if header:
-        pieces.append(header)
-        total_chars = len(header)
-    selected_count = 0
-    truncated = False
-    for unit in ordered_units:
-        if selected_count >= max(int(settings.rerank_max_evidence_blocks), 1):
-            truncated = True
-            break
-        label = {
-            "table_caption": "表格标题",
-            "table_row": "表格证据",
-            "neighbor_context": "相邻上下文",
-        }.get(str(unit.get("unit_type") or ""), "正文证据")
-        formatted = f"{label}: {str(unit.get('text') or '').strip()}"
-        if not formatted.strip():
-            continue
-        remaining = max_chars - total_chars - (2 if pieces else 0)
-        if remaining <= 40:
-            truncated = True
-            break
-        if len(formatted) > remaining:
-            formatted = _truncate_for_budget(formatted, max_chars=remaining)
-            truncated = True
-        pieces.append(formatted)
-        total_chars += len(formatted) + (2 if len(pieces) > 1 else 0)
-        used_types.append(str(unit.get("unit_type") or "primary_block"))
-        selected_count += 1
-
-    if len(pieces) <= 1:
-        fallback_body = str(metadata.get("body_text") or chunk.content or "").strip()
-        fallback = "\n\n".join(part for part in (header, _truncate_for_budget(fallback_body, max_chars=max_chars // 2)) if part)
-        return fallback, {
-            "rerank_context_chars": len(fallback),
-            "rerank_evidence_blocks": 0,
-            "rerank_context_truncated": truncated or len(fallback) >= max_chars,
-            "rerank_evidence_types": [],
-        }
-
-    context = "\n\n".join(part for part in pieces if part)
-    return context, {
-        "rerank_context_chars": len(context),
-        "rerank_evidence_blocks": selected_count,
-        "rerank_context_truncated": truncated,
-        "rerank_evidence_types": sorted(set(used_types)),
-    }
+    return build_rerank_context_for_chunk(query, chunk=chunk, catalog=catalog)
 
 
 def _apply_reranking(
@@ -1942,62 +1079,15 @@ def _apply_reranking(
     record_map: dict[int, tuple[PaperChunk, Paper]],
     limit: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    documents: list[str] = []
-    aligned_candidates: list[dict[str, Any]] = []
-    rerank_stats = {
-        "query_chars": len(query or ""),
-        "documents_count": 0,
-        "max_document_chars": 0,
-        "over_budget_truncated_count": 0,
-    }
-    block_catalogs = _build_rerank_block_catalog(
+    from app.services.chat_rag.retrieval_low_level import apply_reranking
+
+    return apply_reranking(
         db,
-        paper_ids=[paper.id for _, paper in record_map.values()],
+        query,
+        fused_candidates=fused_candidates,
+        record_map=record_map,
+        limit=limit,
     )
-    for candidate in fused_candidates:
-        record = record_map.get(int(candidate["chunk_id"]))
-        if record is None:
-            continue
-        chunk, paper = record
-        rerank_context, context_meta = _build_rerank_context_for_chunk(
-            query,
-            chunk=chunk,
-            catalog=block_catalogs.get(int(paper.id)),
-        )
-        if not rerank_context:
-            continue
-        candidate_with_meta = dict(candidate)
-        candidate_with_meta.update(context_meta)
-        documents.append(rerank_context)
-        aligned_candidates.append(candidate_with_meta)
-        rerank_stats["documents_count"] = len(documents)
-        rerank_stats["max_document_chars"] = max(int(rerank_stats["max_document_chars"]), len(rerank_context))
-        if bool(context_meta.get("rerank_context_truncated")):
-            rerank_stats["over_budget_truncated_count"] = int(rerank_stats["over_budget_truncated_count"]) + 1
-    if not documents:
-        return [], rerank_stats
-    rerank_results = rerank_documents(query, documents, top_n=limit)
-    if not rerank_results:
-        return aligned_candidates[:limit], rerank_stats
-
-    reranked: list[dict[str, Any]] = []
-    seen_indexes: set[int] = set()
-    for rank, item in enumerate(rerank_results, start=1):
-        if item.index < 0 or item.index >= len(aligned_candidates):
-            continue
-        candidate = dict(aligned_candidates[item.index])
-        candidate["score"] = float(item.relevance_score)
-        candidate["rerank_score"] = float(item.relevance_score)
-        candidate["rerank_rank"] = rank
-        reranked.append(candidate)
-        seen_indexes.add(item.index)
-
-    for index, candidate in enumerate(aligned_candidates):
-        if index in seen_indexes:
-            continue
-        reranked.append(dict(candidate))
-
-    return reranked[:limit], rerank_stats
 
 
 def _history_messages(records: list[ChatMessage], *, include_last_user: bool = False) -> list[dict[str, str]]:
@@ -2705,93 +1795,15 @@ def rebuild_paper_index(
     paper_title: str | None = None,
     structured_summary: dict[str, Any] | None = None,
 ) -> int:
-    chunks = _split_text(
+    from app.services.chat_rag.indexing import get_paper_indexing_service
+
+    return get_paper_indexing_service().rebuild_paper_index(
+        db,
+        paper_id=paper_id,
         preanalysis=preanalysis,
         paper_title=paper_title,
         structured_summary=structured_summary,
     )
-    embeddings: list[list[float]] = []
-    if chunks and (settings.glm_api_key.strip() or settings.openai_api_key.strip()):
-        try:
-            embeddings = embed_texts([str(chunk.get("embedding_input") or chunk["content"]) for chunk in chunks])
-        except Exception:
-            embeddings = []
-
-    db.execute(delete(PaperChunk).where(PaperChunk.paper_id == paper_id))
-    parent_chunk_ids_by_section: dict[str, int] = {}
-    child_chunk_ids_by_section: dict[str, list[int]] = {}
-    child_rows: list[tuple[PaperChunk, str]] = []
-    section_summary_rows: list[tuple[PaperChunk, str]] = []
-    paper_summary_rows: list[PaperChunk] = []
-    for index, chunk in enumerate(chunks):
-        record = PaperChunk(
-            paper_id=paper_id,
-            parent_chunk_id=None,
-            chunk_index=chunk["chunk_index"],
-            chunk_role=str(chunk.get("chunk_role") or "child"),
-            content=chunk["content"],
-            embedding=embeddings[index] if index < len(embeddings) else None,
-            token_count=chunk["token_count"],
-            page_from=chunk["page_from"],
-            page_to=chunk["page_to"],
-            metadata_json=chunk["metadata_json"],
-        )
-        db.add(record)
-        db.flush()
-        if record.chunk_role == "parent":
-            section_key = str(chunk.get("section_key") or chunk["metadata_json"].get("section_id") or "")
-            if section_key:
-                parent_chunk_ids_by_section[section_key] = int(record.id)
-        elif record.chunk_role == "child":
-            child_rows.append((record, str(chunk.get("parent_key") or "")))
-            section_key = str(chunk.get("parent_key") or chunk["metadata_json"].get("section_id") or "")
-            if section_key:
-                child_chunk_ids_by_section.setdefault(section_key, []).append(int(record.id))
-        elif record.chunk_role == "section_summary":
-            section_summary_rows.append((record, str(chunk.get("section_key") or chunk["metadata_json"].get("section_id") or "")))
-        elif record.chunk_role == "paper_summary":
-            paper_summary_rows.append(record)
-    for record, section_key in child_rows:
-        parent_chunk_id = parent_chunk_ids_by_section.get(section_key)
-        if parent_chunk_id is not None:
-            record.parent_chunk_id = parent_chunk_id
-    anchor_limit = max(settings.rag_summary_anchor_limit, 1)
-    for record, section_key in section_summary_rows:
-        metadata = dict(record.metadata_json or {})
-        parent_chunk_id = parent_chunk_ids_by_section.get(section_key)
-        anchor_chunk_ids: list[int] = []
-        if parent_chunk_id is not None:
-            anchor_chunk_ids.append(parent_chunk_id)
-            metadata["resolved_chunk_id"] = parent_chunk_id
-        anchor_chunk_ids.extend(child_chunk_ids_by_section.get(section_key, [])[:anchor_limit])
-        metadata["anchor_chunk_ids"] = anchor_chunk_ids
-        metadata["anchor_section_id"] = section_key or None
-        record.metadata_json = metadata
-    ordered_parent_ids = [
-        chunk_id
-        for section_key, chunk_id in parent_chunk_ids_by_section.items()
-        if section_key
-    ]
-    for record in paper_summary_rows:
-        metadata = dict(record.metadata_json or {})
-        metadata["anchor_chunk_ids"] = ordered_parent_ids[:anchor_limit]
-        metadata["resolved_chunk_id"] = ordered_parent_ids[0] if ordered_parent_ids else None
-        metadata["anchor_section_ids"] = list(parent_chunk_ids_by_section.keys())[:anchor_limit]
-        record.metadata_json = metadata
-    db.commit()
-    if _is_postgres_session(db):
-        db.execute(
-            update(PaperChunk)
-            .where(PaperChunk.paper_id == paper_id)
-            .values(
-                search_vector=func.to_tsvector(
-                    settings.rag_text_search_config,
-                    PaperChunk.content,
-                )
-            )
-        )
-        db.commit()
-    return len(chunks)
 
 
 def rebuild_paper_index_from_document_structure(
@@ -2801,11 +1813,11 @@ def rebuild_paper_index_from_document_structure(
     paper_title: str | None = None,
     structured_summary: dict[str, Any] | None = None,
 ) -> int:
-    preanalysis = _build_preanalysis_from_document_structure(db, paper_id=paper_id)
-    return rebuild_paper_index(
+    from app.services.chat_rag.indexing import get_paper_indexing_service
+
+    return get_paper_indexing_service().rebuild_paper_index_from_document_structure(
         db,
         paper_id=paper_id,
-        preanalysis=preanalysis,
         paper_title=paper_title,
         structured_summary=structured_summary,
     )
@@ -2819,255 +1831,15 @@ def _search_chunks(
     top_k: int | None = None,
     trace: dict[str, Any] | None = None,
 ) -> list[RetrievalResult]:
-    limit = top_k or settings.rag_top_k
-    query_plan = _build_crosslingual_query_plan(query)
-    exact_terms = list(query_plan.exact_terms)
-    exact_match_heavy = query_plan.query_type == "exact_heavy_short" or _is_exact_match_heavy_query(
-        query_plan.original_query,
-        exact_terms,
-    )
-    exact_terms_for_boost = exact_terms if exact_match_heavy or _is_table_or_figure_query(query) else []
-    if not _is_postgres_session(db):
-        variant_results: dict[str, list[RetrievalResult]] = {}
-        for variant in query_plan.variants:
-            variant_results[variant.name] = _search_chunks_legacy(
-                db,
-                query=variant.query,
-                top_k=max(settings.rag_rerank_top_n, limit),
-                organization_id=organization_id,
-            )
-        source_hits: dict[str, list[dict[str, Any]]] = {}
-        variant_traces: dict[str, dict[str, Any]] = {}
-        for variant in query_plan.variants:
-            hits = _results_to_ranked_hits(variant_results.get(variant.name, []))
-            local_sources: dict[str, list[dict[str, Any]]] = {}
-            if variant.use_sparse:
-                local_sources[f"{variant.name}_sparse"] = hits
-                source_hits[f"{variant.name}_sparse"] = hits
-            if variant.use_dense:
-                local_sources[f"{variant.name}_dense"] = hits
-                source_hits[f"{variant.name}_dense"] = hits
-            variant_traces[variant.name] = {
-                "query": variant.query,
-                "language": variant.language,
-                "role": variant.role,
-                "use_sparse": variant.use_sparse,
-                "use_dense": variant.use_dense,
-                "sparse_hits": hits if variant.use_sparse else [],
-                "dense_hits": hits if variant.use_dense else [],
-                "fused_hits": _fuse_ranked_candidate_sources(local_sources, limit=max(settings.rag_rerank_top_n, limit))
-                if local_sources
-                else [],
-            }
-        fused_hits = _fuse_ranked_candidate_sources(source_hits, limit=max(settings.rag_rerank_top_n, limit)) if source_hits else []
-        record_map = {
-            int(result.chunk.id): (result.chunk, result.paper)
-            for results in variant_results.values()
-            for result in results
-        }
-        results = _build_retrieval_results(fused_hits[:limit], record_map=record_map)
-        if trace is not None:
-            serialized = _serialize_ranked_trace_candidates(fused_hits, record_map)
-            sparse_sources = {
-                name: hits
-                for name, hits in source_hits.items()
-                if name.endswith("_sparse")
-            }
-            dense_sources = {
-                name: hits
-                for name, hits in source_hits.items()
-                if name.endswith("_dense")
-            }
-            trace.update(
-                {
-                    "query_plan": _serialize_query_plan(query_plan),
-                    "variant_candidates": _serialize_variant_traces(variant_traces, record_map=record_map),
-                    "sparse_candidates": _serialize_ranked_trace_candidates(
-                        _fuse_ranked_candidate_sources(sparse_sources, limit=max(settings.rag_rerank_top_n, limit))
-                        if sparse_sources
-                        else [],
-                        record_map,
-                    ),
-                    "dense_candidates": _serialize_ranked_trace_candidates(
-                        _fuse_ranked_candidate_sources(dense_sources, limit=max(settings.rag_rerank_top_n, limit))
-                        if dense_sources
-                        else [],
-                        record_map,
-                    ),
-                    "fused_candidates": serialized,
-                    "reranked_candidates": serialized,
-                    "retrieval_backend": "legacy",
-                    "exact_match_terms": exact_terms,
-                    "exact_match_terms_applied": exact_terms_for_boost,
-                    "exact_match_heavy": exact_match_heavy,
-                    "generation_instruction": query_plan.generation_instruction,
-                    "rerank_query": query_plan.rerank_query,
-                    "rerank_status": "not_applicable",
-                }
-            )
-        return results
+    from app.services.chat_rag.retrieval import search_chunks
 
-    sparse_limit = max(settings.rag_sparse_top_k, limit)
-    dense_limit = max(settings.rag_dense_top_k, limit)
-    if exact_match_heavy:
-        sparse_limit = max(sparse_limit, limit * 8, settings.rag_sparse_top_k * 2)
-        dense_limit = max(dense_limit, limit * 4, settings.rag_dense_top_k)
-
-    dense_query_texts = _unique_strings([variant.query for variant in query_plan.variants if variant.use_dense])
-    dense_embeddings: dict[str, list[float] | None] = {}
-    if dense_query_texts and (settings.glm_api_key.strip() or settings.openai_api_key.strip()):
-        try:
-            embedding_rows = embed_texts(dense_query_texts)
-            dense_embeddings = {
-                dense_query_texts[index]: embedding_rows[index]
-                for index in range(min(len(dense_query_texts), len(embedding_rows)))
-            }
-        except Exception:
-            dense_embeddings = {}
-
-    sparse_source_hits: dict[str, list[dict[str, Any]]] = {}
-    dense_source_hits: dict[str, list[dict[str, Any]]] = {}
-    all_source_hits: dict[str, list[dict[str, Any]]] = {}
-    variant_traces: dict[str, dict[str, Any]] = {}
-    fusion_limit = max(settings.rag_fusion_window, settings.rag_rerank_top_n, limit, sparse_limit if exact_match_heavy else 0)
-
-    for variant in query_plan.variants:
-        variant_sparse_hits: list[dict[str, Any]] = []
-        variant_dense_hits: list[dict[str, Any]] = []
-        if variant.use_sparse:
-            variant_sparse_hits = _search_sparse_chunks_postgres(
-                db,
-                query=variant.query,
-                limit=sparse_limit,
-                organization_id=organization_id,
-                exact_terms=exact_terms_for_boost if variant.language == "en" else [],
-            )
-            if variant_sparse_hits:
-                source_name = f"{variant.name}_sparse"
-                sparse_source_hits[source_name] = variant_sparse_hits
-                all_source_hits[source_name] = variant_sparse_hits
-        if variant.use_dense:
-            variant_dense_hits = _search_dense_chunks_postgres(
-                db,
-                query_embedding=dense_embeddings.get(variant.query),
-                limit=dense_limit,
-                organization_id=organization_id,
-            )
-            if variant_dense_hits:
-                source_name = f"{variant.name}_dense"
-                dense_source_hits[source_name] = variant_dense_hits
-                all_source_hits[source_name] = variant_dense_hits
-        local_sources = {
-            **({f"{variant.name}_sparse": variant_sparse_hits} if variant_sparse_hits else {}),
-            **({f"{variant.name}_dense": variant_dense_hits} if variant_dense_hits else {}),
-        }
-        variant_traces[variant.name] = {
-            "query": variant.query,
-            "language": variant.language,
-            "role": variant.role,
-            "use_sparse": variant.use_sparse,
-            "use_dense": variant.use_dense,
-            "sparse_hits": variant_sparse_hits,
-            "dense_hits": variant_dense_hits,
-            "fused_hits": _fuse_ranked_candidate_sources(local_sources, limit=fusion_limit) if local_sources else [],
-        }
-
-    sparse_hits = _fuse_ranked_candidate_sources(sparse_source_hits, limit=fusion_limit) if sparse_source_hits else []
-    dense_hits = _fuse_ranked_candidate_sources(dense_source_hits, limit=fusion_limit) if dense_source_hits else []
-    fused_candidates = _fuse_ranked_candidate_sources(all_source_hits, limit=fusion_limit) if all_source_hits else []
-    record_map = _load_chunk_record_map(
+    return search_chunks(
         db,
-        chunk_ids=[
-            item["chunk_id"]
-            for item in [
-                *sparse_hits,
-                *dense_hits,
-                *fused_candidates,
-                *[candidate for hits in all_source_hits.values() for candidate in hits],
-            ]
-        ],
+        query=query,
         organization_id=organization_id,
+        top_k=top_k,
+        trace=trace,
     )
-    expanded_candidates = fused_candidates
-    expansion_stats: dict[str, Any] = {
-        "enabled": False,
-        "expanded_candidate_count": 0,
-        "expansion_added_ids": [],
-    }
-    if fused_candidates:
-        expanded_candidates, expansion_stats = _expand_retrieval_candidates(
-            db,
-            query=query,
-            candidates=fused_candidates,
-            record_map=record_map,
-            organization_id=organization_id,
-            query_plan=query_plan,
-            limit=fusion_limit,
-        )
-    if exact_terms_for_boost:
-        expanded_candidates = _boost_exact_match_candidates(query, candidates=expanded_candidates, record_map=record_map)[: max(fusion_limit, len(expanded_candidates))]
-
-    reranked_candidates = expanded_candidates
-    rerank_status = "skipped"
-    rerank_error: str | None = None
-    rerank_context_stats: dict[str, Any] = {
-        "query_chars": len(query_plan.rerank_query or ""),
-        "documents_count": 0,
-        "max_document_chars": 0,
-        "over_budget_truncated_count": 0,
-    }
-    if expanded_candidates:
-        try:
-            reranked_candidates, rerank_context_stats = _apply_reranking(
-                db,
-                query_plan.rerank_query,
-                fused_candidates=expanded_candidates,
-                record_map=record_map,
-                limit=max(settings.rag_rerank_top_n, limit),
-            )
-            rerank_status = "applied"
-        except Exception as exc:
-            logger.warning(
-                "Rerank failed, falling back to fused order: user_query=%s rerank_query=%s fused_count=%s rerank_limit=%s rerank_context_stats=%s error=%s",
-                _preview_log_text(query, limit=200),
-                _preview_log_text(query_plan.rerank_query, limit=200),
-                len(expanded_candidates),
-                max(settings.rag_rerank_top_n, limit),
-                rerank_context_stats,
-                exc,
-                exc_info=True,
-            )
-            reranked_candidates = expanded_candidates[: max(settings.rag_rerank_top_n, limit)]
-            rerank_status = "fallback_to_fused"
-            rerank_error = "rerank_failed"
-
-    results = _build_retrieval_results(reranked_candidates[:limit], record_map=record_map)
-    if trace is not None:
-        trace.update(
-            {
-                "query_plan": _serialize_query_plan(query_plan),
-                "variant_candidates": _serialize_variant_traces(variant_traces, record_map=record_map),
-                "sparse_candidates": _serialize_ranked_trace_candidates(sparse_hits, record_map),
-                "dense_candidates": _serialize_ranked_trace_candidates(dense_hits, record_map),
-                "fused_candidates": _serialize_ranked_trace_candidates(fused_candidates, record_map),
-                "expanded_candidates": _serialize_ranked_trace_candidates(expanded_candidates, record_map),
-                "reranked_candidates": _serialize_ranked_trace_candidates(reranked_candidates, record_map),
-                "retrieval_backend": "postgres_hybrid",
-                "exact_match_terms": exact_terms,
-                "exact_match_terms_applied": exact_terms_for_boost,
-                "exact_match_heavy": exact_match_heavy,
-                "generation_instruction": query_plan.generation_instruction,
-                "rerank_query": query_plan.rerank_query,
-                "sparse_limit": sparse_limit,
-                "dense_limit": dense_limit,
-                "fusion_limit": fusion_limit,
-                "expansion_stats": expansion_stats,
-                "rerank_status": rerank_status,
-                "rerank_error": rerank_error,
-                "rerank_context_stats": rerank_context_stats,
-            }
-        )
-    return results
 
 
 def _serialize_citations(results: list[RetrievalResult]) -> list[dict]:
@@ -3100,63 +1872,21 @@ def _build_evidence_candidates(
     *,
     query: str,
 ) -> list[dict[str, Any]]:
-    if not results:
-        return []
-    max_score = max((float(result.score) for result in results), default=0.0)
-    include_supporting_context = True
-    total = len(results)
-    candidates: list[dict[str, Any]] = []
-    for rank, result in enumerate(results, start=1):
-        relative_score = (float(result.score) / max_score) if max_score > 0 else 0.0
-        rank_score = 1.0 if total == 1 else 1.0 - ((rank - 1) / max(total - 1, 1))
-        support_score = round(min(0.99, max(0.05, relative_score * 0.6 + rank_score * 0.4)), 4)
-        full_text = _chunk_text_payload(result.chunk, include_supporting_context=include_supporting_context)
-        candidates.append(
-            {
-                "evidence_id": f"chunk-{result.chunk.id}",
-                "chunk_id": int(result.chunk.id),
-                "paper_id": int(result.paper.id),
-                "paper_title": result.paper.title,
-                "source_url": result.paper.source_url,
-                "snippet": _clip_snippet(full_text, max_length=320),
-                "full_text": full_text,
-                "score": round(float(result.score), 4),
-                "support_score": support_score,
-                "page_from": result.chunk.page_from,
-                "page_to": result.chunk.page_to,
-                "section_path": _chunk_section_path(result.chunk),
-                "selection_reason": "",
-                "claim_texts": [],
-                "rank": rank,
-            }
-        )
-    return candidates
+    from app.services.chat_rag.retrieval import build_evidence_candidates
+
+    return build_evidence_candidates(results, query=query)
 
 
 def _serialize_evidence_item(item: dict[str, Any]) -> dict[str, Any]:
-    row = {
-        "evidence_id": str(item.get("evidence_id") or ""),
-        "chunk_id": int(item.get("chunk_id") or 0),
-        "paper_id": int(item.get("paper_id") or 0),
-        "paper_title": item.get("paper_title"),
-        "source_url": item.get("source_url"),
-        "snippet": str(item.get("snippet") or ""),
-        "score": round(float(item.get("score") or 0.0), 4),
-        "support_score": round(float(item.get("support_score") or 0.0), 4),
-        "page_from": item.get("page_from"),
-        "page_to": item.get("page_to"),
-        "section_path": item.get("section_path"),
-    }
-    if item.get("selection_reason"):
-        row["selection_reason"] = str(item["selection_reason"])
-    claim_texts = [str(text) for text in item.get("claim_texts") or [] if str(text).strip()]
-    if claim_texts:
-        row["claim_texts"] = claim_texts
-    return row
+    from app.services.chat_rag.evidence import serialize_evidence_item
+
+    return serialize_evidence_item(item)
 
 
 def _serialize_evidence_list(items: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [_serialize_evidence_item(item) for item in items]
+    from app.services.chat_rag.evidence import serialize_evidence_list
+
+    return serialize_evidence_list(items)
 
 
 def _build_sufficiency_decision(
@@ -3166,46 +1896,14 @@ def _build_sufficiency_decision(
     llm_sufficient: bool | None,
     policy: ChatAttributionPolicy = STRICT_CHAT_ATTRIBUTION_POLICY,
 ) -> dict[str, Any]:
-    support_scores = [float(item.get("support_score") or 0.0) for item in selected_evidence]
-    top_support = max(support_scores, default=0.0)
-    total_support = sum(support_scores)
-    threshold_passed = bool(selected_evidence) and (
-        top_support >= policy.min_support_score
-        and total_support >= policy.min_total_support_score
+    from app.services.chat_rag.evidence import build_sufficiency_decision
+
+    return build_sufficiency_decision(
+        selected_evidence,
+        overall_support_score=overall_support_score,
+        llm_sufficient=llm_sufficient,
+        policy=policy,
     )
-    if llm_sufficient is None:
-        is_sufficient = threshold_passed
-    elif policy.llm_insufficient_hard_gate:
-        is_sufficient = bool(llm_sufficient and threshold_passed)
-    else:
-        is_sufficient = threshold_passed
-    reason_codes: list[str] = []
-    if not selected_evidence:
-        reason_codes.append("no_evidence_selected")
-    if top_support < policy.min_support_score:
-        reason_codes.append("top_support_below_threshold")
-    if total_support < policy.min_total_support_score:
-        reason_codes.append("total_support_below_threshold")
-    if llm_sufficient is False:
-        reason_codes.append("llm_marked_insufficient")
-    if is_sufficient:
-        reason_codes = ["sufficient"]
-        if llm_sufficient is False and not policy.llm_insufficient_hard_gate:
-            reason_codes.append("llm_marked_insufficient_advisory")
-        if policy.name != "strict":
-            reason_codes.append("relaxed_chat_policy")
-    return {
-        "is_sufficient": is_sufficient,
-        "llm_sufficient": llm_sufficient,
-        "evidence_count": len(selected_evidence),
-        "top_support_score": round(top_support, 4),
-        "total_support_score": round(total_support, 4),
-        "overall_support_score": round(float(overall_support_score or 0.0), 4),
-        "min_support_score_threshold": policy.min_support_score,
-        "min_total_support_score_threshold": policy.min_total_support_score,
-        "policy_name": policy.name,
-        "reason_codes": reason_codes,
-    }
 
 
 def _heuristic_select_claim_supporting_evidence(
@@ -3216,54 +1914,14 @@ def _heuristic_select_claim_supporting_evidence(
     policy: ChatAttributionPolicy = STRICT_CHAT_ATTRIBUTION_POLICY,
     reason_suffix: str = "",
 ) -> EvidenceSelectionResult:
-    selected: list[dict[str, Any]] = []
-    max_evidence = max(1, settings.rag_attribution_max_evidence)
-    for candidate in evidence_candidates[:max_evidence]:
-        evidence = dict(candidate)
-        reasons = ["高排序检索证据"]
-        if evidence.get("section_path"):
-            reasons.append(f"章节 {evidence['section_path']}")
-        detected_language = str((query_plan or {}).get("detected_language") or "")
-        if detected_language in {"zh", "mixed"}:
-            reasons.append("兼容跨语言检索改写")
-        if reason_suffix:
-            reasons.append(reason_suffix)
-        evidence["selection_reason"] = "；".join(reasons)
-        evidence["claim_texts"] = [question]
-        selected.append(evidence)
-        if (
-            len(selected) >= 2
-            and sum(float(item.get("support_score") or 0.0) for item in selected)
-            >= policy.min_total_support_score
-        ):
-            break
-    overall_support_score = round(_mean([float(item.get("support_score") or 0.0) for item in selected]), 4)
-    claims = (
-        [
-            {
-                "claim_text": question,
-                "supporting_evidence_ids": [str(item.get("evidence_id") or "") for item in selected],
-                "support_score": overall_support_score,
-                "selection_reason": "基于高排序证据的回退选择",
-            }
-        ]
-        if selected
-        else []
-    )
-    sufficiency_decision = _build_sufficiency_decision(
-        selected,
-        overall_support_score=overall_support_score,
-        llm_sufficient=None,
+    from app.services.chat_rag.evidence import heuristic_select_claim_supporting_evidence
+
+    return heuristic_select_claim_supporting_evidence(
+        question=question,
+        query_plan=query_plan,
+        evidence_candidates=evidence_candidates,
         policy=policy,
-    )
-    missing_information = "" if sufficiency_decision["is_sufficient"] else "未找到足以稳定支撑回答的知识库证据。"
-    return EvidenceSelectionResult(
-        selected_evidence=tuple(selected),
-        claims=tuple(claims),
-        overall_support_score=overall_support_score,
-        sufficiency_decision=sufficiency_decision,
-        missing_information=missing_information,
-        method="heuristic",
+        reason_suffix=reason_suffix,
     )
 
 
@@ -3274,198 +1932,20 @@ def _select_claim_supporting_evidence(
     evidence_candidates: list[dict[str, Any]],
     policy: ChatAttributionPolicy = STRICT_CHAT_ATTRIBUTION_POLICY,
 ) -> EvidenceSelectionResult:
-    fallback = _heuristic_select_claim_supporting_evidence(
+    from app.services.chat_rag.evidence import select_claim_supporting_evidence
+
+    return select_claim_supporting_evidence(
         question=question,
         query_plan=query_plan,
         evidence_candidates=evidence_candidates,
         policy=policy,
     )
-    if not evidence_candidates or not _llm_available_for_grounding():
-        logger.info(
-            "RAG evidence selection skipped: candidates=%s method=%s question=%s",
-            len(evidence_candidates),
-            fallback.method,
-            _preview_log_text(question),
-        )
-        return fallback
-
-    selection_started_at = time.perf_counter()
-    logger.info(
-        "RAG evidence selection started: candidates=%s question=%s",
-        len(evidence_candidates),
-        _preview_log_text(question),
-    )
-    evidence_text = "\n\n".join(
-        [
-            (
-                f"evidence_id: {item['evidence_id']}\n"
-                f"paper_title: {item['paper_title'] or '-'}\n"
-                f"section_path: {item.get('section_path') or '-'}\n"
-                f"page_range: {item.get('page_from') or '-'}-{item.get('page_to') or '-'}\n"
-                f"retrieval_score: {item.get('score')}\n"
-                f"candidate_support_score: {item.get('support_score')}\n"
-                f"snippet: {item.get('snippet') or ''}"
-            )
-            for item in evidence_candidates
-        ]
-    )
-    prompt = (
-        "请阅读用户问题与候选证据，返回 JSON 对象，字段必须包含：\n"
-        "- claims: 数组。每项包含 claim_text, supporting_evidence_ids, support_score, selection_reason\n"
-        "- selected_evidence: 数组。每项包含 evidence_id, support_score, selection_reason\n"
-        "- overall_support_score: 0 到 1 之间的数字\n"
-        "- is_sufficient: boolean，表示这些证据是否足以支持一个保守答案\n"
-        "- missing_information: 字符串，不足时说明缺什么\n\n"
-        "规则：\n"
-        "1. 只允许使用给定 evidence_id。\n"
-        "2. 同一条证据可以支持多个 claim。\n"
-        "3. 支持关系按语义判断，允许中文问题对应英文论文证据。\n"
-        "4. 如果证据不足，is_sufficient 必须为 false。\n\n"
-        f"用户问题：{question}\n\n"
-        f"Query plan：{json.dumps(query_plan or {}, ensure_ascii=False)}\n\n"
-        f"候选证据：\n{evidence_text}"
-    )
-    try:
-        content, _ = chat_with_messages(
-            [
-                {"role": "system", "content": EVIDENCE_SELECTION_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.0,
-        )
-        payload = _parse_json_object(content)
-        candidate_map = {str(item["evidence_id"]): item for item in evidence_candidates}
-        support_by_id: dict[str, float] = {}
-        reasons_by_id: dict[str, list[str]] = {}
-        claims_by_id: dict[str, list[str]] = {}
-        claims: list[dict[str, Any]] = []
-        for claim in payload.get("claims") or []:
-            if not isinstance(claim, dict):
-                continue
-            claim_text = _normalize_query_text(str(claim.get("claim_text") or ""))
-            evidence_ids = [
-                str(evidence_id)
-                for evidence_id in (claim.get("supporting_evidence_ids") or [])
-                if str(evidence_id) in candidate_map
-            ]
-            support_score = float(claim.get("support_score") or 0.0)
-            selection_reason = _normalize_query_text(str(claim.get("selection_reason") or ""))
-            if not claim_text and not evidence_ids:
-                continue
-            claims.append(
-                {
-                    "claim_text": claim_text or question,
-                    "supporting_evidence_ids": evidence_ids,
-                    "support_score": round(support_score, 4),
-                    "selection_reason": selection_reason,
-                }
-            )
-            for evidence_id in evidence_ids:
-                support_by_id[evidence_id] = max(support_by_id.get(evidence_id, 0.0), support_score)
-                if selection_reason:
-                    reasons_by_id.setdefault(evidence_id, []).append(selection_reason)
-                if claim_text:
-                    claims_by_id.setdefault(evidence_id, []).append(claim_text)
-        explicit_order: list[str] = []
-        for row in payload.get("selected_evidence") or []:
-            if not isinstance(row, dict):
-                continue
-            evidence_id = str(row.get("evidence_id") or "")
-            if evidence_id not in candidate_map:
-                continue
-            explicit_order.append(evidence_id)
-            support_by_id[evidence_id] = max(support_by_id.get(evidence_id, 0.0), float(row.get("support_score") or 0.0))
-            reason = _normalize_query_text(str(row.get("selection_reason") or ""))
-            if reason:
-                reasons_by_id.setdefault(evidence_id, []).append(reason)
-        ordered_ids = explicit_order + [
-            str(item["evidence_id"])
-            for item in evidence_candidates
-            if str(item["evidence_id"]) not in explicit_order and str(item["evidence_id"]) in support_by_id
-        ]
-        seen_ids: set[str] = set()
-        selected: list[dict[str, Any]] = []
-        for evidence_id in ordered_ids:
-            if evidence_id in seen_ids:
-                continue
-            seen_ids.add(evidence_id)
-            base = dict(candidate_map[evidence_id])
-            base["support_score"] = round(max(float(base.get("support_score") or 0.0), support_by_id.get(evidence_id, 0.0)), 4)
-            reason_text = "；".join(reasons_by_id.get(evidence_id, []))
-            if reason_text:
-                base["selection_reason"] = reason_text
-            base["claim_texts"] = claims_by_id.get(evidence_id, [])
-            selected.append(base)
-            if len(selected) >= settings.rag_attribution_max_evidence:
-                break
-        if not selected:
-            logger.warning(
-                "RAG evidence selection returned empty result, using heuristic fallback: candidates=%s elapsed=%.2fs",
-                len(evidence_candidates),
-                time.perf_counter() - selection_started_at,
-            )
-            return _heuristic_select_claim_supporting_evidence(
-                question=question,
-                query_plan=query_plan,
-                evidence_candidates=evidence_candidates,
-                policy=policy,
-                reason_suffix="LLM 选择为空，已回退到启发式",
-            )
-        overall_support_score = round(
-            float(payload.get("overall_support_score") or _mean([float(item.get("support_score") or 0.0) for item in selected])),
-            4,
-        )
-        llm_sufficient = payload.get("is_sufficient")
-        sufficiency_decision = _build_sufficiency_decision(
-            selected,
-            overall_support_score=overall_support_score,
-            llm_sufficient=bool(llm_sufficient) if llm_sufficient is not None else None,
-            policy=policy,
-        )
-        missing_information = _normalize_query_text(str(payload.get("missing_information") or ""))
-        return EvidenceSelectionResult(
-            selected_evidence=tuple(selected),
-            claims=tuple(claims),
-            overall_support_score=overall_support_score,
-            sufficiency_decision=sufficiency_decision,
-            missing_information=missing_information,
-            method="llm",
-        )
-    except Exception as exc:
-        logger.warning(
-            "RAG evidence selection failed, using heuristic fallback: candidates=%s error=%s elapsed=%.2fs",
-            len(evidence_candidates),
-            exc,
-            time.perf_counter() - selection_started_at,
-        )
-        return _heuristic_select_claim_supporting_evidence(
-            question=question,
-            query_plan=query_plan,
-            evidence_candidates=evidence_candidates,
-            reason_suffix="LLM 选择失败，已回退到启发式",
-        )
-    finally:
-        logger.info(
-            "RAG evidence selection finished: candidates=%s elapsed=%.2fs",
-            len(evidence_candidates),
-            time.perf_counter() - selection_started_at,
-        )
 
 
 def _build_evidence_prompt_text(selected_evidence: list[dict[str, Any]]) -> str:
-    return "\n\n".join(
-        [
-            (
-                f"[{index}] evidence_id: {item['evidence_id']}\n"
-                f"论文标题: {item['paper_title'] or '-'}\n"
-                f"章节路径: {item.get('section_path') or '-'}\n"
-                f"页码: {item.get('page_from') or '-'}-{item.get('page_to') or '-'}\n"
-                f"support_score: {round(float(item.get('support_score') or 0.0), 4)}\n"
-                f"片段: {item.get('snippet') or ''}"
-            )
-            for index, item in enumerate(selected_evidence, start=1)
-        ]
-    )
+    from app.services.chat_rag.evidence import build_evidence_prompt_text
+
+    return build_evidence_prompt_text(selected_evidence)
 
 
 def _heuristic_verify_answer(
@@ -3474,22 +1954,13 @@ def _heuristic_verify_answer(
     answer: str,
     selection_result: EvidenceSelectionResult,
 ) -> dict[str, Any]:
-    abstained = "知识库中未找到确切依据" in (answer or "")
-    supported = selection_result.sufficiency_decision.get("is_sufficient", False) and not abstained
-    if abstained and not selection_result.sufficiency_decision.get("is_sufficient", False):
-        supported = True
-    support_score = (
-        selection_result.overall_support_score
-        if supported
-        else (1.0 if abstained and not selection_result.sufficiency_decision.get("is_sufficient", False) else 0.0)
+    from app.services.chat_rag.evidence import heuristic_verify_answer
+
+    return heuristic_verify_answer(
+        question=question,
+        answer=answer,
+        selection_result=selection_result,
     )
-    return {
-        "method": "heuristic",
-        "supported": bool(supported),
-        "support_score": round(float(support_score or 0.0), 4),
-        "unsupported_claims": [] if supported else [question],
-        "notes": "heuristic_verifier",
-    }
 
 
 def _verify_grounded_answer(
@@ -3500,87 +1971,21 @@ def _verify_grounded_answer(
     selected_evidence: list[dict[str, Any]],
     selection_result: EvidenceSelectionResult,
 ) -> dict[str, Any]:
-    fallback = _heuristic_verify_answer(
+    from app.services.chat_rag.evidence import verify_grounded_answer
+
+    return verify_grounded_answer(
         question=question,
         answer=answer,
+        query_plan=query_plan,
+        selected_evidence=selected_evidence,
         selection_result=selection_result,
     )
-    if not selected_evidence or not _llm_available_for_grounding():
-        logger.info(
-            "RAG grounding verifier skipped: evidence=%s method=%s",
-            len(selected_evidence),
-            fallback.get("method"),
-        )
-        return fallback
-    verifier_started_at = time.perf_counter()
-    logger.info(
-        "RAG grounding verifier started: evidence=%s question=%s",
-        len(selected_evidence),
-        _preview_log_text(question),
-    )
-    prompt = (
-        "请检查最终答案是否被证据支持，并返回 JSON 对象，字段必须包含：\n"
-        "- supported: boolean\n"
-        "- support_score: 0 到 1 的数字\n"
-        "- unsupported_claims: 字符串数组\n"
-        "- notes: 字符串\n\n"
-        "规则：\n"
-        "1. 只根据给定证据判断，不要补充外部知识。\n"
-        "2. 要允许跨语言支持关系，例如中文回答由英文证据支持。\n"
-        "3. 若答案包含任何证据中不存在的关键结论，应标到 unsupported_claims。\n\n"
-        f"用户问题：{question}\n\n"
-        f"最终答案：{answer}\n\n"
-        f"Query plan：{json.dumps(query_plan or {}, ensure_ascii=False)}\n\n"
-        f"选中证据：\n{_build_evidence_prompt_text(selected_evidence)}"
-    )
-    try:
-        content, _ = chat_with_messages(
-            [
-                {"role": "system", "content": EVIDENCE_VERIFIER_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.0,
-        )
-        payload = _parse_json_object(content)
-        return {
-            "method": "llm",
-            "supported": bool(payload.get("supported")),
-            "support_score": round(float(payload.get("support_score") or 0.0), 4),
-            "unsupported_claims": [str(item) for item in (payload.get("unsupported_claims") or []) if str(item).strip()],
-            "notes": str(payload.get("notes") or ""),
-        }
-    except Exception as exc:
-        logger.warning(
-            "RAG grounding verifier failed, using heuristic fallback: error=%s elapsed=%.2fs",
-            exc,
-            time.perf_counter() - verifier_started_at,
-        )
-        return fallback
-    finally:
-        logger.info(
-            "RAG grounding verifier finished: evidence=%s elapsed=%.2fs",
-            len(selected_evidence),
-            time.perf_counter() - verifier_started_at,
-        )
 
 
 def _serialize_trace_candidates(results: list[RetrievalResult]) -> list[dict]:
-    candidates: list[dict] = []
-    for result in results:
-        snippet = _clip_snippet(_chunk_text_payload(result.chunk), max_length=180)
-        candidates.append(
-            {
-                "chunk_id": result.chunk.id,
-                "chunk_index": result.chunk.chunk_index,
-                "paper_id": result.paper.id,
-                "paper_title": result.paper.title,
-                "score": round(result.score, 4),
-                "page_from": result.chunk.page_from,
-                "page_to": result.chunk.page_to,
-                "snippet": snippet,
-            }
-        )
-    return candidates
+    from app.services.chat_rag.tracing import serialize_trace_candidates
+
+    return serialize_trace_candidates(results)
 
 
 def _create_message(
@@ -3671,63 +2076,18 @@ def _generate_fallback_chat_answer(
     prior_answer: str | None = None,
     progress_callback: ChatProgressCallback | None = None,
 ) -> tuple[str, str | None]:
-    has_evidence = bool(selected_evidence)
-    evidence_text = _build_evidence_prompt_text(selected_evidence) if has_evidence else "无可引用知识库证据。"
-    sufficiency = selection_result.sufficiency_decision or {}
-    reason_codes = ", ".join(str(code) for code in (sufficiency.get("reason_codes") or []) if str(code).strip()) or "none"
-    missing_information = selection_result.missing_information or "未提供"
-    prior_answer_text = (prior_answer or "").strip() or "无"
-    generation_instruction = retrieval_debug.get("generation_instruction") or "请用中文回答，保留关键英文术语原文。"
-    _emit_chat_progress(
-        progress_callback,
-        phase="fallback_generation",
-        status="started",
-        message="正在生成保守补充回答",
-        detail=fallback_reason,
+    from app.services.chat_rag.generation import generate_fallback_chat_answer
+
+    return generate_fallback_chat_answer(
+        records=records,
+        message=message,
+        selected_evidence=selected_evidence,
+        selection_result=selection_result,
+        retrieval_debug=retrieval_debug,
+        fallback_reason=fallback_reason,
+        prior_answer=prior_answer,
+        progress_callback=progress_callback,
     )
-    try:
-        answer, model = chat_with_messages(
-            [
-                {"role": "system", "content": FALLBACK_SYSTEM_PROMPT},
-                *_history_messages(records),
-                {
-                    "role": "user",
-                    "content": (
-                        f"用户问题：{message}\n\n"
-                        f"回答要求：{generation_instruction}\n"
-                        f"fallback_reason: {fallback_reason}\n"
-                        f"is_sufficient: {bool(sufficiency.get('is_sufficient'))}\n"
-                        f"reason_codes: {reason_codes}\n"
-                        f"missing_information: {missing_information}\n\n"
-                        "请先明确说明“知识库中未找到确切依据”。\n"
-                        "如果存在部分相关证据，可说明这些证据只是线索，不能当作充分结论。\n"
-                        "随后给出简短通用补充，并避免伪造具体论文结论、数值或引用。\n\n"
-                        f"可参考的知识库证据（可能不足）：\n{evidence_text}\n\n"
-                        f"上一阶段答案草稿（如有，可用于纠偏，不可照搬无依据内容）：\n{prior_answer_text}"
-                    ),
-                },
-            ],
-            temperature=0.3,
-        )
-        normalized = _normalize_fallback_answer(answer, has_evidence=has_evidence)
-        _emit_chat_progress(
-            progress_callback,
-            phase="fallback_generation",
-            status="finished",
-            message="保守补充回答已生成",
-            detail=model,
-        )
-        return normalized, model
-    except Exception as exc:
-        logger.warning("Fallback generation failed: reason=%s error=%s", fallback_reason, exc)
-        _emit_chat_progress(
-            progress_callback,
-            phase="fallback_generation",
-            status="failed",
-            message="保守补充回答生成失败，已使用默认提示",
-            detail=str(exc),
-        )
-        return _normalize_fallback_answer("", has_evidence=has_evidence), None
 
 
 def _build_assistant_message_draft(
@@ -4077,12 +2437,12 @@ def build_topic_assistant_draft(
     progress_callback: ChatProgressCallback | None = None,
     relaxed_chat_rag: bool = False,
 ) -> AssistantMessageDraft:
-    return _build_assistant_message_draft(
+    from app.services.chat_rag.workflow import get_chat_turn_service
+
+    return get_chat_turn_service().build_topic_assistant_draft(
         db,
         user=user,
-        topic=started_turn.topic,
-        records=started_turn.records,
-        message=started_turn.prompt,
+        started_turn=started_turn,
         progress_callback=progress_callback,
         relaxed_chat_rag=relaxed_chat_rag,
     )
@@ -4097,32 +2457,25 @@ def prepare_topic_message(
     progress_callback: ChatProgressCallback | None = None,
     relaxed_chat_rag: bool = False,
 ) -> PreparedChatTurn:
-    started_turn = start_topic_message(db, user=user, topic_id=topic_id, prompt=prompt)
-    assistant_draft = build_topic_assistant_draft(
+    from app.services.chat_rag.workflow import get_chat_turn_service
+
+    return get_chat_turn_service().prepare_topic_message(
         db,
         user=user,
-        started_turn=started_turn,
+        topic_id=topic_id,
+        prompt=prompt,
         progress_callback=progress_callback,
         relaxed_chat_rag=relaxed_chat_rag,
-    )
-    return PreparedChatTurn(
-        topic=started_turn.topic,
-        user_message=started_turn.user_message,
-        assistant_draft=assistant_draft,
     )
 
 
 def persist_topic_assistant_message(db: Session, *, topic: ChatTopic, assistant_draft: AssistantMessageDraft) -> ChatMessage:
-    return _create_message(
+    from app.services.chat_rag.repository import ChatTopicRepository
+
+    return ChatTopicRepository().persist_assistant_message(
         db,
         topic=topic,
-        role="assistant",
-        content=assistant_draft.content,
-        model=assistant_draft.model,
-        answer_mode=assistant_draft.answer_mode,
-        used_knowledge_base=assistant_draft.used_knowledge_base,
-        citations_json=assistant_draft.citations_json,
-        metadata_json=assistant_draft.metadata_json,
+        assistant_draft=assistant_draft,
     )
 
 
@@ -4134,20 +2487,12 @@ def send_topic_message(
     prompt: str,
     relaxed_chat_rag: bool = False,
 ) -> ChatTurnResult:
-    prepared_turn = prepare_topic_message(
+    from app.services.chat_rag.workflow import get_chat_turn_service
+
+    return get_chat_turn_service().send_topic_message(
         db,
         user=user,
         topic_id=topic_id,
         prompt=prompt,
         relaxed_chat_rag=relaxed_chat_rag,
-    )
-    assistant_message = persist_topic_assistant_message(
-        db,
-        topic=prepared_turn.topic,
-        assistant_draft=prepared_turn.assistant_draft,
-    )
-    return ChatTurnResult(
-        topic=_topic_summary(db, prepared_turn.topic),
-        user_message=prepared_turn.user_message,
-        assistant_message=assistant_message,
     )

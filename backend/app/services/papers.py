@@ -15,13 +15,11 @@ from app.celery_app import celery_app
 from app.config import settings
 from app.database import SessionLocal
 from app.models import Job, Paper, PaperAsset, PaperChunk, PaperDocumentBlock, PaperDocumentPage, PaperDocumentPicture, PaperDocumentTable
-from app.services.docling_extraction import build_document_extractor
 from app.services.document_extraction import DocumentExtractor, ExtractedDocument, ExtractedPicture
 from app.services.llm import answer_question_set_questions, is_chat_llm_configured, summarize_paper_text
 from app.services.org_settings import get_organization_question_items
-from app.services.rag import rebuild_paper_index_from_document_structure
 from app.services.task_events import publish_task_status_event
-from app.services.vision import PictureDescriptionAdapter, PictureDescriptionRequest, build_picture_description_adapter
+from app.services.vision import PictureDescriptionAdapter, PictureDescriptionRequest
 
 
 @dataclass
@@ -136,149 +134,15 @@ def _normalize_rendered_lines(lines: list[str]) -> str:
 
 
 def render_document_text(document: ExtractedDocument) -> str:
-    rows: list[tuple[tuple[int, int, int, int], str]] = []
-    for fallback_index, block in enumerate(document.blocks):
-        text = str(block.text or "").strip()
-        if not text:
-            continue
-        if block.block_type == "heading":
-            heading_level = max(int(block.heading_level or 1), 1)
-            text = f"{'#' * min(heading_level, 6)} {text}"
-        rows.append(
-            (
-                _structure_sort_key(
-                    reading_order=block.reading_order,
-                    page_number=block.page_number,
-                    fallback_group=0,
-                    fallback_index=fallback_index,
-                ),
-                text,
-            )
-        )
-    for fallback_index, table in enumerate(document.tables):
-        parts = [str(table.caption or "").strip()]
-        table_rows = _serialize_table_rows(table.data)
-        if table_rows:
-            parts.append(table_rows)
-        elif str(table.markdown or "").strip():
-            parts.append(str(table.markdown or "").strip())
-        rendered = "\n".join(part for part in parts if part)
-        if not rendered:
-            continue
-        rows.append(
-            (
-                _structure_sort_key(
-                    reading_order=table.reading_order,
-                    page_number=table.page_from,
-                    fallback_group=1,
-                    fallback_index=fallback_index,
-                ),
-                rendered,
-            )
-        )
-    for fallback_index, picture in enumerate(document.pictures):
-        rendered = "\n".join(
-            part
-            for part in (str(picture.caption or "").strip(), str(picture.description or "").strip())
-            if part
-        )
-        if not rendered:
-            continue
-        rows.append(
-            (
-                _structure_sort_key(
-                    reading_order=picture.reading_order,
-                    page_number=picture.page_number,
-                    fallback_group=2,
-                    fallback_index=fallback_index,
-                ),
-                rendered,
-            )
-        )
-    return _normalize_rendered_lines([text for _sort_key, text in sorted(rows, key=lambda item: item[0])])
+    from app.services.paper_pipeline.rendering import render_document_text as render_document_text_impl
+
+    return render_document_text_impl(document)
 
 
 def render_paper_text_from_structure(db: Session, paper_id: int) -> str:
-    rows: list[tuple[tuple[int, int, int, int], str]] = []
-    blocks = db.scalars(
-        select(PaperDocumentBlock)
-        .where(PaperDocumentBlock.paper_id == paper_id)
-        .order_by(PaperDocumentBlock.block_index.asc(), PaperDocumentBlock.id.asc())
-    ).all()
-    for fallback_index, block in enumerate(blocks):
-        text = str(block.text or "").strip()
-        if not text:
-            continue
-        if (block.block_type or "") == "heading":
-            heading_level = max(int(block.heading_level or 1), 1)
-            text = f"{'#' * min(heading_level, 6)} {text}"
-        page_number = None
-        page = getattr(block, "page_id", None)
-        if page is not None:
-            linked_page = db.get(PaperDocumentPage, block.page_id)
-            page_number = linked_page.page_number if linked_page is not None else None
-        rows.append(
-            (
-                _structure_sort_key(
-                    reading_order=block.reading_order,
-                    page_number=page_number,
-                    fallback_group=0,
-                    fallback_index=fallback_index,
-                ),
-                text,
-            )
-        )
-    tables = db.scalars(
-        select(PaperDocumentTable)
-        .where(PaperDocumentTable.paper_id == paper_id)
-        .order_by(PaperDocumentTable.table_index.asc(), PaperDocumentTable.id.asc())
-    ).all()
-    for fallback_index, table in enumerate(tables):
-        parts = [str(table.caption or "").strip()]
-        table_rows = _serialize_table_rows(table.data_json)
-        if table_rows:
-            parts.append(table_rows)
-        elif str(table.markdown or "").strip():
-            parts.append(str(table.markdown or "").strip())
-        rendered = "\n".join(part for part in parts if part)
-        if not rendered:
-            continue
-        rows.append(
-            (
-                _structure_sort_key(
-                    reading_order=table.reading_order,
-                    page_number=table.page_from,
-                    fallback_group=1,
-                    fallback_index=fallback_index,
-                ),
-                rendered,
-            )
-        )
-    pictures = db.scalars(
-        select(PaperDocumentPicture)
-        .where(PaperDocumentPicture.paper_id == paper_id)
-        .order_by(PaperDocumentPicture.picture_index.asc(), PaperDocumentPicture.id.asc())
-    ).all()
-    for fallback_index, picture in enumerate(pictures):
-        rendered = "\n".join(
-            part
-            for part in (str(picture.caption or "").strip(), str(picture.description or "").strip())
-            if part
-        )
-        if not rendered:
-            continue
-        rows.append(
-            (
-                _structure_sort_key(
-                    reading_order=picture.reading_order,
-                    page_number=picture.page_number,
-                    fallback_group=2,
-                    fallback_index=fallback_index,
-                ),
-                rendered,
-            )
-        )
-    return _normalize_rendered_lines([text for _sort_key, text in sorted(rows, key=lambda item: item[0])])
+    from app.services.paper_pipeline.rendering import render_paper_text_from_structure as render_paper_text_from_structure_impl
+
+    return render_paper_text_from_structure_impl(db, paper_id)
 
 
 def _get_latest_job_for_paper(db: Session, paper_id: int, job_type: str) -> Job | None:
@@ -385,64 +249,27 @@ def _mark_job_cancelled(db: Session, job: Job, paper: Paper | None) -> None:
 
 
 def _raise_if_cancel_requested(db: Session, job: Job, paper: Paper | None) -> None:
-    db.refresh(job)
-    if job.deleted_at is not None or job.status == "cancelled":
-        raise JobCancellationRequested()
-    if job.status == "cancel_requested":
-        _mark_job_cancelled(db, job, paper)
-        raise JobCancellationRequested()
+    from app.services.paper_pipeline.helpers import raise_if_cancel_requested
+
+    return raise_if_cancel_requested(db, job, paper)
 
 
 def _queue_summary_job_if_needed(db: Session, paper: Paper, asset: PaperAsset) -> int | None:
-    if not is_chat_llm_configured():
-        return None
-    if not render_paper_text_from_structure(db, paper.id):
-        return None
+    from app.services.paper_pipeline.helpers import queue_summary_job_if_needed
 
-    latest_summary_job = _get_latest_job_for_paper(db, paper.id, "paper_summary")
-    if latest_summary_job is not None and latest_summary_job.status in ACTIVE_JOB_STATUSES:
-        return latest_summary_job.id
-
-    paper.status = "queued"
-    paper.updated_at = datetime.now(timezone.utc)
-    summary_job = Job(job_type="paper_summary", paper_id=paper.id, status="queued")
-    db.add(summary_job)
-    db.commit()
-    db.refresh(summary_job)
-    publish_task_status_event(db, paper_id=paper.id, job_id=summary_job.id)
-    return summary_job.id
+    return queue_summary_job_if_needed(db, paper, asset)
 
 
 def _extract_structured_summary_from_asset(asset: PaperAsset | None) -> dict | None:
-    metadata = asset.metadata_json if asset else None
-    if not isinstance(metadata, dict):
-        return None
-    structured_summary = metadata.get("structured_summary")
-    return structured_summary if isinstance(structured_summary, dict) else None
+    from app.services.paper_pipeline.helpers import extract_structured_summary_from_asset
+
+    return extract_structured_summary_from_asset(asset)
 
 
 def _queue_question_set_job_if_needed(db: Session, paper: Paper, asset: PaperAsset) -> int | None:
-    if not is_chat_llm_configured():
-        return None
-    if not render_paper_text_from_structure(db, paper.id):
-        return None
-    if _extract_structured_summary_from_asset(asset) is None:
-        return None
-    if not get_organization_question_items(db, organization_id=paper.organization_id):
-        return None
+    from app.services.paper_pipeline.helpers import queue_question_set_job_if_needed
 
-    latest_question_set_job = _get_latest_job_for_paper(db, paper.id, "paper_question_set")
-    if latest_question_set_job is not None and latest_question_set_job.status in ACTIVE_JOB_STATUSES:
-        return latest_question_set_job.id
-
-    paper.status = "queued"
-    paper.updated_at = datetime.now(timezone.utc)
-    question_set_job = Job(job_type="paper_question_set", paper_id=paper.id, status="queued")
-    db.add(question_set_job)
-    db.commit()
-    db.refresh(question_set_job)
-    publish_task_status_event(db, paper_id=paper.id, job_id=question_set_job.id)
-    return question_set_job.id
+    return queue_question_set_job_if_needed(db, paper, asset)
 
 
 def get_job_phase_status(job: Job | None) -> str | None:
@@ -735,10 +562,9 @@ def enqueue_paper_reparse(db: Session, paper_id: int, *, organization_id: int) -
 
 
 def _clear_document_structure(db: Session, paper_id: int) -> None:
-    db.execute(delete(PaperDocumentPicture).where(PaperDocumentPicture.paper_id == paper_id))
-    db.execute(delete(PaperDocumentTable).where(PaperDocumentTable.paper_id == paper_id))
-    db.execute(delete(PaperDocumentBlock).where(PaperDocumentBlock.paper_id == paper_id))
-    db.execute(delete(PaperDocumentPage).where(PaperDocumentPage.paper_id == paper_id))
+    from app.services.paper_pipeline.helpers import clear_document_structure
+
+    return clear_document_structure(db, paper_id)
 
 
 def _picture_context(document: ExtractedDocument, picture: ExtractedPicture) -> str | None:
@@ -753,102 +579,15 @@ def _picture_context(document: ExtractedDocument, picture: ExtractedPicture) -> 
 
 
 def _describe_pictures(document: ExtractedDocument, adapter: PictureDescriptionAdapter) -> None:
-    for picture in document.pictures:
-        result = adapter.describe(
-            PictureDescriptionRequest(
-                image_bytes=picture.image_bytes,
-                caption=picture.caption,
-                page_number=picture.page_number,
-                bbox=picture.bbox,
-                context=_picture_context(document, picture),
-            )
-        )
-        if result.description:
-            picture.description = result.description
-        picture.description_model = result.model_name
-        picture.description_prompt_version = result.prompt_version
-        metadata = dict(picture.metadata or {})
-        metadata["description"] = {
-            "usage": result.usage,
-            "error": result.error,
-        }
-        if result.raw_response is not None:
-            metadata["description"]["raw_response"] = result.raw_response
-        picture.metadata = metadata
+    from app.services.paper_pipeline.helpers import describe_pictures
+
+    return describe_pictures(document, adapter)
 
 
 def _persist_document_structure(db: Session, *, paper_id: int, asset_id: int, document: ExtractedDocument) -> None:
-    page_id_by_number: dict[int, int] = {}
-    for page in document.pages:
-        record = PaperDocumentPage(
-            paper_id=paper_id,
-            asset_id=asset_id,
-            page_number=page.page_number,
-            text=page.text or None,
-            width=int(page.width) if page.width is not None else None,
-            height=int(page.height) if page.height is not None else None,
-            metadata_json=page.metadata,
-        )
-        db.add(record)
-        db.flush()
-        page_id_by_number[page.page_number] = record.id
+    from app.services.paper_pipeline.helpers import persist_document_structure
 
-    for block in document.blocks:
-        db.add(
-            PaperDocumentBlock(
-                paper_id=paper_id,
-                page_id=page_id_by_number.get(block.page_number or 0),
-                block_index=block.block_index,
-                reading_order=block.reading_order,
-                block_type=block.block_type or "paragraph",
-                docling_label=block.docling_label,
-                heading_level=block.heading_level,
-                section_path=block.section_path,
-                text=block.text,
-                bbox_json=block.bbox,
-                provenance_json=block.provenance,
-                metadata_json=block.metadata,
-            )
-        )
-
-    for table in document.tables:
-        db.add(
-            PaperDocumentTable(
-                paper_id=paper_id,
-                page_from=table.page_from,
-                page_to=table.page_to,
-                table_index=table.table_index,
-                reading_order=table.reading_order,
-                heading_level=table.heading_level,
-                section_path=table.section_path,
-                caption=table.caption,
-                markdown=table.markdown,
-                data_json=table.data,
-                bbox_json=table.bbox,
-                provenance_json=table.provenance,
-                metadata_json=table.metadata,
-            )
-        )
-
-    for picture in document.pictures:
-        db.add(
-            PaperDocumentPicture(
-                paper_id=paper_id,
-                page_number=picture.page_number,
-                picture_index=picture.picture_index,
-                reading_order=picture.reading_order,
-                heading_level=picture.heading_level,
-                section_path=picture.section_path,
-                caption=picture.caption,
-                description=picture.description,
-                description_model=picture.description_model,
-                description_prompt_version=picture.description_prompt_version,
-                bbox_json=picture.bbox,
-                provenance_json=picture.provenance,
-                image_asset_path=picture.image_asset_path,
-                metadata_json=picture.metadata,
-            )
-        )
+    return persist_document_structure(db, paper_id=paper_id, asset_id=asset_id, document=document)
 
 
 def enqueue_paper_summary_regeneration(db: Session, paper_id: int, *, organization_id: int) -> Job | None:
@@ -912,82 +651,14 @@ def run_pdf_ingest_job(
     extractor: DocumentExtractor | None = None,
     picture_adapter: PictureDescriptionAdapter | None = None,
 ) -> int | None:
-    db = session_factory()
-    try:
-        job = db.get(Job, job_id)
-        if not job or job.deleted_at is not None or job.status == "cancelled":
-            return None
+    from app.services.paper_pipeline.workflow import get_paper_workflow_service
 
-        paper = db.get(Paper, job.paper_id) if job.paper_id is not None else None
-        asset = db.scalar(
-            select(PaperAsset).where(
-                PaperAsset.paper_id == job.paper_id,
-                PaperAsset.asset_type == "original_pdf",
-            )
-        )
-        if paper is None or paper.deleted_at is not None or asset is None or not asset.storage_path:
-            raise RuntimeError("Missing upload asset for job")
-        _raise_if_cancel_requested(db, job, paper)
-
-        now = datetime.now(timezone.utc)
-        job.status = "processing"
-        job.started_at = now
-        paper.status = "processing"
-        paper.updated_at = now
-        db.commit()
-        publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
-
-        _raise_if_cancel_requested(db, job, paper)
-        document = (extractor or build_document_extractor()).extract(Path(asset.storage_path))
-        _raise_if_cancel_requested(db, job, paper)
-        _describe_pictures(document, picture_adapter or build_picture_description_adapter())
-        _raise_if_cancel_requested(db, job, paper)
-        _clear_document_structure(db, paper.id)
-        db.execute(delete(PaperChunk).where(PaperChunk.paper_id == paper.id))
-        _persist_document_structure(db, paper_id=paper.id, asset_id=asset.id, document=document)
-        db.flush()
-        metadata = dict(asset.metadata_json or {})
-        metadata["extraction"] = {
-            **document.extraction_metadata(),
-            "picture_vlm": {
-                "provider": settings.picture_vlm_provider,
-                "model": settings.picture_vlm_model,
-                "prompt_version": settings.picture_vlm_prompt_version,
-            },
-        }
-        asset.metadata_json = metadata
-        asset.raw_text = None
-        rebuild_paper_index_from_document_structure(
-            db,
-            paper_id=paper.id,
-            paper_title=paper.title,
-            structured_summary=_extract_structured_summary_from_asset(asset),
-        )
-        _raise_if_cancel_requested(db, job, paper)
-        paper.status = "completed"
-        paper.updated_at = datetime.now(timezone.utc)
-        job.status = "completed"
-        job.error_message = None
-        job.finished_at = datetime.now(timezone.utc)
-        db.commit()
-        publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
-        return _queue_summary_job_if_needed(db, paper, asset)
-    except JobCancellationRequested:
-        return None
-    except Exception as exc:
-        if "job" in locals() and job is not None:
-            job.status = "failed"
-            job.error_message = str(exc)
-            job.finished_at = datetime.now(timezone.utc)
-        if "paper" in locals() and paper is not None:
-            paper.status = "failed"
-            paper.updated_at = datetime.now(timezone.utc)
-        db.commit()
-        if "paper" in locals() and paper is not None:
-            publish_task_status_event(db, paper_id=paper.id, job_id=job.id if "job" in locals() and job is not None else None)
-        raise
-    finally:
-        db.close()
+    return get_paper_workflow_service().run_pdf_ingest_job(
+        job_id,
+        session_factory=session_factory,
+        extractor=extractor,
+        picture_adapter=picture_adapter,
+    )
 
 
 def run_paper_summary_job(
@@ -995,81 +666,12 @@ def run_paper_summary_job(
     *,
     session_factory: Callable[[], Session] = SessionLocal,
 ) -> int | None:
-    db = session_factory()
-    try:
-        job = db.get(Job, job_id)
-        if not job or job.deleted_at is not None or job.status == "cancelled":
-            return None
+    from app.services.paper_pipeline.workflow import get_paper_workflow_service
 
-        paper = db.get(Paper, job.paper_id) if job.paper_id is not None else None
-        asset = _get_original_pdf_asset(db, job.paper_id) if job.paper_id is not None else None
-        if paper is None or paper.deleted_at is not None or asset is None:
-            raise RuntimeError("Missing paper or upload asset for summary job")
-        if not is_chat_llm_configured():
-            raise RuntimeError("LLM is not configured for summarization")
-        paper_text = render_paper_text_from_structure(db, paper.id)
-        if not paper_text:
-            raise RuntimeError("No parsed text available")
-        _raise_if_cancel_requested(db, job, paper)
-
-        now = datetime.now(timezone.utc)
-        job.status = "processing"
-        job.started_at = now
-        paper.status = "processing"
-        paper.updated_at = now
-        db.commit()
-        publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
-
-        _raise_if_cancel_requested(db, job, paper)
-        summary = summarize_paper_text(paper_text)
-        _raise_if_cancel_requested(db, job, paper)
-        summary["authors"] = _normalize_summary_text(summary.get("authors"))
-        summary["doi"] = _normalize_summary_doi(summary.get("doi"))
-        summary["source_url"] = _normalize_summary_url(summary.get("source_url"))
-        published_at = _parse_summary_published_at(summary.get("published_at"))
-        summary["published_at"] = _serialize_summary_published_at(published_at)
-        metadata = dict(asset.metadata_json or {})
-        metadata["structured_summary"] = summary
-        asset.metadata_json = metadata
-        paper.abstract_raw = summary.get("abstract_cn") or paper.abstract_raw
-        if _paper_text_field_is_empty(paper.authors) and summary["authors"]:
-            paper.authors = summary["authors"]
-        if _paper_text_field_is_empty(paper.doi) and summary["doi"]:
-            paper.doi = summary["doi"]
-        if _paper_text_field_is_empty(paper.source_url) and summary["source_url"]:
-            paper.source_url = summary["source_url"]
-        if paper.published_at is None and published_at is not None:
-            paper.published_at = published_at
-        rebuild_paper_index_from_document_structure(
-            db,
-            paper_id=paper.id,
-            paper_title=paper.title,
-            structured_summary=summary,
-        )
-        paper.status = "completed"
-        paper.updated_at = datetime.now(timezone.utc)
-        job.status = "completed"
-        job.error_message = None
-        job.finished_at = datetime.now(timezone.utc)
-        db.commit()
-        publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
-        return _queue_question_set_job_if_needed(db, paper, asset)
-    except JobCancellationRequested:
-        return None
-    except Exception as exc:
-        if "job" in locals() and job is not None:
-            job.status = "failed"
-            job.error_message = str(exc)
-            job.finished_at = datetime.now(timezone.utc)
-        if "paper" in locals() and paper is not None:
-            paper.status = "failed"
-            paper.updated_at = datetime.now(timezone.utc)
-        db.commit()
-        if "paper" in locals() and paper is not None:
-            publish_task_status_event(db, paper_id=paper.id, job_id=job.id if "job" in locals() and job is not None else None)
-        raise
-    finally:
-        db.close()
+    return get_paper_workflow_service().run_paper_summary_job(
+        job_id,
+        session_factory=session_factory,
+    )
 
 
 def run_paper_question_set_job(
@@ -1077,69 +679,9 @@ def run_paper_question_set_job(
     *,
     session_factory: Callable[[], Session] = SessionLocal,
 ) -> None:
-    db = session_factory()
-    try:
-        job = db.get(Job, job_id)
-        if not job or job.deleted_at is not None or job.status == "cancelled":
-            return
+    from app.services.paper_pipeline.workflow import get_paper_workflow_service
 
-        paper = db.get(Paper, job.paper_id) if job.paper_id is not None else None
-        asset = _get_original_pdf_asset(db, job.paper_id) if job.paper_id is not None else None
-        if paper is None or paper.deleted_at is not None or asset is None:
-            raise RuntimeError("Missing paper or upload asset for question set job")
-        if not is_chat_llm_configured():
-            raise RuntimeError("LLM is not configured for question set extraction")
-        paper_text = render_paper_text_from_structure(db, paper.id)
-        if not paper_text:
-            raise RuntimeError("No parsed text available")
-
-        structured_summary = _extract_structured_summary_from_asset(asset)
-        if structured_summary is None:
-            raise RuntimeError("No structured summary available")
-
-        questions = get_organization_question_items(db, organization_id=paper.organization_id)
-        if not questions:
-            raise RuntimeError("No organization question set configured")
-        _raise_if_cancel_requested(db, job, paper)
-
-        now = datetime.now(timezone.utc)
-        job.status = "processing"
-        job.started_at = now
-        paper.status = "processing"
-        paper.updated_at = now
-        db.commit()
-        publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
-
-        _raise_if_cancel_requested(db, job, paper)
-        result = answer_question_set_questions(
-            paper_text,
-            structured_summary=structured_summary,
-            questions=questions,
-        )
-        _raise_if_cancel_requested(db, job, paper)
-        metadata = dict(asset.metadata_json or {})
-        metadata["question_set_extraction"] = result
-        asset.metadata_json = metadata
-        paper.status = "completed"
-        paper.updated_at = datetime.now(timezone.utc)
-        job.status = "completed"
-        job.error_message = None
-        job.finished_at = datetime.now(timezone.utc)
-        db.commit()
-        publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
-    except JobCancellationRequested:
-        return
-    except Exception as exc:
-        if "job" in locals() and job is not None:
-            job.status = "failed"
-            job.error_message = str(exc)
-            job.finished_at = datetime.now(timezone.utc)
-        if "paper" in locals() and paper is not None:
-            paper.status = "failed"
-            paper.updated_at = datetime.now(timezone.utc)
-        db.commit()
-        if "paper" in locals() and paper is not None:
-            publish_task_status_event(db, paper_id=paper.id, job_id=job.id if "job" in locals() and job is not None else None)
-        raise
-    finally:
-        db.close()
+    return get_paper_workflow_service().run_paper_question_set_job(
+        job_id,
+        session_factory=session_factory,
+    )
