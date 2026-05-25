@@ -788,6 +788,7 @@ def _search_sparse_chunks_postgres(
     limit: int,
     organization_id: int,
     exact_terms: list[str] | None = None,
+    paper_ids: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     from app.services.chat_rag.retrieval_low_level import search_sparse_chunks_postgres
 
@@ -797,6 +798,7 @@ def _search_sparse_chunks_postgres(
         limit=limit,
         organization_id=organization_id,
         exact_terms=exact_terms,
+        paper_ids=paper_ids,
     )
 
 
@@ -806,6 +808,7 @@ def _search_dense_chunks_postgres(
     query_embedding: list[float] | None,
     limit: int,
     organization_id: int,
+    paper_ids: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     from app.services.chat_rag.retrieval_low_level import search_dense_chunks_postgres
 
@@ -814,6 +817,7 @@ def _search_dense_chunks_postgres(
         query_embedding=query_embedding,
         limit=limit,
         organization_id=organization_id,
+        paper_ids=paper_ids,
     )
 
 
@@ -1830,6 +1834,7 @@ def _search_chunks(
     organization_id: int,
     top_k: int | None = None,
     trace: dict[str, Any] | None = None,
+    paper_ids: list[int] | None = None,
 ) -> list[RetrievalResult]:
     from app.services.chat_rag.retrieval import search_chunks
 
@@ -1839,6 +1844,7 @@ def _search_chunks(
         organization_id=organization_id,
         top_k=top_k,
         trace=trace,
+        paper_ids=paper_ids,
     )
 
 

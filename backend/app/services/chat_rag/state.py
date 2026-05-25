@@ -18,6 +18,18 @@ class ChatRagGraphState(TypedDict, total=False):
     started_at: float
     selection_started_at: float
     chat_policy: Any
+    route_plan: dict[str, Any]
+    route_decision: Any
+    engine_name: str
+    engine_inputs: dict[str, Any]
+    engine_result: dict[str, Any]
+    router_debug: dict[str, Any]
+    structured_answer: dict[str, Any]
+    needs_rag_followup: bool
+    metadata_query_plan: dict[str, Any]
+    metadata_query_result: dict[str, Any]
+    paper_scope_ids: list[int]
+    retrieval_query_override: str
     retrieval_query: str
     candidate_limit: int
     retrieval_debug: dict[str, Any]

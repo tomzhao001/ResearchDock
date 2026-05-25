@@ -24,6 +24,7 @@ def search_chunks(
     organization_id: int,
     top_k: int | None = None,
     trace: dict[str, Any] | None = None,
+    paper_ids: list[int] | None = None,
 ) -> list[legacy_rag.RetrievalResult]:
     limit = top_k or legacy_rag.settings.rag_top_k
     query_plan = query_planning.build_crosslingual_query_plan(query)
@@ -41,6 +42,7 @@ def search_chunks(
                 query=variant.query,
                 top_k=max(legacy_rag.settings.rag_rerank_top_n, limit),
                 organization_id=organization_id,
+                paper_ids=paper_ids,
             )
         source_hits: dict[str, list[dict[str, Any]]] = {}
         variant_traces: dict[str, dict[str, Any]] = {}
@@ -107,6 +109,7 @@ def search_chunks(
                     "fused_candidates": serialized,
                     "reranked_candidates": serialized,
                     "retrieval_backend": "legacy",
+                    "paper_scope_ids": [int(item) for item in (paper_ids or [])],
                     "exact_match_terms": exact_terms,
                     "exact_match_terms_applied": exact_terms_for_boost,
                     "exact_match_heavy": exact_match_heavy,
@@ -156,6 +159,7 @@ def search_chunks(
                 limit=sparse_limit,
                 organization_id=organization_id,
                 exact_terms=exact_terms_for_boost if variant.language == "en" else [],
+                paper_ids=paper_ids,
             )
             if variant_sparse_hits:
                 source_name = f"{variant.name}_sparse"
@@ -167,6 +171,7 @@ def search_chunks(
                 query_embedding=dense_embeddings.get(variant.query),
                 limit=dense_limit,
                 organization_id=organization_id,
+                paper_ids=paper_ids,
             )
             if variant_dense_hits:
                 source_name = f"{variant.name}_dense"
@@ -272,6 +277,7 @@ def search_chunks(
                 "expanded_candidates": retrieval_tracing.serialize_ranked_trace_candidates(expanded_candidates, record_map),
                 "reranked_candidates": retrieval_tracing.serialize_ranked_trace_candidates(reranked_candidates, record_map),
                 "retrieval_backend": "postgres_hybrid",
+                "paper_scope_ids": [int(item) for item in (paper_ids or [])],
                 "exact_match_terms": exact_terms,
                 "exact_match_terms_applied": exact_terms_for_boost,
                 "exact_match_heavy": exact_match_heavy,

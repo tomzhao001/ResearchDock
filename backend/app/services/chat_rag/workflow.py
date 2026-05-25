@@ -10,10 +10,47 @@ from sqlalchemy.orm import Session
 from app.models import ChatMessage, ChatTopic, User
 from app.services import rag as legacy_rag
 from app.services.chat_rag import evidence as evidence_ops
+from app.services.chat_rag import engines as engine_ops
 from app.services.chat_rag import generation as generation_ops
 from app.services.chat_rag.repository import ChatTopicRepository
 from app.services.chat_rag import retrieval as retrieval_ops
+from app.services.chat_rag import routing as routing_ops
 from app.services.chat_rag.state import ChatRagGraphState
+
+
+@dataclass
+class ChatRouteService:
+    def plan(self, state: ChatRagGraphState) -> dict[str, Any]:
+        route_plan = routing_ops.build_route_plan(state["message"])
+        return {"route_plan": route_plan}
+
+    def route(self, state: ChatRagGraphState) -> dict[str, Any]:
+        progress_callback = state.get("progress_callback")
+        route_plan = state.get("route_plan") if isinstance(state.get("route_plan"), dict) else {}
+        legacy_rag._emit_chat_progress(
+            progress_callback,
+            phase="routing",
+            status="started",
+            message="正在分析问题类型",
+        )
+        route_decision = routing_ops.route_query(state["message"], route_plan=route_plan)
+        engine_name_labels = {
+            "rag_engine": "知识库检索回答",
+            "metadata_engine": "元数据查询",
+            "hybrid_sql_rag_engine": "结构化筛选后检索回答",
+        }
+        legacy_rag._emit_chat_progress(
+            progress_callback,
+            phase="routing",
+            status="finished",
+            message="问题分流完成",
+            detail=engine_name_labels.get(route_decision.engine_name, route_decision.engine_name),
+        )
+        return {
+            "route_decision": route_decision,
+            "engine_name": route_decision.engine_name,
+            "metadata_query_plan": route_plan.get("metadata_query_plan") if isinstance(route_plan.get("metadata_query_plan"), dict) else None,
+        }
 
 
 @dataclass
@@ -26,7 +63,8 @@ class ChatRetrievalService:
         message = state["message"]
         progress_callback = state.get("progress_callback")
 
-        retrieval_query = retrieval_ops.build_retrieval_query(records, message)
+        retrieval_query_input = str(state.get("retrieval_query_override") or message)
+        retrieval_query = retrieval_ops.build_retrieval_query(records, retrieval_query_input)
         candidate_limit = max(legacy_rag.settings.rag_top_k, legacy_rag.settings.rag_rerank_top_n, 10)
         retrieval_debug: dict[str, Any] = {}
         legacy_rag._emit_chat_progress(
@@ -48,6 +86,7 @@ class ChatRetrievalService:
             organization_id=user.organization_id,
             top_k=candidate_limit,
             trace=retrieval_debug,
+            paper_ids=[int(item) for item in state.get("paper_scope_ids", [])],
         )
         retrieval_results = retrieval_candidates[: legacy_rag.settings.rag_top_k]
         evidence_candidates = retrieval_ops.build_evidence_candidates(retrieval_results, query=message)
@@ -131,14 +170,20 @@ class RetrievalTraceBuilder:
         retrieval_trace = {
             "original_user_query": state["message"],
             "retrieval_query": state["retrieval_query"],
+            "route_plan": state.get("route_plan"),
+            "route_decision": routing_ops.serialize_route_decision(state.get("route_decision")),
+            "engine_name": state.get("engine_name") or "rag_engine",
             "query_plan": retrieval_debug.get("query_plan"),
             "retrieval_backend": retrieval_debug.get("retrieval_backend", "unknown"),
+            "metadata_query_plan": state.get("metadata_query_plan"),
+            "engine_execution": state.get("engine_result"),
             "first_pass_candidates": legacy_rag._serialize_trace_candidates(state["retrieval_candidates"]),
             "variant_candidates": retrieval_debug.get("variant_candidates", {}),
             "sparse_candidates": retrieval_debug.get("sparse_candidates", []),
             "dense_candidates": retrieval_debug.get("dense_candidates", []),
             "fused_candidates": retrieval_debug.get("fused_candidates", []),
             "reranked_candidates": retrieval_debug.get("reranked_candidates", []),
+            "paper_scope_ids": [int(item) for item in state.get("paper_scope_ids", [])],
             "selected_citations": citations,
             "selected_evidence": citations,
             "evidence_selection_trace": {
@@ -385,21 +430,47 @@ class ChatGenerationService:
 
 class ChatDraftGraphRunner:
     def __init__(self) -> None:
+        self.route_service = ChatRouteService()
         self.retrieval_service = ChatRetrievalService()
         self.evidence_service = ChatEvidenceService()
         self.trace_builder = RetrievalTraceBuilder()
         self.generation_service = ChatGenerationService()
+        self.metadata_engine = engine_ops.MetadataQueryEngine()
+        self.hybrid_engine = engine_ops.HybridScopedRagEngine()
         self._graph = self._build_graph()
 
     def _build_graph(self):
         graph = StateGraph(ChatRagGraphState)
+        graph.add_node("plan_route", self.route_service.plan)
+        graph.add_node("route_query", self.route_service.route)
+        graph.add_node("run_metadata_engine", self.metadata_engine.run)
+        graph.add_node("run_hybrid_prefilter", self.hybrid_engine.prefilter)
         graph.add_node("run_retrieval", self.retrieval_service.run)
         graph.add_node("select_evidence", self.evidence_service.select)
         graph.add_node("build_trace", self.trace_builder.build)
         graph.add_node("generate_answer", self.generation_service.generate)
         graph.add_node("build_insufficient_draft", self.generation_service.build_insufficient_draft)
         graph.add_node("finalize_draft", self._finalize_draft)
-        graph.add_edge(START, "run_retrieval")
+        graph.add_edge(START, "plan_route")
+        graph.add_edge("plan_route", "route_query")
+        graph.add_conditional_edges(
+            "route_query",
+            self._route_after_query,
+            {
+                "run_retrieval": "run_retrieval",
+                "run_metadata_engine": "run_metadata_engine",
+                "run_hybrid_prefilter": "run_hybrid_prefilter",
+            },
+        )
+        graph.add_conditional_edges(
+            "run_hybrid_prefilter",
+            self._route_after_hybrid_prefilter,
+            {
+                "run_retrieval": "run_retrieval",
+                "finalize_draft": "finalize_draft",
+            },
+        )
+        graph.add_edge("run_metadata_engine", "finalize_draft")
         graph.add_edge("run_retrieval", "select_evidence")
         graph.add_edge("select_evidence", "build_trace")
         graph.add_conditional_edges(
@@ -414,6 +485,21 @@ class ChatDraftGraphRunner:
         graph.add_edge("build_insufficient_draft", "finalize_draft")
         graph.add_edge("finalize_draft", END)
         return graph.compile()
+
+    @staticmethod
+    def _route_after_query(state: ChatRagGraphState) -> str:
+        engine_name = getattr(state.get("route_decision"), "engine_name", None) or state.get("engine_name")
+        if engine_name == "metadata_engine":
+            return "run_metadata_engine"
+        if engine_name == "hybrid_sql_rag_engine":
+            return "run_hybrid_prefilter"
+        return "run_retrieval"
+
+    @staticmethod
+    def _route_after_hybrid_prefilter(state: ChatRagGraphState) -> str:
+        if state.get("draft") is not None:
+            return "finalize_draft"
+        return "run_retrieval"
 
     @staticmethod
     def _route_after_trace(state: ChatRagGraphState) -> str:

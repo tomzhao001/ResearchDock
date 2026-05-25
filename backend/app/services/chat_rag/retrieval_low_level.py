@@ -52,9 +52,16 @@ def normalize_embedding(value: Any) -> list[float] | None:
     return None
 
 
-def search_chunks_legacy(db: Session, *, query: str, top_k: int, organization_id: int) -> list[legacy_rag.RetrievalResult]:
+def search_chunks_legacy(
+    db: Session,
+    *,
+    query: str,
+    top_k: int,
+    organization_id: int,
+    paper_ids: list[int] | None = None,
+) -> list[legacy_rag.RetrievalResult]:
     searchable_roles = legacy_rag._searchable_chunk_roles()
-    rows = db.execute(
+    statement = (
         select(PaperChunk, Paper)
         .join(Paper, Paper.id == PaperChunk.paper_id)
         .where(
@@ -63,7 +70,10 @@ def search_chunks_legacy(db: Session, *, query: str, top_k: int, organization_id
             PaperChunk.chunk_role.in_(searchable_roles),
         )
         .order_by(PaperChunk.paper_id.asc(), PaperChunk.chunk_index.asc())
-    ).all()
+    )
+    if paper_ids:
+        statement = statement.where(Paper.id.in_([int(paper_id) for paper_id in paper_ids]))
+    rows = db.execute(statement).all()
     if not rows:
         return []
 
@@ -98,6 +108,7 @@ def search_sparse_chunks_postgres(
     limit: int,
     organization_id: int,
     exact_terms: list[str] | None = None,
+    paper_ids: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     if not query.strip():
         return []
@@ -118,6 +129,15 @@ def search_sparse_chunks_postgres(
         exact_bonus_clauses.append(f"CASE WHEN {body_text_expr} LIKE :{term_key} THEN :{bonus_key} ELSE 0 END")
     exact_match_sql = " OR ".join(exact_match_clauses) or "FALSE"
     exact_bonus_sql = " + ".join(exact_bonus_clauses) or "0"
+    paper_scope_sql = ""
+    if paper_ids:
+        placeholders: list[str] = []
+        for index, paper_id in enumerate([int(item) for item in paper_ids]):
+            key = f"paper_id_{index}"
+            params[key] = paper_id
+            placeholders.append(f":{key}")
+        if placeholders:
+            paper_scope_sql = f" AND p.id IN ({', '.join(placeholders)}) "
     rows = db.execute(
         text(
             f"""
@@ -132,6 +152,7 @@ def search_sparse_chunks_postgres(
             JOIN papers AS p ON p.id = pc.paper_id
             WHERE p.deleted_at IS NULL
               AND p.organization_id = :organization_id
+              {paper_scope_sql}
               AND pc.chunk_role IN ({role_sql})
               AND (
                     pc.search_vector @@ plainto_tsquery('{search_config}', :query)
@@ -159,12 +180,13 @@ def search_dense_chunks_postgres(
     query_embedding: list[float] | None,
     limit: int,
     organization_id: int,
+    paper_ids: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     if query_embedding is None:
         return []
     searchable_roles = legacy_rag._searchable_chunk_roles()
     distance = PaperChunk.embedding.cosine_distance(query_embedding)
-    rows = db.execute(
+    statement = (
         select(
             PaperChunk.id.label("chunk_id"),
             PaperChunk.paper_id.label("paper_id"),
@@ -179,7 +201,10 @@ def search_dense_chunks_postgres(
         )
         .order_by(distance.asc(), PaperChunk.id.asc())
         .limit(limit)
-    ).all()
+    )
+    if paper_ids:
+        statement = statement.where(Paper.id.in_([int(paper_id) for paper_id in paper_ids]))
+    rows = db.execute(statement).all()
     return [
         {
             "chunk_id": int(row.chunk_id),
