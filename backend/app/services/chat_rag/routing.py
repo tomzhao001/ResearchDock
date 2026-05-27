@@ -49,6 +49,12 @@ _CONTENT_HINTS = (
     "是什么",
     "为什么",
     "如何",
+    "研究什么",
+    "讲了什么",
+    "主要研究",
+    "主要研究什么",
+    "主要内容",
+    "主要内容是什么",
     "研究结局",
     "结局变量",
     "终点",
@@ -146,6 +152,22 @@ def _answer_shape_for_intent(intent_family: str) -> str:
     return "paragraph"
 
 
+def _looks_like_content_followup(
+    *,
+    query: str,
+    intent_family: str,
+    metadata_plan: metadata_query.MetadataQueryPlan | None,
+) -> bool:
+    normalized = legacy_rag._normalize_query_text(query).lower()
+    if intent_family in {"content_extraction", "summary", "comparison"}:
+        return True
+    if _contains_any(normalized, _CONTENT_HINTS) or _contains_any(normalized, _SUMMARY_HINTS) or _contains_any(normalized, _COMPARISON_HINTS):
+        return True
+    if metadata_plan is not None and metadata_plan.wants_content_followup:
+        return True
+    return False
+
+
 def _extract_conversation_context(records: list[ChatMessage]) -> dict[str, Any]:
     for record in reversed(records):
         if record.role != "assistant" or not isinstance(record.metadata_json, dict):
@@ -211,8 +233,13 @@ def rule_route(query: str, *, route_plan: dict[str, Any] | None = None) -> Route
     paper_scope_ids = [int(item) for item in conversation_context.get("paper_scope_ids", []) if str(item).isdigit()]
     referential_followup = _contains_any(query, _CONVERSATION_SCOPE_HINTS)
     conversation_scope_used = bool(paper_scope_ids and referential_followup)
+    content_followup = _looks_like_content_followup(
+        query=query,
+        intent_family=intent_family,
+        metadata_plan=metadata_plan,
+    )
 
-    if conversation_scope_used and intent_family in {"content_extraction", "summary", "comparison"}:
+    if conversation_scope_used and content_followup:
         return RouteDecision(
             engine_name="hybrid_sql_rag_engine",
             confidence=0.94,

@@ -87,6 +87,8 @@ def test_chat_topic_roundtrip_with_knowledge_base_citations(client, user, db_ses
     assert body["assistant_message"]["model"] == "rag-model"
     assert body["assistant_message"]["answer_mode"] == "knowledge_base"
     assert body["assistant_message"]["used_knowledge_base"] is True
+    assert body["assistant_message"]["response_kind"] == "grounded_rag"
+    assert body["assistant_message"]["attribution_status"] == "grounded"
     assert len(body["assistant_message"]["citations"]) == 1
     assert body["assistant_message"]["citations"][0]["paper_title"] == "Transformer Paper"
     assert body["assistant_message"]["citations"][0]["evidence_id"] == f"chunk-{chunk.id}"
@@ -213,6 +215,8 @@ def test_chat_falls_back_to_general_answer_when_no_kb_match(
     assert body["assistant_message"]["model"] == "fallback-model"
     assert body["assistant_message"]["sufficiency_decision"]["is_sufficient"] is False
     assert "no_evidence_selected" in body["assistant_message"]["sufficiency_decision"]["reason_codes"]
+    assert body["assistant_message"]["response_kind"] == "general_fallback"
+    assert body["assistant_message"]["attribution_status"] == "no_usable_evidence"
 
     assistant_message = db_session.scalar(
         select(ChatMessage)
@@ -292,8 +296,8 @@ def test_chat_abstains_when_verifier_rejects_answer(client, user, db_session, mo
                 """.strip(),
                 "verifier-model",
             )
-        if "当前知识库没有找到足够证据" in system:
-            return "知识库中未找到确切依据。可先把 tES 理解为经颅电刺激相关术语，但该疗效结论不能采信。", "fallback-model"
+        if "fallback_mode: evidence_backed_fallback" in user_content:
+            return "现有材料只能支持把 tES 理解为 transcranial electrical stimulation；至于疗效提升，当前证据不足以确认。", "fallback-model"
         return "基于知识库，tES 不仅是 transcranial electrical stimulation，而且显著提升了疗效。", "rag-model"
 
     monkeypatch.setattr("app.services.rag.chat_with_messages", fake_chat)
@@ -309,9 +313,11 @@ def test_chat_abstains_when_verifier_rejects_answer(client, user, db_session, mo
     assert response.status_code == 200
     body = response.json()
     assert body["assistant_message"]["answer_mode"] == "kb_insufficient_evidence"
-    assert body["assistant_message"]["content"] == "知识库中未找到确切依据。可先把 tES 理解为经颅电刺激相关术语，但该疗效结论不能采信。"
+    assert body["assistant_message"]["content"] == "现有材料只能支持把 tES 理解为 transcranial electrical stimulation；至于疗效提升，当前证据不足以确认。"
     assert len(body["assistant_message"]["citations"]) == 1
     assert body["assistant_message"]["model"] == "fallback-model"
+    assert body["assistant_message"]["response_kind"] == "evidence_backed_fallback"
+    assert body["assistant_message"]["attribution_status"] == "verification_failed"
 
     assistant_message = db_session.scalar(
         select(ChatMessage)
@@ -384,8 +390,8 @@ def test_chat_returns_fallback_answer_when_selector_marks_evidence_insufficient(
                 """.strip() % (chunk.id, chunk.id),
                 "selector-model",
             )
-        if "fallback_reason:" in user_content:
-            return "知识库中未找到确切依据。结合通用知识，tES 通常指经颅电刺激相关概念，可先把该定义作为参考。", "fallback-model"
+        if "fallback_mode: evidence_backed_fallback" in user_content:
+            return "现有材料可支持 tES 指 transcranial electrical stimulation；更广泛的背景含义在当前材料中没有足够依据。", "fallback-model"
         raise AssertionError("不应在证据不足路径中进入知识库主生成或 verifier")
 
     monkeypatch.setattr("app.services.rag.chat_with_messages", fake_chat)
@@ -406,7 +412,10 @@ def test_chat_returns_fallback_answer_when_selector_marks_evidence_insufficient(
     assert body["assistant_message"]["sufficiency_decision"]["is_sufficient"] is False
     assert "llm_marked_insufficient" in body["assistant_message"]["sufficiency_decision"]["reason_codes"]
     assert body["assistant_message"]["missing_information"] == "证据能说明术语含义，但不足以回答更广泛的背景问题。"
+    assert body["assistant_message"]["content"] == "现有材料可支持 tES 指 transcranial electrical stimulation；更广泛的背景含义在当前材料中没有足够依据。"
     assert len(body["assistant_message"]["citations"]) == 1
+    assert body["assistant_message"]["response_kind"] == "evidence_backed_fallback"
+    assert body["assistant_message"]["attribution_status"] == "partial_evidence"
 
 
 def test_send_topic_message_keeps_strict_behavior_by_default(user, db_session, monkeypatch: pytest.MonkeyPatch) -> None:

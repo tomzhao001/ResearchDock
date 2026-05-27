@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+import re
 from typing import Any
 
 from langgraph.graph import END, START, StateGraph
@@ -17,6 +18,24 @@ from app.services.chat_rag import retrieval as retrieval_ops
 from app.services.chat_rag import routing as routing_ops
 from app.services.chat_rag.state import ChatRagGraphState
 from app.services.chat_rag import synthesis as synthesis_ops
+
+
+def _has_substantive_answer(text: str) -> bool:
+    normalized = legacy_rag._normalize_query_text(text)
+    if not normalized:
+        return False
+    stripped = normalized.replace("知识库中未找到确切依据。", "").replace("知识库中未找到确切依据", "").strip()
+    return len(stripped) >= 16
+
+
+def _sanitize_generation_answer(answer: str) -> str:
+    normalized = (answer or "").strip()
+    if "知识库中未找到确切依据" not in normalized:
+        return normalized
+    if not _has_substantive_answer(normalized):
+        return normalized
+    sanitized = re.sub(r"知识库中未找到确切依据[。；;，,\s]*", "", normalized, count=1).strip()
+    return sanitized or normalized
 
 
 @dataclass
@@ -310,6 +329,10 @@ class RetrievalTraceBuilder:
                 "llm_insufficient_hard_gate": state["chat_policy"].llm_insufficient_hard_gate,
                 "verifier_min_support_score": state["chat_policy"].verifier_min_support_score,
             },
+            "response_kind": None,
+            "attribution_status": None,
+            "status_message": None,
+            "status_detail": None,
             "generation_instruction": retrieval_debug.get("generation_instruction"),
             "rerank_query": retrieval_debug.get("rerank_query"),
             "search_ms": round((time.perf_counter() - state["started_at"]) * 1000, 2),
@@ -366,13 +389,15 @@ class ChatGenerationService:
                             f"回答要求：{retrieval_debug.get('generation_instruction') or '请用中文回答，保留关键英文术语原文，并引用英文证据。'}\n"
                             "请先从证据中抽取可以直接支持回答的 claim，再生成最终答案。\n"
                             "只允许使用下列证据支持的内容，避免补充证据中没有的结论。\n"
-                            "如果证据仍然不足，请直接说明“知识库中未找到确切依据”。\n\n"
+                            "如果证据只足以支持部分内容，请优先回答能被证据支持的部分，并明确标注暂时无法确认的部分。\n"
+                            "仅当没有任何证据可以支持回答时，才明确说明“知识库中未找到确切依据”。\n\n"
                             f"{evidence_text}"
                         ),
                     },
                 ],
                 temperature=0.2,
             )
+            answer = _sanitize_generation_answer(answer)
             legacy_rag.logger.info(
                 "RAG answer draft finished: topic_id=%s model=%s elapsed=%.2fs",
                 topic.id,
@@ -400,12 +425,13 @@ class ChatGenerationService:
                 selection_result=selection_result,
             )
             retrieval_trace["verifier_result"] = verifier_result
+            hard_abstain = "知识库中未找到确切依据" in (answer or "") and not _has_substantive_answer(answer or "")
             use_abstain_path = (
-                "知识库中未找到确切依据" in (answer or "")
+                hard_abstain
                 or not verifier_result.get("supported")
                 or float(verifier_result.get("support_score") or 0.0) < chat_policy.verifier_min_support_score
             )
-            if "知识库中未找到确切依据" in (answer or ""):
+            if hard_abstain:
                 fallback_reason = "generation_abstained"
             elif not verifier_result.get("supported"):
                 fallback_reason = "verifier_rejected"
@@ -445,6 +471,10 @@ class ChatGenerationService:
             use_abstain_path = True
             fallback_reason = "generation_failed"
         if use_abstain_path and chat_policy.allow_fallback_generation:
+            fallback_mode = generation_ops.classify_fallback_mode(
+                selected_evidence=selected_evidence,
+                fallback_reason=fallback_reason or "fallback_requested",
+            )
             fallback_answer, fallback_model = generation_ops.generate_fallback_chat_answer(
                 records=records,
                 message=message,
@@ -460,6 +490,7 @@ class ChatGenerationService:
             final_model = fallback_model
             answer_mode = "kb_insufficient_evidence"
             used_knowledge_base = False
+            retrieval_trace["fallback_mode"] = fallback_mode
             retrieval_trace["fallback_reason"] = fallback_reason or "fallback_requested"
             retrieval_trace["fallback_model"] = fallback_model
             retrieval_trace["fallback_used"] = True
@@ -469,6 +500,7 @@ class ChatGenerationService:
             final_model = model
             answer_mode = "knowledge_base" if not use_abstain_path else "kb_insufficient_evidence"
             used_knowledge_base = not use_abstain_path
+            retrieval_trace["fallback_mode"] = None
             retrieval_trace["fallback_used"] = False
         legacy_rag.logger.info(
             "RAG generation finished: topic_id=%s mode=knowledge_base model=%s elapsed=%.2fs",
@@ -479,6 +511,13 @@ class ChatGenerationService:
         retrieval_trace["generation_ms"] = round((time.perf_counter() - state["started_at"]) * 1000, 2)
         retrieval_trace["answer_mode"] = answer_mode
         legacy_rag.logger.info("rag_trace %s", retrieval_trace)
+        semantics = generation_ops.derive_response_semantics(
+            answer_mode=answer_mode,
+            used_knowledge_base=used_knowledge_base,
+            retrieval_trace=retrieval_trace,
+            citations_json=final_citations,
+        )
+        retrieval_trace.update(semantics)
         return {
             "draft": legacy_rag.AssistantMessageDraft(
                 content=final_answer,
@@ -501,6 +540,10 @@ class ChatGenerationService:
         retrieval_trace["generation_ms"] = round((time.perf_counter() - state["started_at"]) * 1000, 2)
         retrieval_trace["fallback_used"] = bool(chat_policy.allow_fallback_generation)
         retrieval_trace["fallback_reason"] = "insufficient_evidence"
+        retrieval_trace["fallback_mode"] = generation_ops.classify_fallback_mode(
+            selected_evidence=selected_evidence,
+            fallback_reason="insufficient_evidence",
+        )
         if chat_policy.allow_fallback_generation:
             fallback_answer, fallback_model = generation_ops.generate_fallback_chat_answer(
                 records=state["records"],
@@ -514,6 +557,13 @@ class ChatGenerationService:
             retrieval_trace["fallback_model"] = fallback_model
             retrieval_trace["answer_mode"] = "kb_insufficient_evidence"
             legacy_rag.logger.info("rag_trace %s", retrieval_trace)
+            semantics = generation_ops.derive_response_semantics(
+                answer_mode="kb_insufficient_evidence",
+                used_knowledge_base=False,
+                retrieval_trace=retrieval_trace,
+                citations_json=citations if selected_evidence else [],
+            )
+            retrieval_trace.update(semantics)
             draft = legacy_rag.AssistantMessageDraft(
                 content=fallback_answer,
                 model=fallback_model,
@@ -525,6 +575,13 @@ class ChatGenerationService:
         else:
             retrieval_trace["answer_mode"] = "kb_insufficient_evidence"
             legacy_rag.logger.info("rag_trace %s", retrieval_trace)
+            semantics = generation_ops.derive_response_semantics(
+                answer_mode="kb_insufficient_evidence",
+                used_knowledge_base=False,
+                retrieval_trace=retrieval_trace,
+                citations_json=[],
+            )
+            retrieval_trace.update(semantics)
             draft = legacy_rag.AssistantMessageDraft(
                 content="知识库中未找到确切依据。",
                 model=None,

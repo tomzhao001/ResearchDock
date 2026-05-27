@@ -23,7 +23,7 @@ export function Tooltip({ content, children, side = "top" }: TooltipProps) {
       {open ? (
         <span
           role="tooltip"
-          className={`pointer-events-none absolute left-1/2 z-50 -translate-x-1/2 rounded-md bg-slate-950 px-2 py-1 text-[11px] whitespace-nowrap text-white shadow-lg ${
+          className={`pointer-events-none absolute left-1/2 z-50 max-w-72 -translate-x-1/2 rounded-md bg-slate-950 px-3 py-2 text-[11px] leading-5 whitespace-normal text-white shadow-lg ${
             side === "bottom" ? "top-[calc(100%+8px)]" : "bottom-[calc(100%+8px)]"
           }`}
         >

@@ -4,6 +4,7 @@ from dataclasses import replace
 from typing import Any
 
 from app.services import rag as legacy_rag
+from app.services.chat_rag import generation
 from app.services.chat_rag import routing
 from app.services.chat_rag.state import ChatRagGraphState
 
@@ -84,6 +85,15 @@ def synthesize_result(state: ChatRagGraphState) -> dict[str, Any]:
         return {"synthesis_result": synthesis_result}
     metadata_json = dict(draft.metadata_json or {})
     retrieval = dict(metadata_json.get("retrieval") or {})
+    if not retrieval.get("response_kind") or not retrieval.get("attribution_status"):
+        retrieval.update(
+            generation.derive_response_semantics(
+                answer_mode=draft.answer_mode,
+                used_knowledge_base=draft.used_knowledge_base,
+                retrieval_trace=retrieval,
+                citations_json=list(draft.citations_json or []),
+            )
+        )
     retrieval["normalized_engine_output"] = normalized
     retrieval["answer_shape_validation"] = validation
     retrieval["selector_result"] = state.get("selector_result")

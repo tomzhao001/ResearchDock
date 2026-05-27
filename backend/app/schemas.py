@@ -246,6 +246,10 @@ class ChatMessagePublic(BaseModel):
     citations: list[ChatCitation] = []
     sufficiency_decision: ChatSufficiencyDecision | None = None
     missing_information: str | None = None
+    response_kind: str | None = None
+    attribution_status: str | None = None
+    status_message: str | None = None
+    status_detail: str | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}

@@ -39,6 +39,8 @@ def test_chat_routes_metadata_queries_without_calling_llm(client, user, db_sessi
     body = response.json()
     assert body["assistant_message"]["answer_mode"] == "metadata_query"
     assert body["assistant_message"]["used_knowledge_base"] is True
+    assert body["assistant_message"]["response_kind"] == "metadata_answer"
+    assert body["assistant_message"]["attribution_status"] == "metadata_only"
     assert "2 篇" in body["assistant_message"]["content"]
 
     assistant_message = db_session.scalar(
@@ -162,6 +164,7 @@ def test_chat_routes_hybrid_queries_to_metadata_then_scoped_rag(client, user, db
     body = response.json()
     assert body["assistant_message"]["answer_mode"] == "knowledge_base"
     assert body["assistant_message"]["used_knowledge_base"] is True
+    assert body["assistant_message"]["response_kind"] == "grounded_rag"
     assert body["assistant_message"]["model"] == "hybrid-rag-model"
     assert len(body["assistant_message"]["citations"]) == 1
     assert body["assistant_message"]["citations"][0]["paper_id"] == missing_doi_paper.id
@@ -300,6 +303,22 @@ def test_selector_low_confidence_falls_back_to_rag_unit(monkeypatch) -> None:
     assert decision.engine_name == "rag_engine"
     assert decision.decision_source == "fallback"
     assert decision.reason == "selector_low_confidence_fallback"
+
+
+def test_route_uses_hybrid_for_chinese_conversation_scope_summary_followup() -> None:
+    route_plan = {
+        "intent_family": "rag",
+        "answer_shape": "paragraph",
+        "conversation_context": {
+            "paper_scope_ids": [11, 12],
+            "last_engine_name": "metadata_engine",
+        },
+        "metadata_query_plan": None,
+    }
+    decision = routing.rule_route("这些论文主要研究什么？", route_plan=route_plan)
+    assert decision.engine_name == "hybrid_sql_rag_engine"
+    assert decision.reason == "conversation_scope_content_followup"
+    assert decision.conversation_scope_used is True
 
 
 def test_chat_uses_conversation_scoped_hybrid_followup(client, user, db_session, monkeypatch) -> None:

@@ -49,10 +49,18 @@ def _serialize_message(message) -> ChatMessagePublic:
     retrieval = message.metadata_json.get("retrieval") if isinstance(message.metadata_json, dict) else {}
     sufficiency_decision = retrieval.get("sufficiency_decision") if isinstance(retrieval, dict) else None
     missing_information = None
+    response_kind = None
+    attribution_status = None
+    status_message = None
+    status_detail = None
     if isinstance(retrieval, dict):
         evidence_trace = retrieval.get("evidence_selection_trace")
         if isinstance(evidence_trace, dict):
             missing_information = evidence_trace.get("missing_information")
+        response_kind = retrieval.get("response_kind")
+        attribution_status = retrieval.get("attribution_status")
+        status_message = retrieval.get("status_message")
+        status_detail = retrieval.get("status_detail")
     return ChatMessagePublic(
         id=message.id,
         topic_id=message.topic_id,
@@ -64,6 +72,10 @@ def _serialize_message(message) -> ChatMessagePublic:
         citations=citations,
         sufficiency_decision=sufficiency_decision,
         missing_information=missing_information,
+        response_kind=response_kind,
+        attribution_status=attribution_status,
+        status_message=status_message,
+        status_detail=status_detail,
         created_at=message.created_at,
     )
 
@@ -201,6 +213,26 @@ def stream_chat_completion(
                         assistant_draft.metadata_json.get("retrieval", {})
                         .get("evidence_selection_trace", {})
                         .get("missing_information")
+                        if isinstance(assistant_draft.metadata_json, dict)
+                        else None
+                    ),
+                    "response_kind": (
+                        assistant_draft.metadata_json.get("retrieval", {}).get("response_kind")
+                        if isinstance(assistant_draft.metadata_json, dict)
+                        else None
+                    ),
+                    "attribution_status": (
+                        assistant_draft.metadata_json.get("retrieval", {}).get("attribution_status")
+                        if isinstance(assistant_draft.metadata_json, dict)
+                        else None
+                    ),
+                    "status_message": (
+                        assistant_draft.metadata_json.get("retrieval", {}).get("status_message")
+                        if isinstance(assistant_draft.metadata_json, dict)
+                        else None
+                    ),
+                    "status_detail": (
+                        assistant_draft.metadata_json.get("retrieval", {}).get("status_detail")
                         if isinstance(assistant_draft.metadata_json, dict)
                         else None
                     ),
