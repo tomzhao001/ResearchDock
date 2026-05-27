@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import io
+import importlib
+import shutil
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +18,23 @@ from app.services.document_extraction import (
     ExtractedTable,
 )
 from app.services.ocr.quality import OcrRoutingDecision
+
+_RAPIDOCR_MODELSCOPE_RELEASE = "v3.8.0"
+_RAPIDOCR_MODELSCOPE_BASE_URL = "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve"
+_RAPIDOCR_V5_COMMON_ARTIFACTS = {
+    "det_model_path": "onnx/PP-OCRv5/det/ch_PP-OCRv5_det_mobile.onnx",
+    "cls_model_path": "onnx/PP-OCRv5/cls/ch_PP-LCNet_x0_25_textline_ori_cls_mobile.onnx",
+}
+_RAPIDOCR_V5_LANGUAGE_ARTIFACTS = {
+    "chinese": {
+        "rec_model_path": "onnx/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile.onnx",
+        "rec_keys_path": "paddle/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile/ppocrv5_dict.txt",
+    },
+    "english": {
+        "rec_model_path": "onnx/PP-OCRv5/rec/en_PP-OCRv5_rec_mobile.onnx",
+        "rec_keys_path": "paddle/PP-OCRv5/rec/en_PP-OCRv5_rec_mobile/ppocrv5_en_dict.txt",
+    },
+}
 
 
 def _label_name(item: Any) -> str | None:
@@ -125,6 +145,62 @@ def _picture_image_bytes(item: Any, doc: Any) -> bytes | None:
         return None
 
 
+def _resolve_rapidocr_language(languages: list[str] | None) -> str:
+    normalized_languages = {str(language).strip().lower() for language in (languages or []) if str(language).strip()}
+    if {"ch", "zh", "chinese", "ch_sim", "chi_sim"} & normalized_languages:
+        return "chinese"
+    if {"en", "english"} & normalized_languages:
+        return "english"
+    return "chinese"
+
+
+def _rapidocr_artifact_url(relative_path: str) -> str:
+    return f"{_RAPIDOCR_MODELSCOPE_BASE_URL}/{_RAPIDOCR_MODELSCOPE_RELEASE}/{relative_path}"
+
+
+def _build_rapidocr_v5_manifest(artifacts_path: Path, languages: list[str] | None) -> dict[str, tuple[Path, str]]:
+    model_root = artifacts_path / "RapidOcr"
+    manifest: dict[str, tuple[Path, str]] = {}
+    for option_name, relative_path in _RAPIDOCR_V5_COMMON_ARTIFACTS.items():
+        manifest[option_name] = (model_root / relative_path, _rapidocr_artifact_url(relative_path))
+
+    language_key = _resolve_rapidocr_language(languages)
+    for option_name, relative_path in _RAPIDOCR_V5_LANGUAGE_ARTIFACTS[language_key].items():
+        manifest[option_name] = (model_root / relative_path, _rapidocr_artifact_url(relative_path))
+    return manifest
+
+
+def _build_rapidocr_v5_params(languages: list[str] | None) -> dict[str, Any]:
+    typings = importlib.import_module("rapidocr.utils.typings")
+    LangCls = getattr(typings, "LangCls")
+    LangDet = getattr(typings, "LangDet")
+    LangRec = getattr(typings, "LangRec")
+    OCRVersion = getattr(typings, "OCRVersion")
+
+    language_key = _resolve_rapidocr_language(languages)
+    rec_lang = LangRec.EN if language_key == "english" else LangRec.CH
+    return {
+        "Det.ocr_version": OCRVersion.PPOCRV5,
+        "Cls.ocr_version": OCRVersion.PPOCRV5,
+        "Rec.ocr_version": OCRVersion.PPOCRV5,
+        "Det.lang_type": LangDet.CH,
+        "Cls.lang_type": LangCls.CH,
+        "Rec.lang_type": rec_lang,
+    }
+
+
+def _ensure_rapidocr_artifact(local_path: Path, url: str) -> Path:
+    if local_path.exists():
+        return local_path
+
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = local_path.with_suffix(local_path.suffix + ".tmp")
+    with urllib.request.urlopen(url, timeout=180) as response, temp_path.open("wb") as output:
+        shutil.copyfileobj(response, output)
+    temp_path.replace(local_path)
+    return local_path
+
+
 class DoclingDocumentExtractor:
     def __init__(self, *, ocr_strategy: OcrRoutingDecision | None = None) -> None:
         self.ocr_strategy = ocr_strategy
@@ -154,7 +230,15 @@ class DoclingDocumentExtractor:
         if ocr_engine == "easyocr":
             pipeline_options.ocr_options = EasyOcrOptions(lang=languages or ["ch_sim", "en"])
         elif ocr_engine == "rapidocr":
-            pipeline_options.ocr_options = RapidOcrOptions(lang=languages or ["chinese", "english"])
+            manifest = _build_rapidocr_v5_manifest(cache_paths.docling, languages or ["chinese", "english"])
+            pipeline_options.ocr_options = RapidOcrOptions(
+                lang=languages or ["chinese", "english"],
+                det_model_path=str(_ensure_rapidocr_artifact(*manifest["det_model_path"])),
+                cls_model_path=str(_ensure_rapidocr_artifact(*manifest["cls_model_path"])),
+                rec_model_path=str(_ensure_rapidocr_artifact(*manifest["rec_model_path"])),
+                rec_keys_path=str(_ensure_rapidocr_artifact(*manifest["rec_keys_path"])),
+                rapidocr_params=_build_rapidocr_v5_params(languages or ["chinese", "english"]),
+            )
         elif ocr_engine == "tesserocr":
             pipeline_options.ocr_options = TesseractOcrOptions(lang=languages or ["chi_sim", "eng"])
         elif ocr_engine == "tesseract":
