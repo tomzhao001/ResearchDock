@@ -13,6 +13,9 @@ from app.services import papers as legacy_papers
 from app.services.chat_rag.indexing import get_paper_indexing_service
 from app.services.docling_extraction import build_document_extractor
 from app.services.document_extraction import DocumentExtractor
+from app.services.ocr.escalation import OcrEscalationProcessor, build_ocr_escalation_processor
+from app.services.ocr.postprocess import OcrPostprocessor, build_ocr_postprocessor
+from app.services.ocr.quality import build_default_routing_decision, assess_document_text_layer
 from app.services.paper_pipeline import helpers as paper_helpers
 from app.services.paper_pipeline.rendering import render_paper_text_from_structure
 from app.services.paper_pipeline.repository import PaperJobRepository
@@ -30,7 +33,10 @@ class PdfIngestGraphRunner:
         graph = StateGraph(PaperJobGraphState)
         graph.add_node("load_context", self._load_context)
         graph.add_node("mark_processing", self._mark_processing)
+        graph.add_node("assess_ocr_strategy", self._assess_ocr_strategy)
         graph.add_node("extract_document", self._extract_document)
+        graph.add_node("postprocess_ocr_text", self._postprocess_ocr_text)
+        graph.add_node("glm_ocr_escalation", self._glm_ocr_escalation)
         graph.add_node("describe_pictures", self._describe_pictures)
         graph.add_node("persist_document_structure", self._persist_document_structure)
         graph.add_node("rebuild_index", self._rebuild_index)
@@ -44,8 +50,11 @@ class PdfIngestGraphRunner:
                 "end": END,
             },
         )
-        graph.add_edge("mark_processing", "extract_document")
-        graph.add_edge("extract_document", "describe_pictures")
+        graph.add_edge("mark_processing", "assess_ocr_strategy")
+        graph.add_edge("assess_ocr_strategy", "extract_document")
+        graph.add_edge("extract_document", "postprocess_ocr_text")
+        graph.add_edge("postprocess_ocr_text", "glm_ocr_escalation")
+        graph.add_edge("glm_ocr_escalation", "describe_pictures")
         graph.add_edge("describe_pictures", "persist_document_structure")
         graph.add_edge("persist_document_structure", "rebuild_index")
         graph.add_edge("rebuild_index", "complete_job")
@@ -81,12 +90,49 @@ class PdfIngestGraphRunner:
         self.repository.mark_processing(state["db"], job=state["job"], paper=state["paper"])
         return {}
 
+    def _assess_ocr_strategy(self, state: PaperJobGraphState) -> dict[str, Any]:
+        file_path = state.get("file_path")
+        if file_path is None:
+            return {"ocr_strategy": build_default_routing_decision(reason="missing_file_path")}
+        return {"ocr_strategy": assess_document_text_layer(file_path)}
+
     def _extract_document(self, state: PaperJobGraphState) -> dict[str, Any]:
         db = state["db"]
         paper_helpers.raise_if_cancel_requested(db, state["job"], state["paper"])
-        document = (state.get("extractor") or build_document_extractor()).extract(state["file_path"])
+        extractor = state.get("extractor") or build_document_extractor(ocr_strategy=state.get("ocr_strategy"))
+        document = extractor.extract(state["file_path"])
         paper_helpers.raise_if_cancel_requested(db, state["job"], state["paper"])
         return {"document": document}
+
+    def _postprocess_ocr_text(self, state: PaperJobGraphState) -> dict[str, Any]:
+        db = state["db"]
+        paper_helpers.raise_if_cancel_requested(db, state["job"], state["paper"])
+        postprocessor = state.get("ocr_postprocessor") or build_ocr_postprocessor()
+        document = postprocessor.process(
+            document=state["document"],
+            pdf_path=state["file_path"],
+            ocr_strategy=state.get("ocr_strategy"),
+        )
+        paper_helpers.raise_if_cancel_requested(db, state["job"], state["paper"])
+        return {
+            "document": document,
+            "ocr_postprocess_stats": dict(document.metadata.get("ocr_postprocess") or {}),
+        }
+
+    def _glm_ocr_escalation(self, state: PaperJobGraphState) -> dict[str, Any]:
+        db = state["db"]
+        paper_helpers.raise_if_cancel_requested(db, state["job"], state["paper"])
+        processor = state.get("ocr_escalation_processor") or build_ocr_escalation_processor()
+        document = processor.process(
+            document=state["document"],
+            pdf_path=state["file_path"],
+            ocr_strategy=state.get("ocr_strategy"),
+        )
+        paper_helpers.raise_if_cancel_requested(db, state["job"], state["paper"])
+        return {
+            "document": document,
+            "ocr_escalation_stats": dict(document.metadata.get("ocr_escalation") or {}),
+        }
 
     def _describe_pictures(self, state: PaperJobGraphState) -> dict[str, Any]:
         db = state["db"]
@@ -107,6 +153,9 @@ class PdfIngestGraphRunner:
         metadata = dict(asset.metadata_json or {})
         metadata["extraction"] = {
             **document.extraction_metadata(),
+            "ocr_strategy": state["ocr_strategy"].to_metadata() if state.get("ocr_strategy") is not None else None,
+            "ocr_postprocess": state.get("ocr_postprocess_stats") or dict(document.metadata.get("ocr_postprocess") or {}),
+            "ocr_escalation": state.get("ocr_escalation_stats") or dict(document.metadata.get("ocr_escalation") or {}),
             "picture_vlm": {
                 "provider": legacy_papers.settings.picture_vlm_provider,
                 "model": legacy_papers.settings.picture_vlm_model,
@@ -143,6 +192,8 @@ class PdfIngestGraphRunner:
         session_factory: Callable[[], Session] = SessionLocal,
         extractor: DocumentExtractor | None = None,
         picture_adapter: PictureDescriptionAdapter | None = None,
+        ocr_postprocessor: OcrPostprocessor | None = None,
+        ocr_escalation_processor: OcrEscalationProcessor | None = None,
     ) -> int | None:
         db = session_factory()
         state: PaperJobGraphState = {
@@ -150,6 +201,8 @@ class PdfIngestGraphRunner:
             "job_id": job_id,
             "extractor": extractor,
             "picture_adapter": picture_adapter,
+            "ocr_postprocessor": ocr_postprocessor,
+            "ocr_escalation_processor": ocr_escalation_processor,
         }
         try:
             result = self._graph.invoke(state)
@@ -407,12 +460,16 @@ class PaperWorkflowService:
         session_factory: Callable[[], Session] = SessionLocal,
         extractor: DocumentExtractor | None = None,
         picture_adapter: PictureDescriptionAdapter | None = None,
+        ocr_postprocessor: OcrPostprocessor | None = None,
+        ocr_escalation_processor: OcrEscalationProcessor | None = None,
     ) -> int | None:
         return self.pdf_ingest.run(
             job_id,
             session_factory=session_factory,
             extractor=extractor,
             picture_adapter=picture_adapter,
+            ocr_postprocessor=ocr_postprocessor,
+            ocr_escalation_processor=ocr_escalation_processor,
         )
 
     def run_paper_summary_job(

@@ -14,6 +14,7 @@ from app.services.document_extraction import (
     ExtractedPicture,
     ExtractedTable,
 )
+from app.services.ocr.quality import OcrRoutingDecision
 
 
 def _label_name(item: Any) -> str | None:
@@ -125,6 +126,9 @@ def _picture_image_bytes(item: Any, doc: Any) -> bytes | None:
 
 
 class DoclingDocumentExtractor:
+    def __init__(self, *, ocr_strategy: OcrRoutingDecision | None = None) -> None:
+        self.ocr_strategy = ocr_strategy
+
     def extract(self, pdf_path: Path) -> ExtractedDocument:
         started = time.monotonic()
         try:
@@ -145,7 +149,7 @@ class DoclingDocumentExtractor:
         if settings.docling_document_timeout_seconds > 0:
             pipeline_options.document_timeout = float(settings.docling_document_timeout_seconds)
 
-        ocr_engine = (settings.docling_ocr_engine or "").strip().lower()
+        ocr_engine = self._resolve_docling_ocr_engine()
         languages = [item.strip() for item in (settings.docling_ocr_languages or "").split(",") if item.strip()]
         if ocr_engine == "easyocr":
             pipeline_options.ocr_options = EasyOcrOptions(lang=languages or ["ch_sim", "en"])
@@ -156,7 +160,7 @@ class DoclingDocumentExtractor:
         elif ocr_engine == "tesseract":
             pipeline_options.ocr_options = TesseractCliOcrOptions(lang=languages or ["chi_sim", "eng"])
         if pipeline_options.ocr_options is not None and hasattr(pipeline_options.ocr_options, "force_full_page_ocr"):
-            pipeline_options.ocr_options.force_full_page_ocr = settings.docling_force_full_page_ocr
+            pipeline_options.ocr_options.force_full_page_ocr = self._resolve_force_full_page_ocr()
 
         converter = DocumentConverter(
             format_options={
@@ -183,14 +187,16 @@ class DoclingDocumentExtractor:
             "engine": "docling",
             "docling_do_ocr": settings.docling_do_ocr,
             "docling_do_table_structure": settings.docling_do_table_structure,
-            "docling_ocr_engine": settings.docling_ocr_engine,
+            "docling_ocr_engine": ocr_engine,
             "docling_ocr_languages": languages,
-            "docling_force_full_page_ocr": settings.docling_force_full_page_ocr,
+            "docling_force_full_page_ocr": self._resolve_force_full_page_ocr(),
             "docling_generate_picture_images": settings.docling_generate_picture_images,
             "docling_images_scale": settings.docling_images_scale,
             "elapsed_ms": elapsed_ms,
             "model_cache": model_cache_metadata(),
         }
+        if self.ocr_strategy is not None:
+            metadata["ocr_strategy"] = self.ocr_strategy.to_metadata()
         return ExtractedDocument(
             markdown_text=markdown_text,
             metadata=metadata,
@@ -367,7 +373,8 @@ class DoclingDocumentExtractor:
             )
         return tables
 
-    def _extract_pictures(self, doc: Any, context_rows: list[dict[str, Any]]) -> list[ExtractedPicture]:
+    def _extract_pictures(self, doc: Any, context_rows: list[dict[str, Any]] | None = None) -> list[ExtractedPicture]:
+        context_rows = context_rows or []
         pictures: list[ExtractedPicture] = []
         used_indexes: set[int] = set()
         for index, picture in enumerate(getattr(doc, "pictures", []) or []):
@@ -400,8 +407,18 @@ class DoclingDocumentExtractor:
             )
         return pictures
 
+    def _resolve_docling_ocr_engine(self) -> str:
+        if self.ocr_strategy is not None:
+            return str(self.ocr_strategy.docling_ocr_engine or "").strip().lower() or "rapidocr"
+        return (settings.docling_ocr_engine or "").strip().lower()
 
-def build_document_extractor() -> DoclingDocumentExtractor:
+    def _resolve_force_full_page_ocr(self) -> bool:
+        if self.ocr_strategy is not None:
+            return bool(self.ocr_strategy.force_full_page_ocr)
+        return bool(settings.docling_force_full_page_ocr)
+
+
+def build_document_extractor(*, ocr_strategy: OcrRoutingDecision | None = None) -> DoclingDocumentExtractor:
     if settings.document_extractor != "docling":
         raise RuntimeError(f"Unsupported document extractor: {settings.document_extractor}")
-    return DoclingDocumentExtractor()
+    return DoclingDocumentExtractor(ocr_strategy=ocr_strategy)

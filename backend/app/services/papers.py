@@ -650,6 +650,8 @@ def run_pdf_ingest_job(
     session_factory: Callable[[], Session] = SessionLocal,
     extractor: DocumentExtractor | None = None,
     picture_adapter: PictureDescriptionAdapter | None = None,
+    ocr_postprocessor=None,
+    ocr_escalation_processor=None,
 ) -> int | None:
     from app.services.paper_pipeline.workflow import get_paper_workflow_service
 
@@ -658,6 +660,8 @@ def run_pdf_ingest_job(
         session_factory=session_factory,
         extractor=extractor,
         picture_adapter=picture_adapter,
+        ocr_postprocessor=ocr_postprocessor,
+        ocr_escalation_processor=ocr_escalation_processor,
     )
 
 

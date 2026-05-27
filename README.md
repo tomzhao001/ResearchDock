@@ -128,12 +128,16 @@ celery -A app.celery_app.celery_app worker --loglevel=info
 - 当前实现使用 Docling 作为唯一 PDF 抽取管线，并将页、块、表格、图片结构写入数据库。
 - 图片/图表描述默认通过 GLM-4.6V 视觉模型完成；未配置 `PICTURE_VLM_API_KEY` 时不会阻塞整篇文档解析。
 - 本机运行 worker 时，请确认 `redis-server` 已启动。
-- 默认 `DOCLING_OCR_ENGINE=easyocr` 时，`requirements.txt` 使用 `docling[easyocr]` 安装 EasyOCR；若此前只装过 `docling==2.94.0`，需补装：`pip install "docling[easyocr]==2.94.0"` 或 `pip install easyocr`。
+- 当前默认 OCR 栈为 `Docling + RapidOCR -> SymSpell + medical-wordlist + 自定义规则校验 -> GLM-OCR escalation`；`Docling` 继续负责版面与结构化输出，`GLM-OCR` 仅处理少量可疑文本块的远程升级识别。
+- `requirements.txt` 现在额外包含 `symspellpy`；若需要兼容 `EasyOCR` fallback，仍保留 `docling[easyocr]`。
 - 若 PDF 自带 text layer 质量很差、会把中文论文解析成整篇乱码，可设置 `DOCLING_FORCE_FULL_PAGE_OCR=true`，强制用整页 OCR 覆盖嵌入文字层。
+- 推荐同时开启 `OCR_QUALITY_ROUTING_ENABLED=true`，让 worker 在抽样页检测到 `toxic_text_layer` 时自动切换到更强的 OCR 路径。
+- `OCR_MEDICAL_WORDLIST_PATH` 可指向医学词表目录（自动合并目录下全部 `.txt`）或单个词表文件。留空时使用 `backend/resources/medical-wordlist/research-core.txt` 作为默认词表；可用 `python -m scripts.build_medical_wordlist` 从 [CodeSante/medical-wordlist](https://github.com/CodeSante/medical-wordlist) 清洗导出完整词库到 `data/models/medical-wordlist/`。
+- `OCR_ESCALATION_ENABLED` / `OCR_ESCALATION_PROVIDER` / `GLM_OCR_*` 控制远程 OCR escalation；当前首个 provider 为 `glm_ocr`，后续可替换成别的 OCR 服务。
 - 若需把图片裁剪结果继续送入 GLM-4.6V 做图表描述，请设置 `DOCLING_GENERATE_PICTURE_IMAGES=true`；`DOCLING_IMAGES_SCALE` 控制导出图片分辨率，默认 `2.0`。
 - **模型缓存卷**：Compose 下 `celery-worker` 挂载命名卷 `model_cache` → 容器内 `/data/models`。通过 `.env` 配置 `MODEL_CACHE_PATH`、`DOCLING_ARTIFACTS_PATH`、`EASYOCR_MODULE_PATH`、`HF_HOME`（后三项可留空，自动落在根目录子路径）。首次解析仍会下载模型，但会写入该卷，**重建容器后无需重复下载**。
 - 本机开发可在 `.env` 设置 `MODEL_CACHE_PATH=./data/models`，目录已加入 `.gitignore`。
-- 若不想装 EasyOCR，可将 `DOCLING_OCR_ENGINE` 改为 `rapidocr`（需 `pip install rapidocr onnxruntime`）或 `tesseract`（需系统安装 Tesseract）。
+- 默认 `DOCLING_OCR_ENGINE=rapidocr` 作为 Docling 内部 fallback；如需兼容老行为，可改回 `easyocr`，或切到 `tesseract`（需系统安装 Tesseract）。
 - 若已配置 `OPENAI_*` 环境变量，worker 会在文本提取完成后继续生成中文摘要与结构化信息。
 
 ### 4. 启动前端（Next.js）
@@ -413,9 +417,13 @@ docker compose logs -f frontend
 - `OPENAI_TIMEOUT_SECONDS` / `OPENAI_VERIFY_SSL`：控制聊天与摘要请求的超时和证书校验。
 - `DOCUMENT_EXTRACTOR`：当前固定为 `docling`，用于 PDF 文档解析。
 - `DOCLING_DO_OCR` / `DOCLING_DO_TABLE_STRUCTURE`：控制 Docling OCR 与表格结构识别步骤。
-- `DOCLING_OCR_ENGINE` / `DOCLING_OCR_LANGUAGES`：控制 Docling 标准管线中的 OCR 引擎与语言；默认 `easyocr` 依赖 `docling[easyocr]`（见 `requirements.txt`），非 `docling` 主包自带。
+- `DOCLING_OCR_ENGINE` / `DOCLING_OCR_LANGUAGES`：控制 Docling 标准管线中的 fallback OCR 引擎与语言；默认使用 `rapidocr`，兼容兜底仍支持 `easyocr` / `tesseract`。
 - `DOCLING_FORCE_FULL_PAGE_OCR`：是否强制整页 OCR 并覆盖 PDF 原有文字层；对“内嵌 text layer 有毒、默认解析成乱码”的中文 PDF 更有帮助，但会更依赖 OCR 质量。
 - `DOCLING_GENERATE_PICTURE_IMAGES` / `DOCLING_IMAGES_SCALE`：控制 Docling 是否导出图片裁剪结果，以及导出图片分辨率；启用后会把图片 bytes 继续传入当前 GLM 图片描述接口。
+- `OCR_QUALITY_ROUTING_ENABLED` / `OCR_QUALITY_SAMPLE_PAGES`：控制 text layer 抽样判断与自动 OCR 路由。
+- `OCR_POSTPROCESS_ENABLED` / `OCR_SYMSPELL_ENABLED` / `OCR_RULES_ENABLED`：控制 OCR 后处理节点是否启用以及启用哪些修复层。
+- `OCR_ESCALATION_ENABLED` / `OCR_ESCALATION_PROVIDER` / `GLM_OCR_*`：控制后置 OCR escalation provider；默认 provider 为 `glm_ocr`。
+- `OCR_MEDICAL_WORDLIST_PATH`：可选的医学词表路径；可填目录（自动读取其下全部 `.txt`）或单个 `.txt` 文件。留空则读取 `backend/resources/medical-wordlist/research-core.txt`；可用 `python -m scripts.build_medical_wordlist` 导出完整词库。
 - `MODEL_CACHE_PATH` / `DOCLING_ARTIFACTS_PATH` / `EASYOCR_MODULE_PATH` / `HF_HOME`：Docling、EasyOCR、Hugging Face 模型缓存目录；生产建议挂载持久卷（见 `docker-compose.yml` 中 `model_cache`）。
 - `PICTURE_VLM_*`：图片/图表描述模型配置，默认使用 GLM-4.6V；API key 不会写入任务元数据。
 - 生产环境若走 HTTPS，请将 `COOKIE_SECURE` 设为 `true`。

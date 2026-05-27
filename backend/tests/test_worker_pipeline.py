@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.models import Job, PaperAsset, PaperChunk, PaperDocumentBlock, PaperDocumentPage, PaperDocumentPicture, PaperDocumentTable
 from app.services.document_extraction import ExtractedBlock, ExtractedDocument, ExtractedPage, ExtractedPicture, ExtractedTable
+from app.services.paper_pipeline.rendering import render_document_text
 from app.services.papers import create_upload_artifacts, run_pdf_ingest_job
 from app.services.vision.base import PictureDescriptionRequest, PictureDescriptionResult
 
@@ -129,6 +130,32 @@ class FakePictureAdapter:
         )
 
 
+class FakeOcrEscalationProcessor:
+    def process(self, *, document: ExtractedDocument, pdf_path: Path, ocr_strategy=None) -> ExtractedDocument:
+        _ = pdf_path
+        _ = ocr_strategy
+        document.blocks[1].text = "GLM OCR corrected paragraph."
+        document.blocks[1].metadata = {
+            "ocr_escalation": {
+                "provider": "fake_glm_ocr",
+                "accepted": True,
+                "reason": "unit_test_candidate",
+            }
+        }
+        document.markdown_text = render_document_text(document)
+        document.metadata["ocr_escalation"] = {
+            "escalation_enabled": True,
+            "provider": "fake_glm_ocr",
+            "available": True,
+            "attempted_block_count": 1,
+            "accepted_block_count": 1,
+            "skipped_block_count": 0,
+            "error_block_count": 0,
+            "disabled_reason": None,
+        }
+        return document
+
+
 def make_pdf_payload() -> bytes:
     return b"%PDF-1.7\n% fake test payload\n"
 
@@ -151,6 +178,7 @@ def test_worker_persists_docling_structure_and_picture_descriptions(
         session_factory=session_factory,
         extractor=FakeDoclingExtractor(),
         picture_adapter=FakePictureAdapter(),
+        ocr_escalation_processor=FakeOcrEscalationProcessor(),
     )
 
     job = db_session.get(Job, artifacts.job_id)
@@ -171,12 +199,17 @@ def test_worker_persists_docling_structure_and_picture_descriptions(
     assert asset.metadata_json["extraction"]["block_count"] == 2
     assert asset.metadata_json["extraction"]["table_count"] == 1
     assert asset.metadata_json["extraction"]["picture_count"] == 1
+    assert asset.metadata_json["extraction"]["ocr_strategy"]["source"] == "default"
+    assert asset.metadata_json["extraction"]["ocr_postprocess"]["postprocess_enabled"] is True
+    assert asset.metadata_json["extraction"]["ocr_escalation"]["provider"] == "fake_glm_ocr"
+    assert asset.metadata_json["extraction"]["ocr_escalation"]["accepted_block_count"] == 1
     assert len(pages) == 1
     assert len(blocks) == 2
     assert len(tables) == 1
     assert len(pictures) == 1
     assert blocks[0].block_type == "heading"
     assert blocks[0].reading_order == 0
+    assert blocks[1].text == "GLM OCR corrected paragraph."
     assert blocks[1].section_path == "Abstract"
     assert tables[0].section_path == "Abstract"
     assert tables[0].reading_order == 2
@@ -219,6 +252,7 @@ def test_worker_reparse_replaces_existing_structure(
         session_factory=session_factory,
         extractor=FakeDoclingExtractor(),
         picture_adapter=FakePictureAdapter(),
+        ocr_escalation_processor=FakeOcrEscalationProcessor(),
     )
     reparse_job = Job(job_type="pdf_ingest", paper_id=artifacts.paper_id, status="queued")
     db_session.add(reparse_job)
@@ -230,6 +264,7 @@ def test_worker_reparse_replaces_existing_structure(
         session_factory=session_factory,
         extractor=SecondFakeDoclingExtractor(),
         picture_adapter=FakePictureAdapter(),
+        ocr_escalation_processor=FakeOcrEscalationProcessor(),
     )
 
     asset = db_session.scalar(select(PaperAsset).where(PaperAsset.paper_id == artifacts.paper_id))
@@ -264,6 +299,7 @@ def test_worker_marks_job_failed_when_docling_errors(
             session_factory=session_factory,
             extractor=FailingDoclingExtractor(),
             picture_adapter=FakePictureAdapter(),
+            ocr_escalation_processor=FakeOcrEscalationProcessor(),
         )
 
     job = db_session.get(Job, artifacts.job_id)
@@ -290,6 +326,7 @@ def test_worker_marks_job_cancelled_when_cancel_requested(
         session_factory=session_factory,
         extractor=CancellingDoclingExtractor(session_factory=session_factory, job_id=artifacts.job_id),
         picture_adapter=FakePictureAdapter(),
+        ocr_escalation_processor=FakeOcrEscalationProcessor(),
     )
 
     job = db_session.get(Job, artifacts.job_id)

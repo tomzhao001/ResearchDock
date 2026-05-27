@@ -16,8 +16,13 @@ class PaperJobGraphState(TypedDict, total=False):
     asset: PaperAsset
     extractor: Any
     picture_adapter: Any
+    ocr_postprocessor: Any
+    ocr_escalation_processor: Any
     document: Any
     file_path: Path
+    ocr_strategy: Any
+    ocr_postprocess_stats: dict[str, Any]
+    ocr_escalation_stats: dict[str, Any]
     paper_text: str
     structured_summary: dict[str, Any] | None
     summary: dict[str, Any]
