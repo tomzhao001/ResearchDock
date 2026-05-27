@@ -16,15 +16,23 @@ from app.services.chat_rag.repository import ChatTopicRepository
 from app.services.chat_rag import retrieval as retrieval_ops
 from app.services.chat_rag import routing as routing_ops
 from app.services.chat_rag.state import ChatRagGraphState
+from app.services.chat_rag import synthesis as synthesis_ops
 
 
 @dataclass
 class ChatRouteService:
     def plan(self, state: ChatRagGraphState) -> dict[str, Any]:
-        route_plan = routing_ops.build_route_plan(state["message"])
-        return {"route_plan": route_plan}
+        route_plan = routing_ops.build_route_plan(state["message"], records=state["records"])
+        return {
+            "route_plan": route_plan,
+            "intent_family": route_plan.get("intent_family"),
+            "answer_shape": route_plan.get("answer_shape"),
+            "engine_candidates": route_plan.get("candidates"),
+            "conversation_context": route_plan.get("conversation_context"),
+            "metadata_query_plan": route_plan.get("metadata_query_plan") if isinstance(route_plan.get("metadata_query_plan"), dict) else None,
+        }
 
-    def route(self, state: ChatRagGraphState) -> dict[str, Any]:
+    def rule_route(self, state: ChatRagGraphState) -> dict[str, Any]:
         progress_callback = state.get("progress_callback")
         route_plan = state.get("route_plan") if isinstance(state.get("route_plan"), dict) else {}
         legacy_rag._emit_chat_progress(
@@ -33,12 +41,55 @@ class ChatRouteService:
             status="started",
             message="正在分析问题类型",
         )
-        route_decision = routing_ops.route_query(state["message"], route_plan=route_plan)
+        route_decision = routing_ops.rule_route(state["message"], route_plan=route_plan)
         engine_name_labels = {
             "rag_engine": "知识库检索回答",
             "metadata_engine": "元数据查询",
             "hybrid_sql_rag_engine": "结构化筛选后检索回答",
         }
+        if not route_decision.low_confidence:
+            legacy_rag._emit_chat_progress(
+                progress_callback,
+                phase="routing",
+                status="finished",
+                message="问题分流完成",
+                detail=engine_name_labels.get(route_decision.engine_name, route_decision.engine_name),
+            )
+        return {
+            "route_decision": route_decision,
+            "engine_name": route_decision.engine_name,
+            "intent_family": route_decision.intent_family,
+            "answer_shape": route_decision.answer_shape,
+            "router_debug": {"rule_route": routing_ops.serialize_route_decision(route_decision)},
+        }
+
+    def selector_route(self, state: ChatRagGraphState) -> dict[str, Any]:
+        progress_callback = state.get("progress_callback")
+        route_plan = state.get("route_plan") if isinstance(state.get("route_plan"), dict) else {}
+        base_decision = state.get("route_decision")
+        legacy_rag._emit_chat_progress(
+            progress_callback,
+            phase="selector",
+            status="started",
+            message="规则置信度不足，正在调用 selector 进一步判断",
+        )
+        route_decision, selector_result = routing_ops.selector_route(
+            state["message"],
+            route_plan=route_plan,
+            base_decision=base_decision if isinstance(base_decision, routing_ops.RouteDecision) else None,
+        )
+        engine_name_labels = {
+            "rag_engine": "知识库检索回答",
+            "metadata_engine": "元数据查询",
+            "hybrid_sql_rag_engine": "结构化筛选后检索回答",
+        }
+        legacy_rag._emit_chat_progress(
+            progress_callback,
+            phase="selector",
+            status="finished",
+            message="selector 判断完成",
+            detail=engine_name_labels.get(route_decision.engine_name, route_decision.engine_name),
+        )
         legacy_rag._emit_chat_progress(
             progress_callback,
             phase="routing",
@@ -49,8 +100,59 @@ class ChatRouteService:
         return {
             "route_decision": route_decision,
             "engine_name": route_decision.engine_name,
-            "metadata_query_plan": route_plan.get("metadata_query_plan") if isinstance(route_plan.get("metadata_query_plan"), dict) else None,
+            "intent_family": route_decision.intent_family,
+            "answer_shape": route_decision.answer_shape,
+            "selector_result": selector_result,
+            "router_debug": {
+                "rule_route": routing_ops.serialize_route_decision(base_decision if isinstance(base_decision, routing_ops.RouteDecision) else None),
+                "selector_route": routing_ops.serialize_route_decision(route_decision),
+            },
         }
+
+
+@dataclass
+class ChatSynthesisService:
+    def normalize(self, state: ChatRagGraphState) -> dict[str, Any]:
+        return {"normalized_engine_output": synthesis_ops.normalize_engine_output(state)}
+
+    def validate(self, state: ChatRagGraphState) -> dict[str, Any]:
+        validation = synthesis_ops.validate_answer_shape(state)
+        router_debug = dict(state.get("router_debug") or {})
+        if validation.get("mismatch"):
+            router_debug["answer_shape_guard"] = {
+                "triggered": True,
+                "expected_answer_shape": validation.get("expected_answer_shape"),
+                "actual_answer_shape": validation.get("actual_answer_shape"),
+                "reroute_engine": validation.get("reroute_engine"),
+            }
+        payload: dict[str, Any] = {"answer_shape_validation": validation, "router_debug": router_debug}
+        if validation.get("mismatch"):
+            reroute_engine = str(validation.get("reroute_engine") or "rag_engine")
+            existing_decision = state.get("route_decision")
+            payload["engine_name"] = reroute_engine
+            payload["draft"] = None
+            if isinstance(existing_decision, routing_ops.RouteDecision):
+                payload["route_decision"] = routing_ops.RouteDecision(
+                    engine_name=reroute_engine,
+                    confidence=existing_decision.confidence,
+                    reason="answer_shape_mismatch_reroute",
+                    fallback_engine=existing_decision.fallback_engine,
+                    decision_source="fallback",
+                    low_confidence=False,
+                    selector_reason=existing_decision.selector_reason,
+                    intent_family=existing_decision.intent_family,
+                    answer_shape=existing_decision.answer_shape,
+                    candidate_scores=existing_decision.candidate_scores,
+                    conversation_scope_used=existing_decision.conversation_scope_used,
+                    rag_followup_query=existing_decision.rag_followup_query,
+                    required_operations=existing_decision.required_operations,
+                    filters=existing_decision.filters,
+                    aggregation=existing_decision.aggregation,
+                )
+        return payload
+
+    def synthesize(self, state: ChatRagGraphState) -> dict[str, Any]:
+        return synthesis_ops.synthesize_result(state)
 
 
 @dataclass
@@ -172,6 +274,12 @@ class RetrievalTraceBuilder:
             "retrieval_query": state["retrieval_query"],
             "route_plan": state.get("route_plan"),
             "route_decision": routing_ops.serialize_route_decision(state.get("route_decision")),
+            "engine_candidates": state.get("engine_candidates"),
+            "selector_result": state.get("selector_result"),
+            "router_debug": state.get("router_debug"),
+            "conversation_context": state.get("conversation_context"),
+            "intent_family": state.get("intent_family"),
+            "answer_shape": state.get("answer_shape"),
             "engine_name": state.get("engine_name") or "rag_engine",
             "query_plan": retrieval_debug.get("query_plan"),
             "retrieval_backend": retrieval_debug.get("retrieval_backend", "unknown"),
@@ -435,6 +543,7 @@ class ChatDraftGraphRunner:
         self.evidence_service = ChatEvidenceService()
         self.trace_builder = RetrievalTraceBuilder()
         self.generation_service = ChatGenerationService()
+        self.synthesis_service = ChatSynthesisService()
         self.metadata_engine = engine_ops.MetadataQueryEngine()
         self.hybrid_engine = engine_ops.HybridScopedRagEngine()
         self._graph = self._build_graph()
@@ -442,7 +551,8 @@ class ChatDraftGraphRunner:
     def _build_graph(self):
         graph = StateGraph(ChatRagGraphState)
         graph.add_node("plan_route", self.route_service.plan)
-        graph.add_node("route_query", self.route_service.route)
+        graph.add_node("rule_route", self.route_service.rule_route)
+        graph.add_node("selector_route", self.route_service.selector_route)
         graph.add_node("run_metadata_engine", self.metadata_engine.run)
         graph.add_node("run_hybrid_prefilter", self.hybrid_engine.prefilter)
         graph.add_node("run_retrieval", self.retrieval_service.run)
@@ -450,11 +560,24 @@ class ChatDraftGraphRunner:
         graph.add_node("build_trace", self.trace_builder.build)
         graph.add_node("generate_answer", self.generation_service.generate)
         graph.add_node("build_insufficient_draft", self.generation_service.build_insufficient_draft)
+        graph.add_node("normalize_output", self.synthesis_service.normalize)
+        graph.add_node("validate_answer_shape", self.synthesis_service.validate)
+        graph.add_node("synthesize_result", self.synthesis_service.synthesize)
         graph.add_node("finalize_draft", self._finalize_draft)
         graph.add_edge(START, "plan_route")
-        graph.add_edge("plan_route", "route_query")
+        graph.add_edge("plan_route", "rule_route")
         graph.add_conditional_edges(
-            "route_query",
+            "rule_route",
+            self._route_after_rule_route,
+            {
+                "selector_route": "selector_route",
+                "run_retrieval": "run_retrieval",
+                "run_metadata_engine": "run_metadata_engine",
+                "run_hybrid_prefilter": "run_hybrid_prefilter",
+            },
+        )
+        graph.add_conditional_edges(
+            "selector_route",
             self._route_after_query,
             {
                 "run_retrieval": "run_retrieval",
@@ -467,10 +590,19 @@ class ChatDraftGraphRunner:
             self._route_after_hybrid_prefilter,
             {
                 "run_retrieval": "run_retrieval",
-                "finalize_draft": "finalize_draft",
+                "normalize_output": "normalize_output",
             },
         )
-        graph.add_edge("run_metadata_engine", "finalize_draft")
+        graph.add_edge("run_metadata_engine", "normalize_output")
+        graph.add_conditional_edges(
+            "validate_answer_shape",
+            self._route_after_answer_shape_validation,
+            {
+                "run_retrieval": "run_retrieval",
+                "run_hybrid_prefilter": "run_hybrid_prefilter",
+                "synthesize_result": "synthesize_result",
+            },
+        )
         graph.add_edge("run_retrieval", "select_evidence")
         graph.add_edge("select_evidence", "build_trace")
         graph.add_conditional_edges(
@@ -481,10 +613,26 @@ class ChatDraftGraphRunner:
                 "build_insufficient_draft": "build_insufficient_draft",
             },
         )
-        graph.add_edge("generate_answer", "finalize_draft")
-        graph.add_edge("build_insufficient_draft", "finalize_draft")
+        graph.add_edge("generate_answer", "normalize_output")
+        graph.add_edge("build_insufficient_draft", "normalize_output")
+        graph.add_conditional_edges(
+            "normalize_output",
+            self._route_after_normalize,
+            {
+                "validate_answer_shape": "validate_answer_shape",
+                "synthesize_result": "synthesize_result",
+            },
+        )
+        graph.add_edge("synthesize_result", "finalize_draft")
         graph.add_edge("finalize_draft", END)
         return graph.compile()
+
+    @staticmethod
+    def _route_after_rule_route(state: ChatRagGraphState) -> str:
+        route_decision = state.get("route_decision")
+        if getattr(route_decision, "low_confidence", False):
+            return "selector_route"
+        return ChatDraftGraphRunner._route_after_query(state)
 
     @staticmethod
     def _route_after_query(state: ChatRagGraphState) -> str:
@@ -498,7 +646,7 @@ class ChatDraftGraphRunner:
     @staticmethod
     def _route_after_hybrid_prefilter(state: ChatRagGraphState) -> str:
         if state.get("draft") is not None:
-            return "finalize_draft"
+            return "normalize_output"
         return "run_retrieval"
 
     @staticmethod
@@ -506,6 +654,21 @@ class ChatDraftGraphRunner:
         if state["selection_result"].sufficiency_decision.get("is_sufficient") and state["selected_evidence"]:
             return "generate_answer"
         return "build_insufficient_draft"
+
+    @staticmethod
+    def _route_after_normalize(state: ChatRagGraphState) -> str:
+        engine_name = str(state.get("engine_name") or "")
+        if engine_name in {"metadata_engine", "hybrid_sql_rag_engine"}:
+            return "validate_answer_shape"
+        return "synthesize_result"
+
+    @staticmethod
+    def _route_after_answer_shape_validation(state: ChatRagGraphState) -> str:
+        validation = state.get("answer_shape_validation") if isinstance(state.get("answer_shape_validation"), dict) else {}
+        if not validation.get("mismatch"):
+            return "synthesize_result"
+        reroute_engine = str(validation.get("reroute_engine") or "rag_engine")
+        return "run_hybrid_prefilter" if reroute_engine == "hybrid_sql_rag_engine" else "run_retrieval"
 
     @staticmethod
     def _finalize_draft(state: ChatRagGraphState) -> dict[str, Any]:
@@ -546,6 +709,14 @@ class ChatDraftGraphRunner:
                 "chat_policy": chat_policy,
             }
         )
+        if "draft" not in result:
+            raise KeyError(
+                "draft missing; "
+                f"keys={sorted(result.keys())}; "
+                f"engine_name={result.get('engine_name')}; "
+                f"route_decision={routing_ops.serialize_route_decision(result.get('route_decision'))}; "
+                f"answer_shape_validation={result.get('answer_shape_validation')}"
+            )
         return result["draft"]
 
 

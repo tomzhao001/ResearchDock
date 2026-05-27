@@ -58,6 +58,10 @@ def _build_followup_query(text: str) -> str | None:
         "讲了什么",
         "内容是什么",
         "总结",
+        "研究结局",
+        "结局变量",
+        "主要结果",
+        "主要发现",
         "what do they study",
         "what are they about",
         "main findings",
@@ -80,6 +84,7 @@ def build_metadata_query_plan(query: str) -> MetadataQueryPlan | None:
     list_patterns = ("有哪些", "列出", "哪些文档", "list", "show me", "which papers", "which documents")
     exists_patterns = ("有没有", "是否有", "exists", "is there", "are there")
     word_count_patterns = ("多少字", "字数", "多少词", "词数", "word count")
+    group_by_patterns = ("按语言", "按状态", "分语言", "分状态", "各语言", "各种状态", "by language", "by status")
     content_followup_patterns = (
         "主要结论",
         "主要研究",
@@ -87,6 +92,10 @@ def build_metadata_query_plan(query: str) -> MetadataQueryPlan | None:
         "讲了什么",
         "内容是什么",
         "总结",
+        "研究结局",
+        "结局变量",
+        "主要结果",
+        "主要发现",
         "what do they study",
         "what are they about",
         "main findings",
@@ -94,35 +103,17 @@ def build_metadata_query_plan(query: str) -> MetadataQueryPlan | None:
         "main conclusions",
         "about what",
     )
-    metadata_hint_patterns = (
-        "中文文档",
-        "英文文档",
-        "doi",
-        "source url",
-        "来源链接",
-        "发表",
-        "published",
-        "status",
-        "论文",
-        "文档",
-        "papers",
-        "documents",
-    )
-
     operation: str | None = None
     if _contains_any(normalized, word_count_patterns):
         operation = "paper_word_count"
     elif _contains_any(normalized, count_patterns):
         operation = "count"
+    elif _contains_any(normalized, group_by_patterns):
+        operation = "group_by_small_enum"
     elif _contains_any(normalized, list_patterns):
         operation = "list"
     elif _contains_any(normalized, exists_patterns):
         operation = "exists"
-
-    if operation is None and not _contains_any(normalized, metadata_hint_patterns):
-        return None
-    if operation is None:
-        operation = "list"
 
     filters: dict[str, Any] = {}
     lowered = normalized.lower()
@@ -132,16 +123,42 @@ def build_metadata_query_plan(query: str) -> MetadataQueryPlan | None:
         filters["language"] = "en"
 
     years = _extract_years(normalized)
-    if years:
+    if len(years) >= 2:
+        filters["published_year_from"] = min(years)
+        filters["published_year_to"] = max(years)
+    elif years:
         filters["published_year"] = years[0]
     if _contains_any(normalized, ("doi 缺失", "没有 doi", "无 doi", "missing doi", "without doi")):
         filters["doi_missing"] = True
     if _contains_any(normalized, ("source url 缺失", "来源链接缺失", "没有 source url", "missing source url", "without source url")):
         filters["source_url_missing"] = True
+    if _contains_any(normalized, ("按语言", "分语言", "各语言", "by language")):
+        filters["group_by"] = "language"
+    elif _contains_any(normalized, ("按状态", "分状态", "各种状态", "by status")):
+        filters["group_by"] = "status"
+    status_filters: list[str] = []
+    if _contains_any(normalized, ("已完成", "完成", "completed")):
+        status_filters.append("completed")
+    if _contains_any(normalized, ("处理中", "processing")):
+        status_filters.append("processing")
+    if _contains_any(normalized, ("失败", "failed")):
+        status_filters.append("failed")
+    if status_filters:
+        filters["status_in"] = sorted(set(status_filters))
 
     wants_content_followup = _contains_any(normalized, content_followup_patterns)
     followup_query = _build_followup_query(normalized) if wants_content_followup else None
     title_hint = _extract_title_hint(normalized)
+    if title_hint:
+        filters["title_hint"] = title_hint
+    has_structured_filters = bool(filters)
+    if operation is None:
+        if wants_content_followup and has_structured_filters:
+            operation = "filter_scope"
+        elif has_structured_filters:
+            operation = "filter_scope"
+        else:
+            return None
     return MetadataQueryPlan(
         operation=operation,
         filters=filters,
@@ -201,11 +218,36 @@ def _apply_filters(rows: list[tuple[Paper, PaperAsset | None]], *, filters: dict
             for paper, asset in filtered
             if isinstance(paper.published_at, datetime) and paper.published_at.year == published_year
         ]
+    year_from = filters.get("published_year_from")
+    if isinstance(year_from, int):
+        filtered = [
+            (paper, asset)
+            for paper, asset in filtered
+            if isinstance(paper.published_at, datetime) and paper.published_at.year >= year_from
+        ]
+    year_to = filters.get("published_year_to")
+    if isinstance(year_to, int):
+        filtered = [
+            (paper, asset)
+            for paper, asset in filtered
+            if isinstance(paper.published_at, datetime) and paper.published_at.year <= year_to
+        ]
 
     if filters.get("doi_missing"):
         filtered = [(paper, asset) for paper, asset in filtered if not str(paper.doi or "").strip()]
     if filters.get("source_url_missing"):
         filtered = [(paper, asset) for paper, asset in filtered if not str(paper.source_url or "").strip()]
+    status_in = [str(item).strip() for item in filters.get("status_in", []) if str(item).strip()]
+    if status_in:
+        allowed = set(status_in)
+        filtered = [(paper, asset) for paper, asset in filtered if str(paper.status or "").strip() in allowed]
+    title_hint = str(filters.get("title_hint") or "").strip().lower()
+    if title_hint:
+        filtered = [
+            (paper, asset)
+            for paper, asset in filtered
+            if title_hint in str(paper.title or "").strip().lower()
+        ]
     return filtered
 
 
@@ -241,6 +283,10 @@ def _format_list_answer(items: list[dict[str, Any]], *, filters: dict[str, Any])
         prefix_parts.append("英文")
     if isinstance(filters.get("published_year"), int):
         prefix_parts.append(f"{filters['published_year']} 年")
+    year_from = filters.get("published_year_from")
+    year_to = filters.get("published_year_to")
+    if isinstance(year_from, int) and isinstance(year_to, int):
+        prefix_parts.append(f"{year_from}-{year_to} 年")
     prefix = "".join(prefix_parts)
     lines = [f"{prefix}匹配文档如下：" if prefix else "匹配文档如下："]
     for item in items:
@@ -286,6 +332,31 @@ def execute_metadata_query(db: Session, *, organization_id: int, plan: MetadataQ
     items = [_paper_item(paper, asset) for paper, asset in filtered_rows[: plan.limit]]
     paper_ids = tuple(int(item["paper_id"]) for item in items)
     total_count = len(filtered_rows)
+    if plan.operation == "group_by_small_enum":
+        group_key = str(plan.filters.get("group_by") or "language")
+        bucket: dict[str, int] = {}
+        for paper, asset in filtered_rows:
+            if group_key == "language":
+                key = _infer_paper_language(paper, asset) or "unknown"
+            else:
+                key = str(paper.status or "unknown").strip() or "unknown"
+            bucket[key] = bucket.get(key, 0) + 1
+        sorted_items = [{"group": key, "count": value} for key, value in sorted(bucket.items(), key=lambda item: (-item[1], item[0]))]
+        answer = "\n".join([f"按{group_key}统计：", *[f"- {item['group']}: {item['count']} 篇" for item in sorted_items]]) if sorted_items else "按当前条件未找到匹配文档。"
+        return MetadataQueryResult(
+            answer=answer,
+            total_count=total_count,
+            items=tuple(sorted_items),
+            paper_ids=paper_ids,
+            trace={
+                "plan": _serialize_plan(plan),
+                "matched_paper_ids": list(paper_ids),
+                "operation": plan.operation,
+                "group_key": group_key,
+                "total_count": total_count,
+                "items": sorted_items,
+            },
+        )
     if plan.operation == "count":
         answer = f"按当前条件，共找到 {total_count} 篇文档。"
     elif plan.operation == "exists":
@@ -317,6 +388,19 @@ def _serialize_plan(plan: MetadataQueryPlan) -> dict[str, Any]:
         "followup_query": plan.followup_query,
         "title_hint": plan.title_hint,
     }
+
+
+def deserialize_metadata_query_plan(payload: dict[str, Any] | None) -> MetadataQueryPlan | None:
+    if not isinstance(payload, dict):
+        return None
+    return MetadataQueryPlan(
+        operation=str(payload.get("operation") or "list"),
+        filters=dict(payload.get("filters") or {}),
+        limit=int(payload.get("limit") or 8),
+        wants_content_followup=bool(payload.get("wants_content_followup")),
+        followup_query=str(payload.get("followup_query") or "") or None,
+        title_hint=str(payload.get("title_hint") or "") or None,
+    )
 
 
 def serialize_metadata_query_plan(plan: MetadataQueryPlan | None) -> dict[str, Any] | None:

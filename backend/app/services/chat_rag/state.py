@@ -19,7 +19,12 @@ class ChatRagGraphState(TypedDict, total=False):
     selection_started_at: float
     chat_policy: Any
     route_plan: dict[str, Any]
+    intent_family: str
+    answer_shape: str
+    conversation_context: dict[str, Any]
+    engine_candidates: list[dict[str, Any]]
     route_decision: Any
+    selector_result: dict[str, Any]
     engine_name: str
     engine_inputs: dict[str, Any]
     engine_result: dict[str, Any]
@@ -30,6 +35,9 @@ class ChatRagGraphState(TypedDict, total=False):
     metadata_query_result: dict[str, Any]
     paper_scope_ids: list[int]
     retrieval_query_override: str
+    normalized_engine_output: dict[str, Any]
+    answer_shape_validation: dict[str, Any]
+    synthesis_result: dict[str, Any]
     retrieval_query: str
     candidate_limit: int
     retrieval_debug: dict[str, Any]

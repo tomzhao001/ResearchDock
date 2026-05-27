@@ -32,6 +32,11 @@ def _base_trace(
         "route_plan": route_plan,
         "route_decision": serialize_route_decision(route_decision),
         "engine_name": engine_name,
+        "intent_family": state.get("intent_family"),
+        "answer_shape": state.get("answer_shape"),
+        "selector_result": state.get("selector_result"),
+        "engine_candidates": state.get("engine_candidates"),
+        "conversation_context": state.get("conversation_context"),
         "verifier_result": None,
     }
 
@@ -41,7 +46,9 @@ class MetadataQueryEngine:
         progress_callback = state.get("progress_callback")
         route_plan = state.get("route_plan") if isinstance(state.get("route_plan"), dict) else None
         route_decision = state.get("route_decision")
-        metadata_plan = metadata_query.build_metadata_query_plan(state["message"])
+        metadata_plan = metadata_query.deserialize_metadata_query_plan(state.get("metadata_query_plan"))
+        if metadata_plan is None:
+            metadata_plan = metadata_query.build_metadata_query_plan(state["message"])
         if metadata_plan is None:
             return {}
 
@@ -94,7 +101,33 @@ class HybridScopedRagEngine:
         progress_callback = state.get("progress_callback")
         route_plan = state.get("route_plan") if isinstance(state.get("route_plan"), dict) else None
         route_decision = state.get("route_decision")
-        metadata_plan = metadata_query.build_metadata_query_plan(state["message"])
+        metadata_plan = metadata_query.deserialize_metadata_query_plan(state.get("metadata_query_plan"))
+        if metadata_plan is None:
+            metadata_plan = metadata_query.build_metadata_query_plan(state["message"])
+        conversation_context = state.get("conversation_context") if isinstance(state.get("conversation_context"), dict) else {}
+        conversation_scope_ids = [int(item) for item in conversation_context.get("paper_scope_ids", []) if str(item).isdigit()]
+        followup_query = (
+            route_decision.rag_followup_query
+            if isinstance(route_decision, RouteDecision) and route_decision.rag_followup_query
+            else state["message"]
+        )
+        if metadata_plan is None and conversation_scope_ids:
+            engine_result = {
+                "structured_phase": {
+                    "source": "conversation_context",
+                    "paper_ids": list(conversation_scope_ids),
+                },
+                "scoped_rag_phase": {
+                    "paper_scope_ids": list(conversation_scope_ids),
+                    "retrieval_query_override": followup_query,
+                },
+            }
+            return {
+                "engine_name": "hybrid_sql_rag_engine",
+                "engine_result": engine_result,
+                "paper_scope_ids": list(conversation_scope_ids),
+                "retrieval_query_override": followup_query,
+            }
         if metadata_plan is None:
             return {}
 
@@ -116,13 +149,20 @@ class HybridScopedRagEngine:
             route_decision=route_decision if isinstance(route_decision, RouteDecision) else None,
         )
         base_trace["metadata_query_plan"] = metadata_query.serialize_metadata_query_plan(metadata_plan)
-        base_trace["engine_execution"] = metadata_query.serialize_metadata_query_result(result)
         followup_query = (
             route_decision.rag_followup_query
             if isinstance(route_decision, RouteDecision) and route_decision.rag_followup_query
             else metadata_plan.followup_query
             or state["message"]
         )
+        engine_result = {
+            "structured_phase": metadata_query.serialize_metadata_query_result(result),
+            "scoped_rag_phase": {
+                "paper_scope_ids": list(result.paper_ids),
+                "retrieval_query_override": followup_query,
+            },
+        }
+        base_trace["engine_execution"] = engine_result
 
         if not result.paper_ids:
             base_trace["answer_mode"] = "metadata_query"
@@ -146,7 +186,7 @@ class HybridScopedRagEngine:
                 "draft": draft,
                 "engine_name": "hybrid_sql_rag_engine",
                 "metadata_query_plan": metadata_query.serialize_metadata_query_plan(metadata_plan),
-                "engine_result": metadata_query.serialize_metadata_query_result(result),
+                "engine_result": engine_result,
             }
 
         legacy_rag._emit_chat_progress(
@@ -159,7 +199,7 @@ class HybridScopedRagEngine:
         return {
             "engine_name": "hybrid_sql_rag_engine",
             "metadata_query_plan": metadata_query.serialize_metadata_query_plan(metadata_plan),
-            "engine_result": metadata_query.serialize_metadata_query_result(result),
+            "engine_result": engine_result,
             "paper_scope_ids": list(result.paper_ids),
             "retrieval_query_override": followup_query,
         }
