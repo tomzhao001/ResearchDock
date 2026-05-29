@@ -12,6 +12,65 @@ from app.models import Paper, PaperAsset
 from app.services import rag as legacy_rag
 from app.services.paper_pipeline.rendering import render_paper_text_from_structure
 
+COUNT_PATTERNS = ("有几个", "多少篇", "多少个文档", "几篇", "几份", "how many", "count")
+LIST_PATTERNS = ("有哪些", "列出", "哪些文档", "list", "show me", "which papers", "which documents")
+EXISTS_PATTERNS = ("有没有", "是否有", "exists", "is there", "are there")
+WORD_COUNT_PATTERNS = ("多少字", "字数", "多少词", "词数", "word count")
+GROUP_BY_PATTERNS = ("按语言", "按状态", "分语言", "分状态", "各语言", "各种状态", "by language", "by status")
+SUMMARY_PATTERNS = ("总结", "概括", "综述", "overview", "summarize", "summary")
+COMPARISON_PATTERNS = ("比较", "区别", "差异", "对比", "相比", "compare", "difference", "comparison")
+COLLECTION_SCOPE_PATTERNS = ("文档", "论文", "papers", "documents", "studies")
+CONTENT_FOLLOWUP_PATTERNS = (
+    "主要结论",
+    "主要研究",
+    "研究什么",
+    "讲了什么",
+    "内容是什么",
+    "主要内容",
+    "主要内容是什么",
+    "主要研究什么",
+    "研究结局",
+    "结局变量",
+    "指标是什么",
+    "这些研究的指标",
+    "主要结果",
+    "主要发现",
+    "研究发现",
+    "研究设计",
+    "设计是什么",
+    "研究方法",
+    "what do they study",
+    "what do these papers study",
+    "what do those papers study",
+    "what are they about",
+    "main findings",
+    "main conclusion",
+    "main conclusions",
+    "study design",
+    "main outcome",
+    "main outcomes",
+    "about what",
+)
+CONTENT_BEARING_PATTERNS = CONTENT_FOLLOWUP_PATTERNS + (
+    "结果",
+    "终点",
+    "指标",
+    "变量",
+    "机制",
+    "effect",
+    "effects",
+    "outcome",
+    "outcomes",
+    "endpoint",
+    "endpoints",
+    "result",
+    "results",
+    "finding",
+    "findings",
+    "conclusion",
+    "conclusions",
+)
+
 
 @dataclass(frozen=True)
 class MetadataQueryPlan:
@@ -45,38 +104,63 @@ def _extract_title_hint(text: str) -> str | None:
     quoted_match = re.search(r"[\"'“”‘’《](.+?)[\"'“”‘’》]", text or "")
     if quoted_match:
         hint = str(quoted_match.group(1) or "").strip()
-        return hint or None
+        if not hint:
+            return None
+        if len(hint) >= 6 or any(char.isdigit() for char in hint) or " " in hint:
+            return hint
+        return None
     return None
+
+
+def _has_collection_scope_request(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", (text or "").strip()).lower()
+    return _contains_any(normalized, COLLECTION_SCOPE_PATTERNS)
+
+
+def _should_apply_year_filter(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", (text or "").strip()).lower()
+    if not normalized:
+        return False
+    year_scope_patterns = (
+        "近三年",
+        "最近三年",
+        "近两年",
+        "最近两年",
+        "近一年",
+        "最近一年",
+        "published in",
+        "published between",
+        "papers from",
+        "papers in",
+        "年论文",
+        "年的论文",
+        "年文档",
+        "年的文档",
+    )
+    return _contains_any(normalized, year_scope_patterns) or _has_collection_scope_request(normalized)
+
+
+def detect_content_intent_family(text: str) -> str | None:
+    normalized = re.sub(r"\s+", " ", (text or "").strip()).lower()
+    if not normalized:
+        return None
+    if _contains_any(normalized, COMPARISON_PATTERNS):
+        return "comparison"
+    if _contains_any(normalized, SUMMARY_PATTERNS):
+        return "summary"
+    if _contains_any(normalized, CONTENT_BEARING_PATTERNS):
+        return "content_extraction"
+    return None
+
+
+def has_strong_content_intent(text: str) -> bool:
+    return detect_content_intent_family(text) is not None
 
 
 def _build_followup_query(text: str) -> str | None:
     segments = [segment.strip() for segment in re.split(r"[?？!！。；;]", text or "") if segment.strip()]
-    followup_patterns = (
-        "主要结论",
-        "主要研究",
-        "研究什么",
-        "讲了什么",
-        "内容是什么",
-        "主要内容",
-        "主要内容是什么",
-        "主要研究什么",
-        "总结",
-        "研究结局",
-        "结局变量",
-        "指标是什么",
-        "这些研究的指标",
-        "主要结果",
-        "主要发现",
-        "这些论文主要发现",
-        "what do they study",
-        "what are they about",
-        "main findings",
-        "main conclusion",
-        "main conclusions",
-        "about what",
-    )
     for segment in reversed(segments):
-        if _contains_any(segment, followup_patterns):
+        if _contains_any(segment, CONTENT_FOLLOWUP_PATTERNS):
             return segment
     return None
 
@@ -86,45 +170,16 @@ def build_metadata_query_plan(query: str) -> MetadataQueryPlan | None:
     if not normalized:
         return None
 
-    count_patterns = ("有几个", "多少篇", "多少个文档", "几篇", "几份", "how many", "count")
-    list_patterns = ("有哪些", "列出", "哪些文档", "list", "show me", "which papers", "which documents")
-    exists_patterns = ("有没有", "是否有", "exists", "is there", "are there")
-    word_count_patterns = ("多少字", "字数", "多少词", "词数", "word count")
-    group_by_patterns = ("按语言", "按状态", "分语言", "分状态", "各语言", "各种状态", "by language", "by status")
-    content_followup_patterns = (
-        "主要结论",
-        "主要研究",
-        "研究什么",
-        "讲了什么",
-        "内容是什么",
-        "主要内容",
-        "主要内容是什么",
-        "主要研究什么",
-        "总结",
-        "研究结局",
-        "结局变量",
-        "指标是什么",
-        "这些研究的指标",
-        "主要结果",
-        "主要发现",
-        "这些论文主要发现",
-        "what do they study",
-        "what are they about",
-        "main findings",
-        "main conclusion",
-        "main conclusions",
-        "about what",
-    )
     operation: str | None = None
-    if _contains_any(normalized, word_count_patterns):
+    if _contains_any(normalized, WORD_COUNT_PATTERNS):
         operation = "paper_word_count"
-    elif _contains_any(normalized, count_patterns):
+    elif _contains_any(normalized, COUNT_PATTERNS):
         operation = "count"
-    elif _contains_any(normalized, group_by_patterns):
+    elif _contains_any(normalized, GROUP_BY_PATTERNS):
         operation = "group_by_small_enum"
-    elif _contains_any(normalized, list_patterns):
+    elif _contains_any(normalized, LIST_PATTERNS):
         operation = "list"
-    elif _contains_any(normalized, exists_patterns):
+    elif _contains_any(normalized, EXISTS_PATTERNS):
         operation = "exists"
 
     filters: dict[str, Any] = {}
@@ -135,11 +190,12 @@ def build_metadata_query_plan(query: str) -> MetadataQueryPlan | None:
         filters["language"] = "en"
 
     years = _extract_years(normalized)
-    if len(years) >= 2:
-        filters["published_year_from"] = min(years)
-        filters["published_year_to"] = max(years)
-    elif years:
-        filters["published_year"] = years[0]
+    if years and _should_apply_year_filter(normalized):
+        if len(years) >= 2:
+            filters["published_year_from"] = min(years)
+            filters["published_year_to"] = max(years)
+        else:
+            filters["published_year"] = years[0]
     if _contains_any(normalized, ("doi 缺失", "没有 doi", "无 doi", "missing doi", "without doi")):
         filters["doi_missing"] = True
     if _contains_any(normalized, ("source url 缺失", "来源链接缺失", "没有 source url", "missing source url", "without source url")):
@@ -158,14 +214,25 @@ def build_metadata_query_plan(query: str) -> MetadataQueryPlan | None:
     if status_filters:
         filters["status_in"] = sorted(set(status_filters))
 
-    wants_content_followup = _contains_any(normalized, content_followup_patterns)
+    wants_content_followup = _contains_any(normalized, CONTENT_FOLLOWUP_PATTERNS)
     followup_query = _build_followup_query(normalized) if wants_content_followup else None
+    content_intent_family = detect_content_intent_family(normalized)
+    has_content_intent = content_intent_family is not None
     title_hint = _extract_title_hint(normalized)
     if title_hint:
         filters["title_hint"] = title_hint
     has_structured_filters = bool(filters)
+    if has_content_intent and operation != "paper_word_count":
+        if has_structured_filters:
+            operation = "filter_scope"
+            wants_content_followup = True
+            followup_query = followup_query or normalized
+        elif operation in {"count", "list", "exists", "group_by_small_enum"}:
+            return None
+    if operation in {"count", "list", "exists"} and not has_structured_filters and not _has_collection_scope_request(normalized):
+        return None
     if operation is None:
-        if wants_content_followup and has_structured_filters:
+        if (wants_content_followup or has_content_intent) and has_structured_filters:
             operation = "filter_scope"
         elif has_structured_filters:
             operation = "filter_scope"

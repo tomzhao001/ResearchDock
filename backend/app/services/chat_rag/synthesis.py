@@ -50,7 +50,13 @@ def validate_answer_shape(state: ChatRagGraphState) -> dict[str, Any]:
     engine_name = str(normalized.get("engine_name") or state.get("engine_name") or "rag_engine")
     intent_family = str(state.get("intent_family") or "rag")
     metadata_query_plan = state.get("metadata_query_plan") if isinstance(state.get("metadata_query_plan"), dict) else {}
-    mismatch = expected == "paragraph" and actual in {"list", "scalar"} and engine_name == "metadata_engine"
+    content_bearing_metadata = engine_name == "metadata_engine" and (
+        intent_family in {"content_extraction", "summary", "comparison"}
+        or bool(metadata_query_plan.get("wants_content_followup"))
+    )
+    mismatch = engine_name == "metadata_engine" and actual in {"list", "scalar"} and (
+        expected == "paragraph" or content_bearing_metadata
+    )
     reroute_engine = None
     if mismatch:
         if (

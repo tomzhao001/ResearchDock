@@ -39,55 +39,13 @@ class RouteDecision:
     aggregation: str | None = None
 
 
-_COUNT_HINTS = ("有几个", "多少篇", "多少个文档", "几篇", "几份", "how many", "count")
-_LIST_HINTS = ("有哪些", "列出", "哪些文档", "清单", "list", "show me", "which papers", "which documents")
-_EXISTS_HINTS = ("有没有", "是否有", "exists", "is there", "are there")
-_WORD_COUNT_HINTS = ("多少字", "字数", "多少词", "词数", "word count")
-_SUMMARY_HINTS = ("总结", "概括", "综述", "overview", "summarize", "summary")
-_COMPARISON_HINTS = ("比较", "区别", "差异", "对比", "compare", "difference")
-_CONTENT_HINTS = (
-    "是什么",
-    "为什么",
-    "如何",
-    "研究什么",
-    "讲了什么",
-    "主要研究",
-    "主要研究什么",
-    "主要内容",
-    "主要内容是什么",
-    "研究结局",
-    "结局变量",
-    "终点",
-    "指标",
-    "变量",
-    "结果",
-    "主要结论",
-    "主要发现",
-    "研究发现",
-    "主要结果",
-    "研究内容",
-    "机制",
-    "outcome",
-    "outcomes",
-    "endpoint",
-    "endpoints",
-    "variable",
-    "variables",
-    "findings",
-    "result",
-    "results",
-    "conclusion",
-    "conclusions",
-    "what is",
-    "what are",
-    "what do",
-    "what does",
-    "why",
-    "how",
-    "which",
-    "explain",
-    "describe",
-)
+_COUNT_HINTS = metadata_query.COUNT_PATTERNS
+_LIST_HINTS = metadata_query.LIST_PATTERNS + ("清单",)
+_EXISTS_HINTS = metadata_query.EXISTS_PATTERNS
+_WORD_COUNT_HINTS = metadata_query.WORD_COUNT_PATTERNS
+_SUMMARY_HINTS = metadata_query.SUMMARY_PATTERNS
+_COMPARISON_HINTS = metadata_query.COMPARISON_PATTERNS
+_CONTENT_HINTS = metadata_query.CONTENT_BEARING_PATTERNS
 _CONVERSATION_SCOPE_HINTS = ("这些论文", "这些文档", "这些研究", "上述论文", "上面这些论文", "these papers", "these documents", "those papers")
 
 
@@ -125,21 +83,26 @@ def _contains_any(text: str, patterns: tuple[str, ...]) -> bool:
     return any(pattern in lowered for pattern in patterns)
 
 
-def _infer_intent_family(query: str) -> str:
+def _infer_intent_family(query: str, *, metadata_plan: metadata_query.MetadataQueryPlan | None = None) -> str:
     normalized = legacy_rag._normalize_query_text(query).lower()
+    content_intent_family = metadata_query.detect_content_intent_family(normalized)
+    if metadata_plan is not None and metadata_plan.wants_content_followup and content_intent_family:
+        return content_intent_family
     if _contains_any(normalized, _WORD_COUNT_HINTS):
         return "single_paper_stats"
-    if _contains_any(normalized, _COUNT_HINTS):
-        return "count"
-    if _contains_any(normalized, _EXISTS_HINTS):
-        return "exists"
     if _contains_any(normalized, _COMPARISON_HINTS):
         return "comparison"
     if _contains_any(normalized, _SUMMARY_HINTS):
         return "summary"
-    if _contains_any(normalized, _CONTENT_HINTS):
+    if content_intent_family == "content_extraction" or _contains_any(normalized, _CONTENT_HINTS):
         return "content_extraction"
+    if _contains_any(normalized, _COUNT_HINTS):
+        return "count"
+    if _contains_any(normalized, _EXISTS_HINTS):
+        return "exists"
     if _contains_any(normalized, _LIST_HINTS):
+        return "list"
+    if metadata_plan is not None and metadata_plan.operation in {"filter_scope", "list"} and not metadata_plan.wants_content_followup:
         return "list"
     return "rag"
 
@@ -198,7 +161,7 @@ def _extract_conversation_context(records: list[ChatMessage]) -> dict[str, Any]:
 def build_route_plan(query: str, *, records: list[ChatMessage] | None = None) -> dict[str, Any]:
     metadata_plan = metadata_query.build_metadata_query_plan(query)
     candidates = build_engine_candidates()
-    intent_family = _infer_intent_family(query)
+    intent_family = _infer_intent_family(query, metadata_plan=metadata_plan)
     answer_shape = _answer_shape_for_intent(intent_family)
     conversation_context = _extract_conversation_context(records or [])
     return {
@@ -227,7 +190,7 @@ def deserialize_metadata_plan(plan_payload: dict[str, Any] | None) -> metadata_q
 def rule_route(query: str, *, route_plan: dict[str, Any] | None = None) -> RouteDecision:
     route_plan = route_plan if isinstance(route_plan, dict) else {}
     metadata_plan = metadata_query.build_metadata_query_plan(query) or deserialize_metadata_plan(route_plan.get("metadata_query_plan"))
-    intent_family = str(route_plan.get("intent_family") or _infer_intent_family(query))
+    intent_family = str(route_plan.get("intent_family") or _infer_intent_family(query, metadata_plan=metadata_plan))
     answer_shape = str(route_plan.get("answer_shape") or _answer_shape_for_intent(intent_family))
     conversation_context = route_plan.get("conversation_context") if isinstance(route_plan.get("conversation_context"), dict) else {}
     paper_scope_ids = [int(item) for item in conversation_context.get("paper_scope_ids", []) if str(item).isdigit()]
@@ -237,6 +200,9 @@ def rule_route(query: str, *, route_plan: dict[str, Any] | None = None) -> Route
         query=query,
         intent_family=intent_family,
         metadata_plan=metadata_plan,
+    )
+    content_bearing_metadata = metadata_plan is not None and (
+        metadata_plan.wants_content_followup or intent_family in {"content_extraction", "summary", "comparison"}
     )
 
     if conversation_scope_used and content_followup:
@@ -251,7 +217,7 @@ def rule_route(query: str, *, route_plan: dict[str, Any] | None = None) -> Route
             required_operations=("conversation_scope", "rag_followup"),
         )
 
-    if metadata_plan is not None and metadata_plan.operation in {"count", "exists", "paper_word_count"}:
+    if metadata_plan is not None and metadata_plan.operation in {"count", "exists", "paper_word_count"} and not content_bearing_metadata:
         return RouteDecision(
             engine_name="metadata_engine",
             confidence=0.96,
@@ -278,7 +244,7 @@ def rule_route(query: str, *, route_plan: dict[str, Any] | None = None) -> Route
                 filters=dict(metadata_plan.filters),
                 aggregation=metadata_plan.operation,
             )
-        if metadata_plan.operation == "list" and intent_family == "list":
+        if metadata_plan.operation == "list" and intent_family == "list" and not content_bearing_metadata:
             return RouteDecision(
                 engine_name="metadata_engine",
                 confidence=0.91,
@@ -293,14 +259,14 @@ def rule_route(query: str, *, route_plan: dict[str, Any] | None = None) -> Route
         if metadata_plan.operation == "filter_scope":
             return RouteDecision(
                 engine_name="hybrid_sql_rag_engine",
-                confidence=0.58,
-                reason="metadata_filter_scope_needs_selector",
+                confidence=0.84 if content_bearing_metadata else 0.58,
+                reason="metadata_content_scope_to_hybrid" if content_bearing_metadata else "metadata_filter_scope_needs_selector",
                 decision_source="rules",
-                low_confidence=True,
+                low_confidence=not content_bearing_metadata,
                 intent_family=intent_family,
-                answer_shape=answer_shape,
+                answer_shape="paragraph" if content_bearing_metadata else answer_shape,
                 rag_followup_query=metadata_plan.followup_query,
-                required_operations=("metadata_query",),
+                required_operations=("metadata_query", "rag_followup") if content_bearing_metadata else ("metadata_query",),
                 filters=dict(metadata_plan.filters),
                 aggregation=metadata_plan.operation,
             )

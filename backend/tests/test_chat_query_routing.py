@@ -305,6 +305,31 @@ def test_selector_low_confidence_falls_back_to_rag_unit(monkeypatch) -> None:
     assert decision.reason == "selector_low_confidence_fallback"
 
 
+def test_route_prefers_hybrid_for_count_query_with_content_followup_unit() -> None:
+    route_plan = routing.build_route_plan("有多少篇英文论文，这些论文的主要结论是什么？")
+    decision = routing.rule_route("有多少篇英文论文，这些论文的主要结论是什么？", route_plan=route_plan)
+    assert decision.engine_name == "hybrid_sql_rag_engine"
+    assert decision.reason in {"metadata_query_with_content_followup", "metadata_content_scope_to_hybrid"}
+    assert decision.low_confidence is False
+    assert decision.answer_shape == "paragraph"
+
+
+def test_route_prefers_hybrid_for_list_query_with_content_intent_unit() -> None:
+    route_plan = routing.build_route_plan("列出 2024 年英文论文，并比较主要结果。")
+    decision = routing.rule_route("列出 2024 年英文论文，并比较主要结果。", route_plan=route_plan)
+    assert decision.engine_name == "hybrid_sql_rag_engine"
+    assert decision.reason in {"metadata_query_with_content_followup", "metadata_content_scope_to_hybrid"}
+    assert decision.answer_shape == "paragraph"
+
+
+def test_route_uses_rag_for_exists_query_with_content_intent_and_no_scope_unit() -> None:
+    route_plan = routing.build_route_plan("有没有论文报告主要结果？")
+    decision = routing.rule_route("有没有论文报告主要结果？", route_plan=route_plan)
+    assert route_plan["metadata_query_plan"] is None
+    assert decision.engine_name == "rag_engine"
+    assert decision.reason == "content_intent_to_rag"
+
+
 def test_route_uses_hybrid_for_chinese_conversation_scope_summary_followup() -> None:
     route_plan = {
         "intent_family": "rag",
