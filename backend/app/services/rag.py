@@ -5,7 +5,7 @@ import logging
 import re
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -193,8 +193,15 @@ class ChatAttributionPolicy:
     min_support_score: float
     min_total_support_score: float
     verifier_min_support_score: float
+    verifier_min_claim_coverage: float
+    verifier_requires_claim_coverage: bool
+    verifier_negative_answer_guard: str
+    verifier_partial_answer_strictness: str
     llm_insufficient_hard_gate: bool
     allow_fallback_generation: bool
+    allow_partial_answer: bool
+    partial_min_support_score: float
+    partial_min_total_support_score: float
 
 
 ChatProgressCallback = Callable[[str, str, str, str | None], None]
@@ -205,8 +212,15 @@ STRICT_CHAT_ATTRIBUTION_POLICY = ChatAttributionPolicy(
     min_support_score=settings.rag_attribution_min_support_score,
     min_total_support_score=settings.rag_attribution_min_total_support_score,
     verifier_min_support_score=settings.rag_attribution_verifier_min_support_score,
+    verifier_min_claim_coverage=1.0,
+    verifier_requires_claim_coverage=True,
+    verifier_negative_answer_guard="strict",
+    verifier_partial_answer_strictness="strict",
     llm_insufficient_hard_gate=True,
     allow_fallback_generation=False,
+    allow_partial_answer=False,
+    partial_min_support_score=settings.rag_attribution_min_support_score,
+    partial_min_total_support_score=settings.rag_attribution_min_total_support_score,
 )
 
 RELAXED_CHAT_ATTRIBUTION_POLICY = ChatAttributionPolicy(
@@ -214,9 +228,84 @@ RELAXED_CHAT_ATTRIBUTION_POLICY = ChatAttributionPolicy(
     min_support_score=0.45,
     min_total_support_score=0.75,
     verifier_min_support_score=0.35,
+    verifier_min_claim_coverage=0.7,
+    verifier_requires_claim_coverage=True,
+    verifier_negative_answer_guard="balanced",
+    verifier_partial_answer_strictness="balanced",
     llm_insufficient_hard_gate=True,
     allow_fallback_generation=True,
+    allow_partial_answer=False,
+    partial_min_support_score=0.45,
+    partial_min_total_support_score=0.75,
 )
+
+
+def _scene_policy_name(base_name: str, scene: str) -> str:
+    return f"{base_name}_{scene}"
+
+
+def derive_chat_attribution_policy(
+    base_policy: ChatAttributionPolicy,
+    *,
+    intent_family: str | None,
+    has_history: bool,
+) -> ChatAttributionPolicy:
+    normalized_intent = str(intent_family or "").strip().lower()
+    if has_history and normalized_intent in {"rag", "content_extraction", "summary", "comparison"}:
+        return replace(
+            base_policy,
+            name=_scene_policy_name(base_policy.name, "followup_balanced"),
+            min_support_score=max(0.45, base_policy.min_support_score - 0.05),
+            min_total_support_score=max(0.65, base_policy.min_total_support_score - 0.15),
+            verifier_min_support_score=max(base_policy.verifier_min_support_score, 0.45),
+            verifier_min_claim_coverage=max(base_policy.verifier_min_claim_coverage, 0.6),
+            verifier_requires_claim_coverage=True,
+            verifier_negative_answer_guard="strict",
+            verifier_partial_answer_strictness="strict",
+            llm_insufficient_hard_gate=False,
+            allow_partial_answer=True,
+            partial_min_support_score=max(0.4, base_policy.min_support_score - 0.1),
+            partial_min_total_support_score=max(0.55, base_policy.min_total_support_score - 0.25),
+        )
+    if normalized_intent in {"summary", "comparison"}:
+        return replace(
+            base_policy,
+            name=_scene_policy_name(base_policy.name, "synthesis_balanced"),
+            min_support_score=max(0.45, base_policy.min_support_score - 0.05),
+            min_total_support_score=max(0.7, base_policy.min_total_support_score - 0.12),
+            verifier_min_support_score=max(base_policy.verifier_min_support_score, 0.45),
+            verifier_min_claim_coverage=max(base_policy.verifier_min_claim_coverage, 0.7),
+            verifier_requires_claim_coverage=False,
+            verifier_negative_answer_guard="balanced",
+            verifier_partial_answer_strictness="balanced",
+            llm_insufficient_hard_gate=False,
+            allow_partial_answer=True,
+            partial_min_support_score=max(0.4, base_policy.min_support_score - 0.1),
+            partial_min_total_support_score=max(0.6, base_policy.min_total_support_score - 0.2),
+        )
+    return replace(
+        base_policy,
+        name=_scene_policy_name(base_policy.name, "factual_strict"),
+        verifier_min_support_score=max(base_policy.verifier_min_support_score, 0.5),
+        verifier_min_claim_coverage=1.0,
+        verifier_requires_claim_coverage=True,
+        verifier_negative_answer_guard="strict",
+        verifier_partial_answer_strictness="strict",
+    )
+
+
+def get_chat_attribution_policy(
+    *,
+    relaxed_chat_rag: bool,
+    intent_family: str | None,
+    has_history: bool,
+) -> ChatAttributionPolicy:
+    base_policy = RELAXED_CHAT_ATTRIBUTION_POLICY if relaxed_chat_rag else STRICT_CHAT_ATTRIBUTION_POLICY
+    return derive_chat_attribution_policy(
+        base_policy,
+        intent_family=intent_family,
+        has_history=has_history,
+    )
 
 
 def _normalize_title(title: str | None) -> str:

@@ -134,6 +134,7 @@ class Settings(BaseSettings):
     glm_ocr_max_retries: int = 1
     glm_ocr_verify_ssl: bool = True
     model_cache_path: Path = _REPO_ROOT / "data" / "models"
+    model_cache_auto_download: bool = False
     docling_artifacts_path: str = ""
     easyocr_module_path: str = ""
     hf_home: str = ""

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-import re
 from typing import Any
 
 from langgraph.graph import END, START, StateGraph
@@ -34,14 +33,34 @@ def _sanitize_generation_answer(answer: str) -> str:
         return normalized
     if not _has_substantive_answer(normalized):
         return normalized
-    sanitized = re.sub(r"知识库中未找到确切依据[。；;，,\s]*", "", normalized, count=1).strip()
+    sanitized = legacy_rag.re.sub(r"知识库中未找到确切依据[。；;，,\s]*", "", normalized, count=1).strip()
     return sanitized or normalized
+
+
+def _build_verifier_history_excerpt(records: list[ChatMessage], *, limit: int = 4) -> list[dict[str, str]]:
+    excerpt: list[dict[str, str]] = []
+    for record in records[-limit:]:
+        if record.role not in {"user", "assistant"}:
+            continue
+        excerpt.append(
+            {
+                "role": record.role,
+                "content": legacy_rag._preview_log_text(record.content or "", limit=180),
+            }
+        )
+    return excerpt
 
 
 @dataclass
 class ChatRouteService:
     def plan(self, state: ChatRagGraphState) -> dict[str, Any]:
         route_plan = routing_ops.build_route_plan(state["message"], records=state["records"])
+        has_history = any(record.role == "assistant" for record in state["records"])
+        chat_policy = legacy_rag.get_chat_attribution_policy(
+            relaxed_chat_rag=bool(state.get("relaxed_chat_rag")),
+            intent_family=str(route_plan.get("intent_family") or ""),
+            has_history=has_history,
+        )
         return {
             "route_plan": route_plan,
             "intent_family": route_plan.get("intent_family"),
@@ -49,6 +68,7 @@ class ChatRouteService:
             "engine_candidates": route_plan.get("candidates"),
             "conversation_context": route_plan.get("conversation_context"),
             "metadata_query_plan": route_plan.get("metadata_query_plan") if isinstance(route_plan.get("metadata_query_plan"), dict) else None,
+            "chat_policy": chat_policy,
         }
 
     def rule_route(self, state: ChatRagGraphState) -> dict[str, Any]:
@@ -322,13 +342,26 @@ class RetrievalTraceBuilder:
             },
             "sufficiency_decision": selection_result.sufficiency_decision,
             "verifier_result": None,
-            "answer_mode": "knowledge_base" if selection_result.sufficiency_decision.get("is_sufficient") else "kb_insufficient_evidence",
+            "answer_mode": (
+                "knowledge_base"
+                if selection_result.sufficiency_decision.get("should_generate_answer")
+                else "kb_insufficient_evidence"
+            ),
             "chat_response_policy": {
                 "name": state["chat_policy"].name,
                 "allow_fallback_generation": state["chat_policy"].allow_fallback_generation,
+                "allow_partial_answer": state["chat_policy"].allow_partial_answer,
                 "llm_insufficient_hard_gate": state["chat_policy"].llm_insufficient_hard_gate,
                 "verifier_min_support_score": state["chat_policy"].verifier_min_support_score,
+                "verifier_min_claim_coverage": state["chat_policy"].verifier_min_claim_coverage,
+                "verifier_requires_claim_coverage": state["chat_policy"].verifier_requires_claim_coverage,
+                "verifier_negative_answer_guard": state["chat_policy"].verifier_negative_answer_guard,
+                "verifier_partial_answer_strictness": state["chat_policy"].verifier_partial_answer_strictness,
+                "partial_min_support_score": state["chat_policy"].partial_min_support_score,
+                "partial_min_total_support_score": state["chat_policy"].partial_min_total_support_score,
             },
+            "verifier_policy_name": state["chat_policy"].name,
+            "verifier_failure_mode": None,
             "response_kind": None,
             "attribution_status": None,
             "status_message": None,
@@ -354,6 +387,17 @@ class ChatGenerationService:
         topic = state["topic"]
         selection_result = state["selection_result"]
         chat_policy = state["chat_policy"]
+        partial_answer_mode = bool(selection_result.sufficiency_decision.get("is_partially_sufficient"))
+        query_plan = retrieval_debug.get("query_plan") if isinstance(retrieval_debug.get("query_plan"), dict) else {}
+        verifier_context = {
+            "policy_name": chat_policy.name,
+            "partial_answer_mode": partial_answer_mode,
+            "expected_abstention_like_query": evidence_ops.is_abstention_like_query(message, query_plan),
+            "conversation_context": state.get("conversation_context") if isinstance(state.get("conversation_context"), dict) else {},
+            "conversation_history_excerpt": _build_verifier_history_excerpt(records),
+            "answer_shape": state.get("answer_shape"),
+            "intent_family": state.get("intent_family"),
+        }
 
         generation_started_at = time.perf_counter()
         evidence_text = legacy_rag._build_evidence_prompt_text(selected_evidence)
@@ -390,7 +434,8 @@ class ChatGenerationService:
                             "请先从证据中抽取可以直接支持回答的 claim，再生成最终答案。\n"
                             "只允许使用下列证据支持的内容，避免补充证据中没有的结论。\n"
                             "如果证据只足以支持部分内容，请优先回答能被证据支持的部分，并明确标注暂时无法确认的部分。\n"
-                            "仅当没有任何证据可以支持回答时，才明确说明“知识库中未找到确切依据”。\n\n"
+                            "仅当没有任何证据可以支持回答时，才明确说明“知识库中未找到确切依据”。\n"
+                            f"partial_answer_mode: {partial_answer_mode}\n\n"
                             f"{evidence_text}"
                         ),
                     },
@@ -420,23 +465,89 @@ class ChatGenerationService:
             verifier_result = evidence_ops.verify_grounded_answer(
                 question=message,
                 answer=answer,
-                query_plan=retrieval_debug.get("query_plan") if isinstance(retrieval_debug.get("query_plan"), dict) else {},
+                query_plan=query_plan,
                 selected_evidence=selected_evidence,
                 selection_result=selection_result,
+                policy=chat_policy,
+                verifier_context=verifier_context,
             )
+            verifier_result = dict(verifier_result)
+            verifier_negative_guard = bool(
+                verifier_context.get("expected_abstention_like_query")
+                and verifier_result.get("abstention_recommended")
+            )
+            non_negative_partial_safe = bool(
+                not verifier_context.get("expected_abstention_like_query")
+                and chat_policy.allow_partial_answer
+                and evidence_ops.has_explicit_uncertainty_marker(answer or "")
+                and str(verifier_result.get("failure_mode") or "") == "abstention_like_negative_answer"
+                and float(verifier_result.get("support_score") or 0.0) >= max(0.35, chat_policy.verifier_min_support_score - 0.1)
+            )
+            if non_negative_partial_safe:
+                verifier_result["supported"] = True
+                verifier_result["abstention_recommended"] = False
+                verifier_result["failure_mode"] = "none"
+            if verifier_negative_guard:
+                verifier_result["supported"] = False
+                verifier_result["support_score"] = round(
+                    min(float(verifier_result.get("support_score") or 0.0), max(0.0, chat_policy.verifier_min_support_score - 0.1)),
+                    4,
+                )
+                verifier_result["failure_mode"] = str(
+                    verifier_result.get("failure_mode") or "abstention_like_negative_answer"
+                )
             retrieval_trace["verifier_result"] = verifier_result
             hard_abstain = "知识库中未找到确切依据" in (answer or "") and not _has_substantive_answer(answer or "")
-            use_abstain_path = (
+            abstention_like_negative_answer = bool(
+                verifier_context.get("expected_abstention_like_query")
+                and evidence_ops.is_negative_evidence_answer(answer or "")
+            )
+            verifier_claim_coverage_low = (
+                chat_policy.verifier_requires_claim_coverage
+                and float(verifier_result.get("claim_coverage") or 0.0) < chat_policy.verifier_min_claim_coverage
+            )
+            hard_abstain_recoverable = bool(
                 hard_abstain
-                or not verifier_result.get("supported")
+                and not verifier_context.get("expected_abstention_like_query")
+                and chat_policy.allow_partial_answer
+                and selected_evidence
+                and verifier_result.get("supported")
+                and float(verifier_result.get("support_score") or 0.0) >= chat_policy.verifier_min_support_score
+            )
+            verifier_guided_partial_recoverable = bool(
+                not verifier_context.get("expected_abstention_like_query")
+                and chat_policy.allow_partial_answer
+                and selected_evidence
+                and not verifier_result.get("supported")
+                and not verifier_negative_guard
+                and not abstention_like_negative_answer
+                and not verifier_result.get("unsupported_claims")
+                and bool(verifier_result.get("missing_claims"))
+                and float(verifier_result.get("support_score") or 0.0) >= max(0.35, chat_policy.verifier_min_support_score - 0.1)
+            )
+            use_abstain_path = (
+                (hard_abstain and not hard_abstain_recoverable)
+                or abstention_like_negative_answer
+                or verifier_negative_guard
+                or (not verifier_result.get("supported") and not verifier_guided_partial_recoverable)
+                or (verifier_claim_coverage_low and not verifier_guided_partial_recoverable)
                 or float(verifier_result.get("support_score") or 0.0) < chat_policy.verifier_min_support_score
             )
             if hard_abstain:
-                fallback_reason = "generation_abstained"
+                fallback_reason = "verifier_guided_partial_answer" if hard_abstain_recoverable else "generation_abstained"
+            elif abstention_like_negative_answer:
+                fallback_reason = "abstention_like_negative_answer"
+            elif verifier_negative_guard:
+                fallback_reason = str(verifier_result.get("failure_mode") or "verifier_abstention_recommended")
+            elif verifier_guided_partial_recoverable:
+                fallback_reason = "verifier_guided_partial_answer"
             elif not verifier_result.get("supported"):
-                fallback_reason = "verifier_rejected"
+                fallback_reason = str(verifier_result.get("failure_mode") or "verifier_rejected")
+            elif verifier_claim_coverage_low:
+                fallback_reason = str(verifier_result.get("failure_mode") or "verifier_claim_coverage_low")
             elif float(verifier_result.get("support_score") or 0.0) < chat_policy.verifier_min_support_score:
-                fallback_reason = "verifier_low_support"
+                fallback_reason = str(verifier_result.get("failure_mode") or "verifier_low_support")
+            retrieval_trace["verifier_failure_mode"] = fallback_reason
             legacy_rag._emit_chat_progress(
                 progress_callback,
                 phase="verification",
@@ -470,7 +581,27 @@ class ChatGenerationService:
             )
             use_abstain_path = True
             fallback_reason = "generation_failed"
-        if use_abstain_path and chat_policy.allow_fallback_generation:
+        if hard_abstain_recoverable or verifier_guided_partial_recoverable:
+            regenerated_answer, regenerated_model = generation_ops.generate_fallback_chat_answer(
+                records=records,
+                message=message,
+                selected_evidence=selected_evidence,
+                selection_result=selection_result,
+                retrieval_debug=retrieval_debug,
+                fallback_reason="verifier_guided_partial_answer",
+                prior_answer=answer,
+                progress_callback=progress_callback,
+            )
+            final_answer = regenerated_answer
+            final_citations = citations
+            final_model = regenerated_model or model
+            answer_mode = "knowledge_base"
+            used_knowledge_base = True
+            retrieval_trace["fallback_mode"] = "verifier_guided_partial_answer"
+            retrieval_trace["fallback_reason"] = "verifier_guided_partial_answer"
+            retrieval_trace["fallback_model"] = regenerated_model
+            retrieval_trace["fallback_used"] = True
+        elif use_abstain_path and chat_policy.allow_fallback_generation:
             fallback_mode = generation_ops.classify_fallback_mode(
                 selected_evidence=selected_evidence,
                 fallback_reason=fallback_reason or "fallback_requested",
@@ -708,7 +839,7 @@ class ChatDraftGraphRunner:
 
     @staticmethod
     def _route_after_trace(state: ChatRagGraphState) -> str:
-        if state["selection_result"].sufficiency_decision.get("is_sufficient") and state["selected_evidence"]:
+        if state["selection_result"].sufficiency_decision.get("should_generate_answer") and state["selected_evidence"]:
             return "generate_answer"
         return "build_insufficient_draft"
 
@@ -748,10 +879,10 @@ class ChatDraftGraphRunner:
         progress_callback: legacy_rag.ChatProgressCallback | None = None,
         relaxed_chat_rag: bool = False,
     ) -> legacy_rag.AssistantMessageDraft:
-        chat_policy = (
-            legacy_rag.RELAXED_CHAT_ATTRIBUTION_POLICY
-            if relaxed_chat_rag
-            else legacy_rag.STRICT_CHAT_ATTRIBUTION_POLICY
+        chat_policy = legacy_rag.get_chat_attribution_policy(
+            relaxed_chat_rag=relaxed_chat_rag,
+            intent_family=None,
+            has_history=any(record.role == "assistant" for record in records),
         )
         result = self._graph.invoke(
             {

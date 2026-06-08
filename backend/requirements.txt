@@ -12,8 +12,11 @@ python-multipart==0.0.17
 celery==5.6.2
 redis==6.4.0
 PyMuPDF==1.27.2.3
-# Docling 继续负责 PDF 结构化；默认 OCR 为 rapidocr（需 onnxruntime），兼容兜底仍保留 easyocr/tesseract
-docling[rapidocr,easyocr]==2.94.0
+# Docling 负责 PDF 结构化；默认 OCR 为 rapidocr（需 onnxruntime）
+# PyTorch 在 Dockerfile 中单独安装（CPU/GPU 可切换）
+docling[rapidocr]==2.94.0
+# EasyOCR 兼容兜底（会额外引入 easyocr + opencv-python-headless；恢复时注释上一行并启用下一行）
+# docling[rapidocr,easyocr]==2.94.0
 onnxruntime>=1.7.0,<2.0.0
 symspellpy==6.9.0
 langgraph==1.2.1

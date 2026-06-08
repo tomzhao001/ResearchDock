@@ -36,6 +36,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--judge-mode", choices=["heuristic", "llm"], default="heuristic")
     parser.add_argument("--question-id", type=str, default=None)
     parser.add_argument(
+        "--question-id-file",
+        type=Path,
+        default=None,
+        help="JSON file containing a list of question ids to evaluate as a slice.",
+    )
+    parser.add_argument(
         "--timeout-seconds",
         type=int,
         default=None,
@@ -58,6 +64,7 @@ def _run_evaluation(
     subset: str,
     judge_mode: str,
     question_id: str | None,
+    question_ids: list[str] | None,
 ) -> dict:
     return run_sample_data_evaluation(
         SessionLocal,
@@ -65,6 +72,7 @@ def _run_evaluation(
         subset=subset,
         judge_mode=judge_mode,
         question_id=question_id,
+        question_ids=question_ids,
     )
 
 
@@ -83,6 +91,7 @@ def _eval_worker(
     subset: str,
     judge_mode: str,
     question_id: str | None,
+    question_ids: list[str] | None,
     result_path: str,
     result_queue,
 ) -> None:
@@ -93,6 +102,7 @@ def _eval_worker(
             subset=subset,
             judge_mode=judge_mode,
             question_id=question_id,
+            question_ids=question_ids,
         )
         Path(result_path).write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
         result_queue.put(
@@ -111,6 +121,7 @@ def _run_single_with_timeout(
     subset: str,
     judge_mode: str,
     question_id: str,
+    question_ids: list[str] | None,
     timeout_seconds: int | None,
 ) -> dict:
     if timeout_seconds is None:
@@ -119,6 +130,7 @@ def _run_single_with_timeout(
             subset=subset,
             judge_mode=judge_mode,
             question_id=question_id,
+            question_ids=question_ids,
         )
 
     ctx = get_context("spawn")
@@ -127,7 +139,7 @@ def _run_single_with_timeout(
         result_path = temp_file.name
     process = ctx.Process(
         target=_eval_worker,
-        args=(mode, subset, judge_mode, question_id, result_path, result_queue),
+        args=(mode, subset, judge_mode, question_id, question_ids, result_path, result_queue),
     )
     process.start()
     process.join(timeout_seconds)
@@ -173,14 +185,23 @@ def _run_single_with_timeout(
 def main() -> None:
     configure_logging()
     args = parse_args()
+    if args.question_id is not None and args.question_id_file is not None:
+        raise SystemExit("--question-id 和 --question-id-file 不能同时使用")
+    question_ids = None
+    if args.question_id_file is not None:
+        question_ids = json.loads(args.question_id_file.read_text(encoding="utf-8"))
+        if not isinstance(question_ids, list):
+            raise SystemExit("--question-id-file 必须是 JSON 数组")
+        question_ids = [str(item) for item in question_ids]
     started_at = time.perf_counter()
     timeout_seconds = _single_run_timeout_seconds(args)
     logger.info(
-        "Starting sample-data evaluation: mode=%s subset=%s judge_mode=%s question_id=%s timeout_seconds=%s output=%s",
+        "Starting sample-data evaluation: mode=%s subset=%s judge_mode=%s question_id=%s question_ids=%s timeout_seconds=%s output=%s",
         args.mode,
         args.subset,
         args.judge_mode,
         args.question_id,
+        question_ids,
         timeout_seconds,
         args.output,
     )
@@ -192,6 +213,7 @@ def main() -> None:
             subset=args.subset,
             judge_mode=args.judge_mode,
             question_id=args.question_id,
+            question_ids=question_ids,
             timeout_seconds=timeout_seconds,
         )
     else:
@@ -200,6 +222,7 @@ def main() -> None:
             subset=args.subset,
             judge_mode=args.judge_mode,
             question_id=None,
+            question_ids=question_ids,
         )
     logger.info("Evaluation finished in %.2fs", time.perf_counter() - started_at)
     content = json.dumps(report, ensure_ascii=False, indent=2)

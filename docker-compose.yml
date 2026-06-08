@@ -62,6 +62,7 @@ x-backend-common-env: &backend-common-env
   GLM_OCR_MAX_RETRIES: ${GLM_OCR_MAX_RETRIES:-1}
   GLM_OCR_VERIFY_SSL: "${GLM_OCR_VERIFY_SSL:-true}"
   MODEL_CACHE_PATH: ${MODEL_CACHE_PATH:-/data/models}
+  MODEL_CACHE_AUTO_DOWNLOAD: "${MODEL_CACHE_AUTO_DOWNLOAD:-false}"
   DOCLING_ARTIFACTS_PATH: ${DOCLING_ARTIFACTS_PATH:-/data/models/docling}
   EASYOCR_MODULE_PATH: ${EASYOCR_MODULE_PATH:-/data/models/easyocr}
   HF_HOME: ${HF_HOME:-/data/models/huggingface}

@@ -528,6 +528,11 @@ def load_sample_data_smoke_question_ids(data_dir: Path | None = None) -> set[str
     return {str(item) for item in payload}
 
 
+def load_sample_data_question_id_slice(filename: str, data_dir: Path | None = None) -> set[str]:
+    payload = _read_json((data_dir or _SAMPLE_DATA_DIR) / filename)
+    return {str(item) for item in payload}
+
+
 def ensure_sample_data_eval_user(db: Session) -> User:
     organization = db.scalar(select(Organization).where(Organization.slug == "sample-data"))
     if organization is None:
@@ -1159,12 +1164,28 @@ def evaluate_end_to_end(
         retrieval_metadata = metadata.get("retrieval") if isinstance(metadata.get("retrieval"), dict) else {}
         selected_evidence = retrieval_metadata.get("selected_evidence") if isinstance(retrieval_metadata.get("selected_evidence"), list) else []
         verifier_result = retrieval_metadata.get("verifier_result") if isinstance(retrieval_metadata.get("verifier_result"), dict) else {}
+        chat_response_policy = (
+            retrieval_metadata.get("chat_response_policy")
+            if isinstance(retrieval_metadata.get("chat_response_policy"), dict)
+            else {}
+        )
         sufficiency_decision = (
             retrieval_metadata.get("sufficiency_decision")
             if isinstance(retrieval_metadata.get("sufficiency_decision"), dict)
             else {}
         )
+        first_pass_candidates = (
+            retrieval_metadata.get("first_pass_candidates")
+            if isinstance(retrieval_metadata.get("first_pass_candidates"), list)
+            else []
+        )
         gold_refs = _resolved_gold_refs(resolved)
+        first_pass_match_sets = [
+            _trace_candidate_match_indexes(candidate, gold_refs)
+            for candidate in first_pass_candidates[:10]
+            if isinstance(candidate, dict)
+        ]
+        retrieval_hit_at_10 = bool(any(match_set for match_set in first_pass_match_sets))
         selected_match_sets = [
             _trace_candidate_match_indexes(candidate, gold_refs)
             for candidate in selected_evidence
@@ -1206,12 +1227,27 @@ def evaluate_end_to_end(
                 "citation_precision": round(citation_precision, 4),
                 "evidence_selection_precision": round(float(evidence_selection_precision), 4),
                 "support_coverage": round(float(support_coverage), 4),
+                "retrieval_hit_at_10": retrieval_hit_at_10,
                 "verifier_alignment": bool(verifier_alignment),
                 "abstention_accuracy": bool(heuristic["abstention_accuracy"]),
                 "keyword_hits": int(heuristic["keyword_hits"]),
                 "cited_gold": int(heuristic["cited_gold"]),
                 "verifier_result": verifier_result,
+                "verifier_policy_name": str(retrieval_metadata.get("verifier_policy_name") or chat_response_policy.get("name") or ""),
+                "verifier_failure_mode": str(
+                    retrieval_metadata.get("verifier_failure_mode")
+                    or verifier_result.get("failure_mode")
+                    or retrieval_metadata.get("fallback_reason")
+                    or ""
+                ),
                 "sufficiency_decision": sufficiency_decision,
+                "sufficiency_policy_name": str(sufficiency_decision.get("policy_name") or ""),
+                "sufficiency_reason_codes": [
+                    str(code)
+                    for code in (sufficiency_decision.get("reason_codes") or [])
+                    if str(code).strip()
+                ],
+                "sufficiency_is_partial": bool(sufficiency_decision.get("is_partially_sufficient")),
                 "judge_notes": llm_grade["notes"] if llm_grade else "heuristic",
             }
         )
@@ -1245,7 +1281,46 @@ def evaluate_end_to_end(
         "support_coverage": round(_mean([float(row["support_coverage"]) for row in rows]), 4),
         "verifier_alignment": round(_mean([1.0 if row["verifier_alignment"] else 0.0 for row in rows]), 4),
         "abstention_accuracy": round(_mean([1.0 if row["abstention_accuracy"] else 0.0 for row in rows]), 4),
+        "overanswer_rate": round(
+            _mean([1.0 if (row["expected_abstention"] and row["answer_mode"] == "knowledge_base") else 0.0 for row in rows]),
+            4,
+        ),
+        "verifier_false_positive_rate": round(
+            _mean([1.0 if (row["expected_abstention"] and bool((row.get("verifier_result") or {}).get("supported"))) else 0.0 for row in rows]),
+            4,
+        ),
+        "sufficiency_failure_rate": round(
+            _mean([1.0 if (not row["expected_abstention"] and row["answer_mode"] == "kb_insufficient_evidence") else 0.0 for row in rows]),
+            4,
+        ),
+        "overconservative_failure_rate": round(
+            _mean(
+                [
+                    1.0
+                    if (
+                        not row["expected_abstention"]
+                        and row["answer_mode"] == "kb_insufficient_evidence"
+                        and row["retrieval_hit_at_10"]
+                        and float(row["support_coverage"]) > 0.0
+                    )
+                    else 0.0
+                    for row in rows
+                ]
+            ),
+            4,
+        ),
+        "partial_answer_rate": round(_mean([1.0 if row["sufficiency_is_partial"] else 0.0 for row in rows]), 4),
     }
+    sufficiency_reason_rows = [
+        {"reason_code": reason_code}
+        for row in rows
+        for reason_code in row.get("sufficiency_reason_codes", [])
+    ]
+    verifier_failure_rows = [
+        {"failure_mode": row["verifier_failure_mode"]}
+        for row in rows
+        if str(row.get("verifier_failure_mode") or "").strip()
+    ]
     breakdown = {
         "by_category": _summarize_groups(
             rows,
@@ -1256,6 +1331,10 @@ def evaluate_end_to_end(
                 "support_coverage": lambda row: float(row["support_coverage"]),
                 "verifier_alignment": lambda row: 1.0 if row["verifier_alignment"] else 0.0,
                 "abstention_accuracy": lambda row: 1.0 if row["abstention_accuracy"] else 0.0,
+                "overanswer_rate": lambda row: 1.0 if (row["expected_abstention"] and row["answer_mode"] == "knowledge_base") else 0.0,
+                "verifier_false_positive_rate": lambda row: 1.0 if (row["expected_abstention"] and bool((row.get("verifier_result") or {}).get("supported"))) else 0.0,
+                "sufficiency_failure_rate": lambda row: 1.0 if (not row["expected_abstention"] and row["answer_mode"] == "kb_insufficient_evidence") else 0.0,
+                "overconservative_failure_rate": lambda row: 1.0 if (not row["expected_abstention"] and row["answer_mode"] == "kb_insufficient_evidence" and row["retrieval_hit_at_10"] and float(row["support_coverage"]) > 0.0) else 0.0,
             },
         ),
         "by_language": _summarize_groups(
@@ -1267,6 +1346,38 @@ def evaluate_end_to_end(
                 "support_coverage": lambda row: float(row["support_coverage"]),
                 "verifier_alignment": lambda row: 1.0 if row["verifier_alignment"] else 0.0,
                 "abstention_accuracy": lambda row: 1.0 if row["abstention_accuracy"] else 0.0,
+                "overanswer_rate": lambda row: 1.0 if (row["expected_abstention"] and row["answer_mode"] == "knowledge_base") else 0.0,
+                "verifier_false_positive_rate": lambda row: 1.0 if (row["expected_abstention"] and bool((row.get("verifier_result") or {}).get("supported"))) else 0.0,
+                "sufficiency_failure_rate": lambda row: 1.0 if (not row["expected_abstention"] and row["answer_mode"] == "kb_insufficient_evidence") else 0.0,
+                "overconservative_failure_rate": lambda row: 1.0 if (not row["expected_abstention"] and row["answer_mode"] == "kb_insufficient_evidence" and row["retrieval_hit_at_10"] and float(row["support_coverage"]) > 0.0) else 0.0,
+            },
+        ),
+        "by_verifier_failure_mode": _count_groups(
+            verifier_failure_rows,
+            key_fn=lambda row: row["failure_mode"],
+        ),
+        "by_verifier_policy_name": _summarize_groups(
+            rows,
+            key_fn=lambda row: row["verifier_policy_name"] or "unknown",
+            score_fns={
+                "verifier_alignment": lambda row: 1.0 if row["verifier_alignment"] else 0.0,
+                "abstention_accuracy": lambda row: 1.0 if row["abstention_accuracy"] else 0.0,
+                "overanswer_rate": lambda row: 1.0 if (row["expected_abstention"] and row["answer_mode"] == "knowledge_base") else 0.0,
+                "verifier_false_positive_rate": lambda row: 1.0 if (row["expected_abstention"] and bool((row.get("verifier_result") or {}).get("supported"))) else 0.0,
+            },
+        ),
+        "by_sufficiency_reason_code": _count_groups(
+            sufficiency_reason_rows,
+            key_fn=lambda row: row["reason_code"],
+        ),
+        "by_policy_name": _summarize_groups(
+            rows,
+            key_fn=lambda row: row["sufficiency_policy_name"] or "unknown",
+            score_fns={
+                "groundedness": lambda row: 1.0 if row["grounded"] else 0.0,
+                "abstention_accuracy": lambda row: 1.0 if row["abstention_accuracy"] else 0.0,
+                "sufficiency_failure_rate": lambda row: 1.0 if (not row["expected_abstention"] and row["answer_mode"] == "kb_insufficient_evidence") else 0.0,
+                "partial_answer_rate": lambda row: 1.0 if row["sufficiency_is_partial"] else 0.0,
             },
         ),
     }
@@ -1288,6 +1399,7 @@ def run_sample_data_evaluation(
     subset: str = "full",
     judge_mode: str = "heuristic",
     question_id: str | None = None,
+    question_ids: list[str] | None = None,
     extractor: DocumentExtractor | None = None,
     data_dir: Path | None = None,
 ) -> dict[str, Any]:
@@ -1341,6 +1453,28 @@ def run_sample_data_evaluation(
                 len(questions),
                 len(sessions),
             )
+        if question_ids:
+            requested_question_ids = {str(item) for item in question_ids}
+            available_question_ids = {item.q_id for item in questions}
+            unknown_question_ids = sorted(requested_question_ids - available_question_ids)
+            if unknown_question_ids:
+                raise ValueError(f"Unknown question_ids for current subset: {', '.join(unknown_question_ids)}")
+            questions = [item for item in questions if item.q_id in requested_question_ids]
+            sessions = [
+                SampleSession(
+                    session_id=item.session_id,
+                    question_ids=tuple(q_id for q_id in item.question_ids if q_id in requested_question_ids),
+                )
+                for item in sessions
+                if any(q_id in requested_question_ids for q_id in item.question_ids)
+            ]
+            sessions = [item for item in sessions if item.question_ids]
+            logger.info(
+                "Applied multi-question filter: question_ids=%s remaining_questions=%s sessions=%s",
+                sorted(requested_question_ids),
+                len(questions),
+                len(sessions),
+            )
         chunk_cache = _load_chunk_cache(db, papers_by_key)
         logger.info("Loaded chunk cache: papers=%s", len(chunk_cache))
         resolve_started_at = time.perf_counter()
@@ -1356,6 +1490,7 @@ def run_sample_data_evaluation(
             "subset": subset,
             "judge_mode": judge_mode,
             "question_id": question_id,
+            "question_ids": question_ids,
             "paper_ids": {key: paper.id for key, paper in papers_by_key.items()},
         }
         if mode in {"retrieval", "both"}:

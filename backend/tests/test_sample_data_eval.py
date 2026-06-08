@@ -69,8 +69,8 @@ def test_sample_data_benchmark_files_have_expected_shape() -> None:
     smoke_ids = load_sample_data_smoke_question_ids()
 
     assert len(papers) == 2
-    assert len(questions) == 102
-    assert len(sessions) == 4
+    assert len(questions) == 107
+    assert len(sessions) == 5
     assert len(smoke_ids) == 14
     assert papers[0].pdf_path.exists()
     assert papers[1].pdf_path.exists()
@@ -103,7 +103,7 @@ def test_sample_data_gold_evidence_resolves_against_ingested_sample_papers(
     eligible = [item for item in resolved if item.question.gold_evidence]
     all_chunks = [chunk for chunks in chunk_cache.values() for chunk in chunks]
 
-    assert len(eligible) == 98
+    assert len(eligible) == 99
     assert all(item.gold_chunk_ids for item in eligible)
     assert all_chunks
     assert all(chunk.page_from is not None for chunk in all_chunks)

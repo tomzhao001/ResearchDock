@@ -189,9 +189,102 @@ def _build_rapidocr_v5_params(languages: list[str] | None) -> dict[str, Any]:
     }
 
 
-def _ensure_rapidocr_artifact(local_path: Path, url: str) -> Path:
+def _layout_model_repo_folder() -> str:
+    from docling.datamodel.pipeline_options import LayoutOptions
+
+    return LayoutOptions().model_spec.model_repo_folder
+
+
+def _table_model_repo_folder() -> str:
+    from docling.models.stages.table_structure.table_structure_model import TableStructureModel
+
+    return TableStructureModel._model_repo_folder
+
+
+def _table_model_relative_path() -> str:
+    from docling.models.stages.table_structure.table_structure_model import TableStructureModel
+
+    return TableStructureModel._model_path
+
+
+def _table_model_mode_dir() -> str:
+    from docling.datamodel.pipeline_options import TableFormerMode, TableStructureOptions
+
+    mode = TableStructureOptions().mode
+    return "fast" if mode == TableFormerMode.FAST else "accurate"
+
+
+def _docling_layout_artifact_marker(artifacts_path: Path) -> Path:
+    return artifacts_path / _layout_model_repo_folder() / "model.safetensors"
+
+
+def _docling_table_artifact_marker(artifacts_path: Path) -> Path:
+    return (
+        artifacts_path
+        / _table_model_repo_folder()
+        / _table_model_relative_path()
+        / _table_model_mode_dir()
+        / "tm_config.json"
+    )
+
+
+def _docling_table_artifact_markers(artifacts_path: Path) -> tuple[Path, ...]:
+    mode_dir = _table_model_mode_dir()
+    relative_path = Path(_table_model_relative_path())
+    return (
+        artifacts_path / _table_model_repo_folder() / relative_path / mode_dir / "tm_config.json",
+        artifacts_path / relative_path / mode_dir / "tm_config.json",
+    )
+
+
+def _docling_table_artifacts_present(artifacts_path: Path) -> bool:
+    return any(marker.is_file() for marker in _docling_table_artifact_markers(artifacts_path))
+
+
+def _prepare_docling_standard_artifacts(artifacts_path: Path) -> None:
+    need_layout = not _docling_layout_artifact_marker(artifacts_path).is_file()
+    need_table = settings.docling_do_table_structure and not _docling_table_artifacts_present(artifacts_path)
+    if not need_layout and not need_table:
+        return
+
+    if not settings.model_cache_auto_download:
+        missing = []
+        if need_layout:
+            missing.append(str(_docling_layout_artifact_marker(artifacts_path)))
+        if need_table:
+            missing.append(str(_docling_table_artifact_marker(artifacts_path)))
+        raise FileNotFoundError(
+            "Missing Docling model artifacts: "
+            + ", ".join(missing)
+            + ". Pre-download with "
+            f"'docling-tools models download layout tableformer -o {artifacts_path}' "
+            "or set MODEL_CACHE_AUTO_DOWNLOAD=true."
+        )
+
+    from docling.utils.model_downloader import download_models
+
+    download_models(
+        output_dir=artifacts_path,
+        with_layout=need_layout,
+        with_tableformer=need_table,
+        with_tableformer_v2=False,
+        with_code_formula=False,
+        with_picture_classifier=False,
+        with_rapidocr=False,
+        with_easyocr=False,
+    )
+
+
+def _resolve_rapidocr_artifact(local_path: Path, url: str) -> Path:
     if local_path.exists():
         return local_path
+
+    if not settings.model_cache_auto_download:
+        raise FileNotFoundError(
+            f"Missing RapidOCR artifact: {local_path}. "
+            "Pre-download RapidOCR models into the Docling artifacts directory "
+            "or set MODEL_CACHE_AUTO_DOWNLOAD=true."
+        )
 
     local_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = local_path.with_suffix(local_path.suffix + ".tmp")
@@ -215,6 +308,7 @@ class DoclingDocumentExtractor:
             raise RuntimeError("Docling is not installed. Install backend requirements before running PDF ingest.") from exc
 
         cache_paths = configure_model_cache_env()
+        _prepare_docling_standard_artifacts(cache_paths.docling)
         pipeline_options = PdfPipelineOptions()
         if hasattr(pipeline_options, "artifacts_path"):
             pipeline_options.artifacts_path = str(cache_paths.docling)
@@ -233,10 +327,10 @@ class DoclingDocumentExtractor:
             manifest = _build_rapidocr_v5_manifest(cache_paths.docling, languages or ["chinese", "english"])
             pipeline_options.ocr_options = RapidOcrOptions(
                 lang=languages or ["chinese", "english"],
-                det_model_path=str(_ensure_rapidocr_artifact(*manifest["det_model_path"])),
-                cls_model_path=str(_ensure_rapidocr_artifact(*manifest["cls_model_path"])),
-                rec_model_path=str(_ensure_rapidocr_artifact(*manifest["rec_model_path"])),
-                rec_keys_path=str(_ensure_rapidocr_artifact(*manifest["rec_keys_path"])),
+                det_model_path=str(_resolve_rapidocr_artifact(*manifest["det_model_path"])),
+                cls_model_path=str(_resolve_rapidocr_artifact(*manifest["cls_model_path"])),
+                rec_model_path=str(_resolve_rapidocr_artifact(*manifest["rec_model_path"])),
+                rec_keys_path=str(_resolve_rapidocr_artifact(*manifest["rec_keys_path"])),
                 rapidocr_params=_build_rapidocr_v5_params(languages or ["chinese", "english"]),
             )
         elif ocr_engine == "tesserocr":
