@@ -56,14 +56,14 @@ case "$DEPLOY_TARGET" in
     UP_SERVICES=()
     ;;
   app)
-    UP_SERVICES=(backend frontend celery-worker nginx)
+    UP_SERVICES=(backend frontend celery-worker celery-extract-worker nginx)
     ;;
   -h|--help|help)
     cat <<'EOF'
 Usage: bash deploy/deploy-from-acr.sh [all|app]
 
   all  Recreate and deploy the full compose stack.
-  app  Recreate only application services (backend, frontend, celery-worker, nginx).
+  app  Recreate only application services (backend, frontend, celery-worker, celery-extract-worker, nginx).
 EOF
     exit 0
     ;;
@@ -92,13 +92,16 @@ services:
   celery-worker:
     image: ${BACKEND_IMAGE}
     build: null
+  celery-extract-worker:
+    image: ${BACKEND_IMAGE}
+    build: null
   frontend:
     image: ${FRONTEND_IMAGE}
     build: null
 EOF
 
 echo "Pulling images"
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" -f "$OVERRIDE_FILE" pull backend celery-worker frontend
+docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" -f "$OVERRIDE_FILE" pull backend celery-worker celery-extract-worker frontend
 
 if [[ "$DEPLOY_TARGET" == "all" ]]; then
   echo "Starting full stack"

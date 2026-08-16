@@ -3,6 +3,7 @@ import sys
 from celery import Celery
 from celery.signals import worker_process_init
 from celery.utils.nodenames import gethostname
+from kombu import Queue
 
 from app.config import settings
 from app.services.model_cache import configure_model_cache_env
@@ -23,6 +24,14 @@ celery_config = {
     "task_serializer": "json",
     "result_serializer": "json",
     "worker_prefetch_multiplier": 1,
+    "task_default_queue": "celery",
+    "task_queues": (
+        Queue("celery"),
+        Queue("extract"),
+    ),
+    "task_routes": {
+        "app.tasks.paper_ingest.process_uploaded_pdf": {"queue": "extract"},
+    },
 }
 if _IS_WINDOWS:
     celery_config.update(

@@ -114,8 +114,43 @@ services:
 
   celery-worker:
     build: ./backend
-    command: ["celery", "-A", "app.celery_app.celery_app", "worker", "--loglevel=info", "--concurrency=2", "--max-tasks-per-child=20", "--max-memory-per-child=700000"]
-    mem_limit: 4.5g
+    command:
+      - celery
+      - -A
+      - app.celery_app.celery_app
+      - worker
+      - --loglevel=info
+      - --hostname=celery-llm@%h
+      - --queues=celery
+      - --concurrency=4
+      - --max-tasks-per-child=20
+      - --max-memory-per-child=700000
+    mem_limit: 1.5g
+    environment:
+      <<: *backend-common-env
+    volumes:
+      - files_data:/data/files
+      - model_cache:/data/models
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  celery-extract-worker:
+    build: ./backend
+    command:
+      - celery
+      - -A
+      - app.celery_app.celery_app
+      - worker
+      - --loglevel=info
+      - --hostname=celery-extract@%h
+      - --queues=extract
+      - --concurrency=1
+      - --max-tasks-per-child=20
+      - --max-memory-per-child=2500000
+    mem_limit: 3.5g
     environment:
       <<: *backend-common-env
     volumes:
