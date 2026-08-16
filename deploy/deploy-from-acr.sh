@@ -55,10 +55,10 @@ check_celery_queue_backlog() {
   fi
 
   local llen
-  llen=$(redis-cli -h localhost -p 6379 LLEN celery 2>/dev/null) || true
+  llen=$(redis-cli -h localhost -p 6379 -n 1 LLEN celery 2>/dev/null) || true
 
   if [[ -n "$llen" && "$llen" =~ ^[0-9]+$ && "$llen" -gt 0 ]]; then
-    printf '\033[33m%s\033[0m\n' "检测到 celery 队列仍有 ${llen} 条遗留消息。若其中包含旧版本入队的 PDF 提取任务，1.5g 主 worker 执行可能 OOM。建议：先确认队列无 in-flight PDF 再继续；或临时 redis-cli -h localhost -p 6379 LRANGE celery 0 -1 检查任务类型"
+    printf '\033[33m%s\033[0m\n' "检测到 celery 队列仍有 ${llen} 条遗留消息。若其中包含旧版本入队的 PDF 提取任务，1.5g 主 worker 执行可能 OOM。建议：先确认队列无 in-flight PDF 再继续；或临时 redis-cli -h localhost -p 6379 -n 1 LRANGE celery 0 -1 检查任务类型"
   fi
   return 0
 }
