@@ -46,6 +46,23 @@ require_env() {
   fi
 }
 
+# Warn if leftover celery-queue messages may still be PDF extract tasks
+# (1.5g main worker can OOM if it consumes them). Never blocks deploy.
+check_celery_queue_backlog() {
+  if ! command -v redis-cli >/dev/null 2>&1; then
+    echo "redis-cli not found in PATH; skipping celery queue backlog check."
+    return 0
+  fi
+
+  local llen
+  llen=$(redis-cli -h localhost -p 6379 LLEN celery 2>/dev/null) || true
+
+  if [[ -n "$llen" && "$llen" =~ ^[0-9]+$ && "$llen" -gt 0 ]]; then
+    printf '\033[33m%s\033[0m\n' "检测到 celery 队列仍有 ${llen} 条遗留消息。若其中包含旧版本入队的 PDF 提取任务，1.5g 主 worker 执行可能 OOM。建议：先确认队列无 in-flight PDF 再继续；或临时 redis-cli -h localhost -p 6379 LRANGE celery 0 -1 检查任务类型"
+  fi
+  return 0
+}
+
 load_env_file "$ENV_FILE"
 
 require_env "ACR_REGISTRY"
@@ -102,6 +119,8 @@ EOF
 
 echo "Pulling images"
 docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" -f "$OVERRIDE_FILE" pull backend celery-worker celery-extract-worker frontend
+
+check_celery_queue_backlog
 
 if [[ "$DEPLOY_TARGET" == "all" ]]; then
   echo "Starting full stack"
