@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from app.config import settings
-from app.services.model_cache import configure_model_cache_env, model_cache_metadata
+from app.services.model_cache import configure_model_cache_env, model_cache_metadata, resolve_model_cache_paths
 from app.services.document_extraction import (
     ExtractedBlock,
     ExtractedDocument,
@@ -48,6 +48,8 @@ def _converter_cache_key(*, ocr_engine: str, force_full_page_ocr: bool, language
         bool(settings.docling_do_table_structure),
         bool(settings.docling_generate_picture_images),
         float(settings.docling_images_scale),
+        str(resolve_model_cache_paths().docling),
+        float(settings.docling_document_timeout_seconds),
     )
 
 

@@ -228,6 +228,8 @@ def test_converter_cache_key_includes_pipeline_settings(monkeypatch: pytest.Monk
     monkeypatch.setattr("app.services.docling_extraction.settings.docling_do_table_structure", True)
     monkeypatch.setattr("app.services.docling_extraction.settings.docling_generate_picture_images", True)
     monkeypatch.setattr("app.services.docling_extraction.settings.docling_images_scale", 2.0)
+    monkeypatch.setattr("app.services.docling_extraction.settings.docling_document_timeout_seconds", 240)
+    monkeypatch.setattr("app.services.docling_extraction.settings.docling_artifacts_path", "/tmp/docling-artifacts-a")
     baseline = _converter_cache_key(**kwargs)
 
     monkeypatch.setattr("app.services.docling_extraction.settings.docling_do_ocr", False)
@@ -243,6 +245,14 @@ def test_converter_cache_key_includes_pipeline_settings(monkeypatch: pytest.Monk
 
     monkeypatch.setattr("app.services.docling_extraction.settings.docling_generate_picture_images", True)
     monkeypatch.setattr("app.services.docling_extraction.settings.docling_images_scale", 1.0)
+    assert baseline != _converter_cache_key(**kwargs)
+
+    monkeypatch.setattr("app.services.docling_extraction.settings.docling_images_scale", 2.0)
+    monkeypatch.setattr("app.services.docling_extraction.settings.docling_document_timeout_seconds", 60)
+    assert baseline != _converter_cache_key(**kwargs)
+
+    monkeypatch.setattr("app.services.docling_extraction.settings.docling_document_timeout_seconds", 240)
+    monkeypatch.setattr("app.services.docling_extraction.settings.docling_artifacts_path", "/tmp/docling-artifacts-b")
     assert baseline != _converter_cache_key(**kwargs)
 
 
