@@ -36,6 +36,34 @@ _RAPIDOCR_V5_LANGUAGE_ARTIFACTS = {
     },
 }
 
+_CONVERTER_CACHE: dict[tuple, object] = {}
+
+
+def _converter_cache_key(*, ocr_engine: str, force_full_page_ocr: bool, languages: tuple[str, ...]) -> tuple:
+    return (
+        ocr_engine,
+        force_full_page_ocr,
+        languages,
+        bool(settings.docling_do_ocr),
+        bool(settings.docling_do_table_structure),
+        bool(settings.docling_generate_picture_images),
+        float(settings.docling_images_scale),
+    )
+
+
+def _get_or_create_converter(key: tuple, pipeline_options) -> object:
+    converter = _CONVERTER_CACHE.get(key)
+    if converter is None:
+        from docling.datamodel.base_models import InputFormat
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+        converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
+            }
+        )
+        _CONVERTER_CACHE[key] = converter
+    return converter
+
 
 def _label_name(item: Any) -> str | None:
     label = getattr(item, "label", None)
@@ -340,11 +368,12 @@ class DoclingDocumentExtractor:
         if pipeline_options.ocr_options is not None and hasattr(pipeline_options.ocr_options, "force_full_page_ocr"):
             pipeline_options.ocr_options.force_full_page_ocr = self._resolve_force_full_page_ocr()
 
-        converter = DocumentConverter(
-            format_options={
-                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
-            }
+        key = _converter_cache_key(
+            ocr_engine=ocr_engine,
+            force_full_page_ocr=self._resolve_force_full_page_ocr(),
+            languages=tuple(languages),
         )
+        converter = _get_or_create_converter(key, pipeline_options)
         conversion = converter.convert(str(pdf_path))
         doc = conversion.document
 
