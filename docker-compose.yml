@@ -128,7 +128,7 @@ services:
     mem_limit: 1.5g
     environment:
       <<: *backend-common-env
-      WORKER_ROLE: celery-llm
+      # WORKER_ROLE 仅作运维标签，代码不再读取；队列由上方 --queues 决定
     volumes:
       - files_data:/data/files
       - model_cache:/data/models
@@ -154,7 +154,7 @@ services:
     mem_limit: 3.5g
     environment:
       <<: *backend-common-env
-      WORKER_ROLE: celery-extract
+      # WORKER_ROLE 仅作运维标签，代码不再读取；队列由上方 --queues 决定
     volumes:
       - files_data:/data/files
       - model_cache:/data/models

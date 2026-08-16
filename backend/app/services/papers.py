@@ -235,6 +235,36 @@ def set_job_celery_task_id(
             db.close()
 
 
+def mark_job_failed(
+    job_id: int,
+    error: Exception | str,
+    *,
+    db: Session | None = None,
+    session_factory: Callable[[], Session] = SessionLocal,
+) -> None:
+    owns_session = db is None
+    if db is None:
+        db = session_factory()
+    try:
+        job = db.get(Job, job_id)
+        if job is None or job.deleted_at is not None:
+            return
+        now = datetime.now(timezone.utc)
+        job.status = "failed"
+        job.error_message = str(error)
+        job.finished_at = now
+        paper = db.get(Paper, job.paper_id) if job.paper_id is not None else None
+        if paper is not None and paper.deleted_at is None:
+            paper.status = "failed"
+            paper.updated_at = now
+        db.commit()
+        if paper is not None and paper.deleted_at is None:
+            publish_task_status_event(db, paper_id=paper.id, job_id=job.id)
+    finally:
+        if owns_session:
+            db.close()
+
+
 def _mark_job_cancelled(db: Session, job: Job, paper: Paper | None) -> None:
     now = datetime.now(timezone.utc)
     job.status = "cancelled"
