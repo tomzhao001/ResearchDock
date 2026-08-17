@@ -224,6 +224,11 @@ python -m scripts.sample_data_eval --mode retrieval --subset full --output repor
 
 ## 快速启动（Docker Compose，适合服务器发布）
 
+部署形态为双 Celery worker（对应 `docker-compose.yml` 两个服务，复用同一 `backend` 镜像）：
+
+- `celery-worker`：`--queues=celery`，`concurrency=4`，`mem_limit 1.5g`（LLM 摘要/问答）
+- `celery-extract-worker`：`--queues=extract`，`concurrency=1`，`mem_limit 3.5g`（PDF 解析）
+
 1. 复制环境变量模板并按需修改：
   ```bash
    cp .env.example .env
