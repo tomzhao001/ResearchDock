@@ -368,6 +368,7 @@ class RetrievalTraceBuilder:
             "status_detail": None,
             "generation_instruction": retrieval_debug.get("generation_instruction"),
             "rerank_query": retrieval_debug.get("rerank_query"),
+            "embedding_status": retrieval_debug.get("embedding_status"),
             "search_ms": round((time.perf_counter() - state["started_at"]) * 1000, 2),
             "evidence_selection_ms": round((time.perf_counter() - state["selection_started_at"]) * 1000, 2),
         }
@@ -668,12 +669,18 @@ class ChatGenerationService:
         citations = state["citations"]
 
         legacy_rag.logger.info("RAG abstain path: topic_id=%s selected_evidence=%s", state["topic"].id, len(selected_evidence))
+        embedding_status = str(retrieval_trace.get("embedding_status") or "")
+        fallback_reason = (
+            "embedding_unavailable"
+            if embedding_status in {"not_configured", "embed_failed"}
+            else "insufficient_evidence"
+        )
         retrieval_trace["generation_ms"] = round((time.perf_counter() - state["started_at"]) * 1000, 2)
         retrieval_trace["fallback_used"] = bool(chat_policy.allow_fallback_generation)
-        retrieval_trace["fallback_reason"] = "insufficient_evidence"
+        retrieval_trace["fallback_reason"] = fallback_reason
         retrieval_trace["fallback_mode"] = generation_ops.classify_fallback_mode(
             selected_evidence=selected_evidence,
-            fallback_reason="insufficient_evidence",
+            fallback_reason=fallback_reason,
         )
         if chat_policy.allow_fallback_generation:
             fallback_answer, fallback_model = generation_ops.generate_fallback_chat_answer(
@@ -682,7 +689,7 @@ class ChatGenerationService:
                 selected_evidence=selected_evidence,
                 selection_result=state["selection_result"],
                 retrieval_debug=state["retrieval_debug"],
-                fallback_reason="insufficient_evidence",
+                fallback_reason=fallback_reason,
                 progress_callback=progress_callback,
             )
             retrieval_trace["fallback_model"] = fallback_model
@@ -714,7 +721,11 @@ class ChatGenerationService:
             )
             retrieval_trace.update(semantics)
             draft = legacy_rag.AssistantMessageDraft(
-                content="知识库中未找到确切依据。",
+                content=(
+                    "当前未启用向量检索（embedding 未配置或调用失败），不能等同于知识库中没有相关内容。"
+                    if fallback_reason == "embedding_unavailable"
+                    else "知识库中未找到确切依据。"
+                ),
                 model=None,
                 answer_mode="kb_insufficient_evidence",
                 used_knowledge_base=False,

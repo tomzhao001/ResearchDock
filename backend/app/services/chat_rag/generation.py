@@ -13,6 +13,17 @@ EVIDENCE_BACKED_FALLBACK_SYSTEM_PROMPT = (
     "不要补充通用知识，不要伪造论文引用。"
 )
 
+EMBEDDING_UNAVAILABLE_INTRO = (
+    "当前未启用向量检索（embedding 未配置或调用失败），不能等同于知识库中没有相关内容。"
+)
+
+EMBEDDING_UNAVAILABLE_FALLBACK_SYSTEM_PROMPT = (
+    "你是 ResearchDock 的研究助理。"
+    "当前未启用向量检索（embedding 未配置或调用失败），这不能等同于知识库中没有相关内容。"
+    "请先向用户说明这一点，再给出简短通用补充。"
+    "不要说“知识库中未找到确切依据”，不要伪造具体论文结论、数值或引用。"
+)
+
 
 def classify_fallback_mode(*, selected_evidence: list[dict[str, Any]], fallback_reason: str) -> str:
     if selected_evidence:
@@ -25,7 +36,12 @@ def build_status_detail(
     fallback_mode: str,
     fallback_reason: str,
     missing_information: str,
+    embedding_status: str | None = None,
 ) -> str | None:
+    if fallback_reason == "embedding_unavailable":
+        if embedding_status == "embed_failed":
+            return "embedding 调用失败，已跳过向量检索。"
+        return "embedding 服务未配置，已跳过向量检索。"
     if fallback_mode == "general_fallback":
         return "未找到可直接支撑当前问题的知识库材料，以下仅提供通用参考。"
     if fallback_reason in {"generation_abstained", "verifier_rejected", "verifier_low_support"}:
@@ -33,6 +49,22 @@ def build_status_detail(
     if missing_information:
         return missing_information
     return "已找到部分相关材料，但不足以完整回答，以下为基于现有材料的保守总结。"
+
+
+def _normalize_embedding_unavailable_fallback(answer: str, *, has_evidence: bool) -> str:
+    suffix = (
+        "以下补充结合了通用知识与部分相关证据线索，请自行判断。"
+        if has_evidence
+        else "以下为通用补充，请自行判断。"
+    )
+    normalized = (answer or "").strip()
+    if "知识库中未找到确切依据" in normalized:
+        normalized = normalized.replace("知识库中未找到确切依据。", "").replace("知识库中未找到确切依据", "").strip()
+    if not normalized:
+        return f"{EMBEDDING_UNAVAILABLE_INTRO}{suffix}"
+    if "不能等同于知识库中没有" in normalized:
+        return normalized
+    return f"{EMBEDDING_UNAVAILABLE_INTRO}\n\n{normalized}"
 
 
 def build_status_message(*, response_kind: str, attribution_status: str) -> str:
@@ -46,6 +78,8 @@ def build_status_message(*, response_kind: str, attribution_status: str) -> str:
         return "已找到部分相关材料，以下为基于现有材料的归纳总结。"
     if attribution_status == "scope_empty":
         return "按当前筛选条件未匹配到论文。"
+    if attribution_status == "embedding_unavailable":
+        return "当前未启用向量检索（embedding 未配置或调用失败），结果不能等同于知识库中没有相关内容。"
     if attribution_status == "no_usable_evidence":
         return "未找到可直接支撑当前问题的知识库材料。"
     return "以下回答请结合材料自行判断。"
@@ -82,7 +116,19 @@ def derive_response_semantics(
             attribution_status = "partial_evidence"
     else:
         response_kind = "general_fallback"
-        attribution_status = "scope_empty" if fallback_reason == "scope_empty" else "no_usable_evidence"
+        if fallback_reason == "embedding_unavailable":
+            attribution_status = "embedding_unavailable"
+        elif fallback_reason == "scope_empty":
+            attribution_status = "scope_empty"
+        else:
+            attribution_status = "no_usable_evidence"
+    if attribution_status == "embedding_unavailable":
+        sufficiency = retrieval_trace.get("sufficiency_decision")
+        if isinstance(sufficiency, dict):
+            reason_codes = [str(code) for code in (sufficiency.get("reason_codes") or []) if str(code).strip()]
+            if "embedding_unavailable" not in reason_codes:
+                reason_codes.append("embedding_unavailable")
+            sufficiency["reason_codes"] = reason_codes
     if response_kind == "metadata_answer":
         status_detail = "该回答基于文档范围、数量或筛选结果生成，不包含正文引用。"
     elif attribution_status == "grounded":
@@ -96,6 +142,7 @@ def derive_response_semantics(
                     ((retrieval_trace.get("evidence_selection_trace") or {}).get("missing_information") if isinstance(retrieval_trace.get("evidence_selection_trace"), dict) else "")
                     or ""
                 ),
+                embedding_status=str(retrieval_trace.get("embedding_status") or "") or None,
             )
             or ""
         )
@@ -126,13 +173,25 @@ def generate_fallback_chat_answer(
     missing_information = selection_result.missing_information or "未提供"
     prior_answer_text = (prior_answer or "").strip() or "无"
     generation_instruction = retrieval_debug.get("generation_instruction") or "请用中文回答，保留关键英文术语原文。"
-    mode_instruction = (
-        "请基于给定证据总结已经能确定的内容，并明确标注暂时无法确认的部分。\n"
-        "不要输出“知识库中未找到确切依据”，不要补充通用知识，不要伪造结论或引用。\n\n"
-        if fallback_mode == "evidence_backed_fallback"
-        else "请先明确说明“知识库中未找到确切依据”。\n"
-        "随后给出简短通用补充，并避免伪造具体论文结论、数值或引用。\n\n"
-    )
+    if fallback_mode == "evidence_backed_fallback":
+        mode_instruction = (
+            "请基于给定证据总结已经能确定的内容，并明确标注暂时无法确认的部分。\n"
+            "不要输出“知识库中未找到确切依据”，不要补充通用知识，不要伪造结论或引用。\n\n"
+        )
+        system_prompt = EVIDENCE_BACKED_FALLBACK_SYSTEM_PROMPT
+    elif fallback_reason == "embedding_unavailable":
+        mode_instruction = (
+            f"请先明确说明“{EMBEDDING_UNAVAILABLE_INTRO}”。\n"
+            "随后可给出简短通用补充，并避免伪造具体论文结论、数值或引用。\n"
+            "不要写成“知识库中未找到确切依据”，因为当前只是向量检索不可用。\n\n"
+        )
+        system_prompt = EMBEDDING_UNAVAILABLE_FALLBACK_SYSTEM_PROMPT
+    else:
+        mode_instruction = (
+            "请先明确说明“知识库中未找到确切依据”。\n"
+            "随后给出简短通用补充，并避免伪造具体论文结论、数值或引用。\n\n"
+        )
+        system_prompt = legacy_rag.FALLBACK_SYSTEM_PROMPT
     legacy_rag._emit_chat_progress(
         progress_callback,
         phase="fallback_generation",
@@ -145,11 +204,7 @@ def generate_fallback_chat_answer(
             [
                 {
                     "role": "system",
-                    "content": (
-                        EVIDENCE_BACKED_FALLBACK_SYSTEM_PROMPT
-                        if fallback_mode == "evidence_backed_fallback"
-                        else legacy_rag.FALLBACK_SYSTEM_PROMPT
-                    ),
+                    "content": system_prompt,
                 },
                 *legacy_rag._history_messages(records),
                 {
@@ -170,7 +225,12 @@ def generate_fallback_chat_answer(
             ],
             temperature=0.3,
         )
-        normalized = answer.strip() if fallback_mode == "evidence_backed_fallback" else legacy_rag._normalize_fallback_answer(answer, has_evidence=has_evidence)
+        if fallback_mode == "evidence_backed_fallback":
+            normalized = answer.strip()
+        elif fallback_reason == "embedding_unavailable":
+            normalized = _normalize_embedding_unavailable_fallback(answer, has_evidence=has_evidence)
+        else:
+            normalized = legacy_rag._normalize_fallback_answer(answer, has_evidence=has_evidence)
         legacy_rag._emit_chat_progress(
             progress_callback,
             phase="fallback_generation",
@@ -193,6 +253,9 @@ def generate_fallback_chat_answer(
                 fallback_mode=fallback_mode,
                 fallback_reason=fallback_reason,
                 missing_information=missing_information,
+                embedding_status=str(retrieval_debug.get("embedding_status") or "") or None,
             ) or "已找到部分相关材料，但暂时无法生成更完整的总结。"
             return f"基于已检索到的材料，可先确认以下内容：\n\n{detail}", None
+        if fallback_reason == "embedding_unavailable":
+            return _normalize_embedding_unavailable_fallback("", has_evidence=has_evidence), None
         return legacy_rag._normalize_fallback_answer("", has_evidence=has_evidence), None

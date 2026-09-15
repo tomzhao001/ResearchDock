@@ -85,15 +85,23 @@ function getPhaseStatusClassName(status: string | null): string {
   return getStatusClassName(status);
 }
 
+function phaseJobErrorMessage(status: string | null, job: JobPublic | null): string | null {
+  if (status !== "failed") return null;
+  const message = job?.error_message?.trim();
+  return message || null;
+}
+
 function PhaseBadge({
   label,
   status,
   className,
   action,
+  errorMessage,
 }: {
   label: string;
   status: string | null;
   className?: string;
+  errorMessage?: string | null;
   action?: {
     tooltip: string;
     ariaLabel: string;
@@ -102,33 +110,36 @@ function PhaseBadge({
     onClick: () => void;
   };
 }) {
+  const visibleError = status === "failed" ? errorMessage?.trim() || null : null;
   return (
-    <span
-      className={cn(
-        "inline-flex min-w-[88px] items-center justify-center gap-1 whitespace-nowrap rounded-full px-3 py-1 text-center text-xs font-medium ring-1",
-        getPhaseStatusClassName(status),
-        className
-      )}
-    >
-      <span>{label}</span>
-      <span>{phaseStatusLabel(status)}</span>
-      {action ? (
-        <Tooltip content={action.tooltip}>
-          <button
-            type="button"
-            aria-label={action.ariaLabel}
-            className="inline-flex size-5 items-center justify-center rounded-full text-current transition hover:bg-black/5 disabled:cursor-not-allowed disabled:opacity-50"
-            onClick={(event) => {
-              event.stopPropagation();
-              action.onClick();
-            }}
-            disabled={action.disabled}
-          >
-            <RefreshCw className={cn("size-3", action.loading ? "animate-spin" : "")} />
-          </button>
-        </Tooltip>
-      ) : null}
-    </span>
+    <div className={cn("grid justify-items-end gap-1", className)}>
+      <span
+        className={cn(
+          "inline-flex min-w-[88px] items-center justify-center gap-1 whitespace-nowrap rounded-full px-3 py-1 text-center text-xs font-medium ring-1",
+          getPhaseStatusClassName(status)
+        )}
+      >
+        <span>{label}</span>
+        <span>{phaseStatusLabel(status)}</span>
+        {action ? (
+          <Tooltip content={action.tooltip}>
+            <button
+              type="button"
+              aria-label={action.ariaLabel}
+              className="inline-flex size-5 items-center justify-center rounded-full text-current transition hover:bg-black/5 disabled:cursor-not-allowed disabled:opacity-50"
+              onClick={(event) => {
+                event.stopPropagation();
+                action.onClick();
+              }}
+              disabled={action.disabled}
+            >
+              <RefreshCw className={cn("size-3", action.loading ? "animate-spin" : "")} />
+            </button>
+          </Tooltip>
+        ) : null}
+      </span>
+      {visibleError ? <p className="max-w-[16rem] text-right text-xs leading-5 text-rose-600">{visibleError}</p> : null}
+    </div>
   );
 }
 
@@ -787,6 +798,7 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                         <PhaseBadge
                           label="解析"
                           status={paperDetail.ocr_status}
+                          errorMessage={phaseJobErrorMessage(paperDetail.ocr_status, paperDetail.latest_ocr_job)}
                           action={
                             canWritePapers
                               ? {
@@ -802,6 +814,7 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                         <PhaseBadge
                           label="摘要"
                           status={paperDetail.summary_status}
+                          errorMessage={phaseJobErrorMessage(paperDetail.summary_status, paperDetail.latest_summary_job)}
                           action={
                             canWritePapers
                               ? {
@@ -817,6 +830,7 @@ export function PaperWorkbench({ selectedPaperId, onSelectedPaperChange }: Paper
                         <PhaseBadge
                           label="问题集"
                           status={paperDetail.question_set_status}
+                          errorMessage={phaseJobErrorMessage(paperDetail.question_set_status, paperDetail.latest_question_set_job)}
                           action={
                             canWritePapers
                               ? {

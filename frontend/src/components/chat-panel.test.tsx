@@ -15,7 +15,8 @@ vi.mock("@/lib/chat", () => ({
   fetchChatTopics: (...args: unknown[]) => fetchChatTopics(...args),
   fetchTopicMessages: (...args: unknown[]) => fetchTopicMessages(...args),
   streamTopicMessage: (...args: unknown[]) => streamTopicMessage(...args),
-  subscribeChatProgressEvents: (...args: unknown[]) => subscribeChatProgressEvents(...args),
+  subscribeChatProgressEvents: (...args: unknown[]) =>
+    (subscribeChatProgressEvents as (...inner: unknown[]) => unknown)(...args),
 }));
 
 describe("ChatPanel", () => {
@@ -276,7 +277,7 @@ describe("ChatPanel", () => {
     expect(screen.queryByRole("button", { name: "发送中..." })).not.toBeInTheDocument();
     expect(screen.getByText("当前话题还没有消息，试着问一个和已归档论文相关的问题。")).toBeInTheDocument();
 
-    finishStream?.();
+    (finishStream as (() => void) | null)?.();
 
     await waitFor(() => expect(fetchChatTopics).toHaveBeenCalledTimes(2));
     expect(screen.queryByText("话题 A 的最终答案")).not.toBeInTheDocument();

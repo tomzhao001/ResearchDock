@@ -35,6 +35,7 @@ def search_chunks(
         exact_terms,
     )
     exact_terms_for_boost = exact_terms if exact_match_heavy or legacy_rag._is_table_or_figure_query(query) else []
+    embedding_debug: dict[str, str] = {"embedding_status": low_level.initial_embedding_status()}
     if not low_level.is_postgres_session(db):
         variant_results: dict[str, list[legacy_rag.RetrievalResult]] = {}
         for variant in query_plan.variants:
@@ -44,6 +45,7 @@ def search_chunks(
                 top_k=max(legacy_rag.settings.rag_rerank_top_n, limit),
                 organization_id=organization_id,
                 paper_ids=paper_ids,
+                embedding_debug=embedding_debug,
             )
         source_hits: dict[str, list[dict[str, Any]]] = {}
         variant_traces: dict[str, dict[str, Any]] = {}
@@ -117,6 +119,7 @@ def search_chunks(
                     "generation_instruction": query_plan.generation_instruction,
                     "rerank_query": query_plan.rerank_query,
                     "rerank_status": "not_applicable",
+                    "embedding_status": embedding_debug.get("embedding_status"),
                 }
             )
         return results
@@ -129,15 +132,21 @@ def search_chunks(
 
     dense_query_texts = legacy_rag._unique_strings([variant.query for variant in query_plan.variants if variant.use_dense])
     dense_embeddings: dict[str, list[float] | None] = {}
-    if dense_query_texts and is_embedding_configured():
+    if not is_embedding_configured():
+        low_level.record_embedding_status(embedding_debug, "not_configured")
+    elif dense_query_texts:
         try:
             embedding_rows = legacy_rag.embed_texts(dense_query_texts)
             dense_embeddings = {
                 dense_query_texts[index]: embedding_rows[index]
                 for index in range(min(len(dense_query_texts), len(embedding_rows)))
             }
+            low_level.record_embedding_status(embedding_debug, "available")
         except Exception:
             dense_embeddings = {}
+            low_level.record_embedding_status(embedding_debug, "embed_failed")
+    else:
+        low_level.record_embedding_status(embedding_debug, "available")
 
     sparse_source_hits: dict[str, list[dict[str, Any]]] = {}
     dense_source_hits: dict[str, list[dict[str, Any]]] = {}
@@ -291,6 +300,7 @@ def search_chunks(
                 "rerank_status": rerank_status,
                 "rerank_error": rerank_error,
                 "rerank_context_stats": rerank_context_stats,
+                "embedding_status": embedding_debug.get("embedding_status"),
             }
         )
     return results

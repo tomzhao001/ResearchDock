@@ -40,7 +40,8 @@ vi.mock("@/lib/papers", () => ({
   regeneratePaperQuestionSet: (...args: unknown[]) => regeneratePaperQuestionSet(...args),
   regeneratePaperSummary: (...args: unknown[]) => regeneratePaperSummary(...args),
   reparsePaperDocument: (...args: unknown[]) => reparsePaperDocument(...args),
-  subscribeTaskStatusEvents: (...args: unknown[]) => subscribeTaskStatusEvents(...args),
+  subscribeTaskStatusEvents: (...args: unknown[]) =>
+    (subscribeTaskStatusEvents as (...inner: unknown[]) => unknown)(...args),
 }));
 
 function makePaperListItem({
@@ -285,5 +286,153 @@ describe("PaperWorkbench", () => {
     expect(screen.getByRole("button", { name: "重新解析文档" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "重新生成摘要" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "重新提取问题集" })).toBeDisabled();
+  });
+
+  it("详情区在对应阶段失败时展示 latest_*_job.error_message", async () => {
+    const papers = [
+      {
+        ...makePaperListItem({ id: 1, title: "Alpha", publishedAt: "2024-05-01T00:00:00Z" }),
+        status: "completed",
+        ocr_status: "failed",
+        summary_status: "completed",
+        question_set_status: "failed",
+      },
+    ];
+
+    fetchPapers.mockResolvedValue(papers);
+    fetchPaper.mockResolvedValue({
+      ...makePaperDetail(1, "Alpha"),
+      status: "completed",
+      ocr_status: "failed",
+      summary_status: "completed",
+      question_set_status: "failed",
+      latest_ocr_job: {
+        id: 11,
+        job_type: "pdf_ingest",
+        paper_id: 1,
+        celery_task_id: "ocr-fail",
+        status: "failed",
+        error_message: "MinerU 解析超时：上游无响应",
+        retry_count: 0,
+        cancel_requested_at: null,
+        started_at: "2026-05-16T00:00:00Z",
+        finished_at: "2026-05-16T00:01:00Z",
+        deleted_at: null,
+        created_at: "2026-05-16T00:00:00Z",
+      },
+      latest_summary_job: {
+        id: 12,
+        job_type: "paper_summary",
+        paper_id: 1,
+        celery_task_id: "summary-ok",
+        status: "completed",
+        error_message: null,
+        retry_count: 0,
+        cancel_requested_at: null,
+        started_at: "2026-05-16T00:02:00Z",
+        finished_at: "2026-05-16T00:03:00Z",
+        deleted_at: null,
+        created_at: "2026-05-16T00:02:00Z",
+      },
+      latest_question_set_job: {
+        id: 13,
+        job_type: "paper_question_set",
+        paper_id: 1,
+        celery_task_id: "qs-fail",
+        status: "failed",
+        error_message: "问题集提取失败：模型返回空结果",
+        retry_count: 0,
+        cancel_requested_at: null,
+        started_at: "2026-05-16T00:04:00Z",
+        finished_at: "2026-05-16T00:05:00Z",
+        deleted_at: null,
+        created_at: "2026-05-16T00:04:00Z",
+      },
+    });
+
+    function Harness() {
+      const [selectedPaperId, setSelectedPaperId] = useState<number | null>(1);
+      return <PaperWorkbench selectedPaperId={selectedPaperId} onSelectedPaperChange={setSelectedPaperId} />;
+    }
+
+    render(<Harness />);
+
+    await waitFor(() => expect(fetchPaper).toHaveBeenCalledWith(1));
+    expect(screen.getByText("MinerU 解析超时：上游无响应")).toBeInTheDocument();
+    expect(screen.getByText("问题集提取失败：模型返回空结果")).toBeInTheDocument();
+  });
+
+  it("按阶段 job 判断失败原因，不把 paper.status 当成唯一失败源", async () => {
+    const papers = [
+      {
+        ...makePaperListItem({ id: 1, title: "Alpha", publishedAt: "2024-05-01T00:00:00Z" }),
+        status: "failed",
+        ocr_status: "completed",
+        summary_status: "failed",
+        question_set_status: "completed",
+      },
+    ];
+
+    fetchPapers.mockResolvedValue(papers);
+    fetchPaper.mockResolvedValue({
+      ...makePaperDetail(1, "Alpha"),
+      status: "failed",
+      ocr_status: "completed",
+      summary_status: "failed",
+      question_set_status: "completed",
+      latest_ocr_job: {
+        id: 21,
+        job_type: "pdf_ingest",
+        paper_id: 1,
+        celery_task_id: "ocr-ok",
+        status: "completed",
+        error_message: "旧的 OCR 错误不应显示",
+        retry_count: 0,
+        cancel_requested_at: null,
+        started_at: "2026-05-16T00:00:00Z",
+        finished_at: "2026-05-16T00:01:00Z",
+        deleted_at: null,
+        created_at: "2026-05-16T00:00:00Z",
+      },
+      latest_summary_job: {
+        id: 22,
+        job_type: "paper_summary",
+        paper_id: 1,
+        celery_task_id: "summary-fail",
+        status: "failed",
+        error_message: "摘要生成失败：模型超时",
+        retry_count: 0,
+        cancel_requested_at: null,
+        started_at: "2026-05-16T00:02:00Z",
+        finished_at: "2026-05-16T00:03:00Z",
+        deleted_at: null,
+        created_at: "2026-05-16T00:02:00Z",
+      },
+      latest_question_set_job: {
+        id: 23,
+        job_type: "paper_question_set",
+        paper_id: 1,
+        celery_task_id: "qs-ok",
+        status: "completed",
+        error_message: null,
+        retry_count: 0,
+        cancel_requested_at: null,
+        started_at: "2026-05-16T00:04:00Z",
+        finished_at: "2026-05-16T00:05:00Z",
+        deleted_at: null,
+        created_at: "2026-05-16T00:04:00Z",
+      },
+    });
+
+    function Harness() {
+      const [selectedPaperId, setSelectedPaperId] = useState<number | null>(1);
+      return <PaperWorkbench selectedPaperId={selectedPaperId} onSelectedPaperChange={setSelectedPaperId} />;
+    }
+
+    render(<Harness />);
+
+    await waitFor(() => expect(fetchPaper).toHaveBeenCalledWith(1));
+    expect(screen.getByText("摘要生成失败：模型超时")).toBeInTheDocument();
+    expect(screen.queryByText("旧的 OCR 错误不应显示")).not.toBeInTheDocument();
   });
 });

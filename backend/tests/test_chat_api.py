@@ -192,6 +192,7 @@ def test_chat_falls_back_to_general_answer_when_no_kb_match(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     login(client)
+    _enable_embedding(monkeypatch)
 
     def fake_chat(_: list[dict[str, str]], *, temperature: float = 0.3) -> tuple[str, str | None]:
         return "知识库中未找到确切依据。基于通用知识，CRISPR 是一种基因编辑技术。", "fallback-model"
@@ -563,3 +564,202 @@ def test_chat_retrieval_is_limited_to_users_organization(
     citations = response.json()["assistant_message"]["citations"]
     assert len(citations) == 1
     assert citations[0]["paper_title"] == "Org B Paper"
+
+
+def _disable_embedding(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.config.settings.openai_api_key", "")
+    monkeypatch.setattr("app.config.settings.glm_embedding_api_key", "")
+    monkeypatch.setattr("app.services.chat_rag.retrieval.is_embedding_configured", lambda: False)
+    monkeypatch.setattr("app.services.chat_rag.retrieval_low_level.is_embedding_configured", lambda: False)
+
+
+def _enable_embedding(monkeypatch: pytest.MonkeyPatch, *, fail: bool = False) -> None:
+    monkeypatch.setattr("app.services.chat_rag.retrieval.is_embedding_configured", lambda: True)
+    monkeypatch.setattr("app.services.chat_rag.retrieval_low_level.is_embedding_configured", lambda: True)
+
+    def fake_embed_texts(texts):
+        if fail:
+            raise RuntimeError("embedding endpoint unavailable")
+        return [[0.1, 0.2, 0.3] for _ in texts]
+
+    monkeypatch.setattr("app.services.rag.embed_texts", fake_embed_texts)
+
+
+def test_chat_signals_embedding_unavailable_when_not_configured(
+    client,
+    user,
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    login(client)
+    _disable_embedding(monkeypatch)
+
+    def fake_chat(_: list[dict[str, str]], *, temperature: float = 0.3) -> tuple[str, str | None]:
+        return "知识库中未找到确切依据。基于通用知识，CRISPR 是一种基因编辑技术。", "fallback-model"
+
+    monkeypatch.setattr("app.services.rag.chat_with_messages", fake_chat)
+
+    topic_response = client.post("/api/chat/topics", json={"title": "无向量检索"})
+    assert topic_response.status_code == 201
+    topic_id = topic_response.json()["id"]
+
+    response = client.post(
+        f"/api/chat/topics/{topic_id}/messages",
+        json={"message": "What is CRISPR?"},
+    )
+    assert response.status_code == 200
+    body = response.json()["assistant_message"]
+    assert body["attribution_status"] == "embedding_unavailable"
+    assert "向量检索" in (body["status_message"] or "")
+    assert "不能等同于知识库中没有" in (body["status_message"] or "")
+    assert "embedding_unavailable" in (body["sufficiency_decision"]["reason_codes"] or [])
+    assert body["attribution_status"] != "no_usable_evidence"
+
+    assistant_message = db_session.scalar(
+        select(ChatMessage)
+        .where(ChatMessage.topic_id == topic_id, ChatMessage.role == "assistant")
+        .order_by(ChatMessage.id.desc())
+    )
+    assert assistant_message is not None
+    retrieval = assistant_message.metadata_json["retrieval"]
+    assert retrieval["embedding_status"] == "not_configured"
+    assert retrieval["fallback_reason"] == "embedding_unavailable"
+
+
+def test_chat_signals_embedding_unavailable_when_embed_call_fails(
+    client,
+    user,
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    login(client)
+    _enable_embedding(monkeypatch, fail=True)
+
+    paper = Paper(
+        organization_id=user.organization_id,
+        title="Embed Fail Paper",
+        status="completed",
+    )
+    db_session.add(paper)
+    db_session.flush()
+    db_session.add(
+        PaperChunk(
+            paper_id=paper.id,
+            chunk_index=0,
+            content="unrelated biochemistry paragraph about mitochondria",
+            embedding=[0.9, 0.1, 0.0],
+            token_count=7,
+            page_from=1,
+            page_to=1,
+            metadata_json={"body_text": "unrelated biochemistry paragraph about mitochondria"},
+        )
+    )
+    db_session.commit()
+
+    def fake_chat(_: list[dict[str, str]], *, temperature: float = 0.3) -> tuple[str, str | None]:
+        return "知识库中未找到确切依据。", "fallback-model"
+
+    monkeypatch.setattr("app.services.rag.chat_with_messages", fake_chat)
+
+    topic_response = client.post("/api/chat/topics", json={})
+    topic_id = topic_response.json()["id"]
+    response = client.post(
+        f"/api/chat/topics/{topic_id}/messages",
+        json={"message": "What is CRISPR?"},
+    )
+    assert response.status_code == 200
+    body = response.json()["assistant_message"]
+    assert body["attribution_status"] == "embedding_unavailable"
+    assert "embedding_unavailable" in (body["sufficiency_decision"]["reason_codes"] or [])
+    assistant_message = db_session.scalar(
+        select(ChatMessage)
+        .where(ChatMessage.topic_id == topic_id, ChatMessage.role == "assistant")
+        .order_by(ChatMessage.id.desc())
+    )
+    assert assistant_message.metadata_json["retrieval"]["embedding_status"] == "embed_failed"
+    assert assistant_message.metadata_json["retrieval"]["fallback_reason"] == "embedding_unavailable"
+    assert "调用失败" in (body["status_detail"] or "")
+
+
+def test_chat_keeps_insufficient_evidence_when_embedding_available_but_no_match(
+    client,
+    user,
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    login(client)
+    _enable_embedding(monkeypatch)
+
+    def fake_chat(_: list[dict[str, str]], *, temperature: float = 0.3) -> tuple[str, str | None]:
+        return "知识库中未找到确切依据。基于通用知识，CRISPR 是一种基因编辑技术。", "fallback-model"
+
+    monkeypatch.setattr("app.services.rag.chat_with_messages", fake_chat)
+
+    topic_response = client.post("/api/chat/topics", json={"title": "基因编辑"})
+    topic_id = topic_response.json()["id"]
+    response = client.post(
+        f"/api/chat/topics/{topic_id}/messages",
+        json={"message": "What is CRISPR?"},
+    )
+    assert response.status_code == 200
+    body = response.json()["assistant_message"]
+    assert body["attribution_status"] == "no_usable_evidence"
+    assert body["response_kind"] == "general_fallback"
+    assert "embedding_unavailable" not in (body["sufficiency_decision"]["reason_codes"] or [])
+    assistant_message = db_session.scalar(
+        select(ChatMessage)
+        .where(ChatMessage.topic_id == topic_id, ChatMessage.role == "assistant")
+        .order_by(ChatMessage.id.desc())
+    )
+    assert assistant_message.metadata_json["retrieval"]["embedding_status"] == "available"
+    assert assistant_message.metadata_json["retrieval"]["fallback_reason"] == "insufficient_evidence"
+
+
+def test_chat_abstain_content_mentions_embedding_when_unavailable(user, db_session, monkeypatch: pytest.MonkeyPatch) -> None:
+    _disable_embedding(monkeypatch)
+    topic = create_topic(db_session, user=user, title="无 embedding")
+    result = send_topic_message(
+        db_session,
+        user=user,
+        topic_id=topic.topic.id,
+        prompt="What is CRISPR?",
+        relaxed_chat_rag=False,
+    )
+    assert result.assistant_message.content != "知识库中未找到确切依据。"
+    assert "向量检索" in result.assistant_message.content
+    assert "不能等同于知识库中没有" in result.assistant_message.content
+    assert result.assistant_message.metadata_json["retrieval"]["fallback_reason"] == "embedding_unavailable"
+
+
+def test_chat_relaxed_fallback_does_not_claim_kb_empty_when_embedding_unavailable(
+    client,
+    user,
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    login(client)
+    _disable_embedding(monkeypatch)
+    captured: list[list[dict[str, str]]] = []
+
+    def fake_chat(messages: list[dict[str, str]], *, temperature: float = 0.3) -> tuple[str, str | None]:
+        captured.append(messages)
+        return "基于通用知识，CRISPR 是一种基因编辑技术。", "fallback-model"
+
+    monkeypatch.setattr("app.services.rag.chat_with_messages", fake_chat)
+
+    topic_response = client.post("/api/chat/topics", json={"title": "无向量检索"})
+    topic_id = topic_response.json()["id"]
+    response = client.post(
+        f"/api/chat/topics/{topic_id}/messages",
+        json={"message": "What is CRISPR?"},
+    )
+    assert response.status_code == 200
+    body = response.json()["assistant_message"]
+    prompt_text = "\n".join(message["content"] for turn in captured for message in turn)
+    assert "向量检索" in prompt_text
+    assert "不能等同于知识库中没有" in prompt_text
+    assert "请先明确说明“知识库中未找到确切依据”" not in prompt_text
+    assert "知识库中未找到确切依据" not in body["content"]
+    assert "向量检索" in body["content"]
+    assert "不能等同于知识库中没有" in body["content"]
+    assert body["attribution_status"] == "embedding_unavailable"

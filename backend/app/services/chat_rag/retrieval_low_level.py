@@ -53,6 +53,19 @@ def normalize_embedding(value: Any) -> list[float] | None:
     return None
 
 
+def initial_embedding_status() -> str:
+    return "available" if is_embedding_configured() else "not_configured"
+
+
+def record_embedding_status(embedding_debug: dict[str, str] | None, status: str) -> None:
+    if embedding_debug is None:
+        return
+    current = embedding_debug.get("embedding_status") or initial_embedding_status()
+    priority = {"embed_failed": 2, "not_configured": 1, "available": 0}
+    if priority.get(status, 0) >= priority.get(current, 0):
+        embedding_debug["embedding_status"] = status
+
+
 def search_chunks_legacy(
     db: Session,
     *,
@@ -60,6 +73,7 @@ def search_chunks_legacy(
     top_k: int,
     organization_id: int,
     paper_ids: list[int] | None = None,
+    embedding_debug: dict[str, str] | None = None,
 ) -> list[legacy_rag.RetrievalResult]:
     searchable_roles = legacy_rag._searchable_chunk_roles()
     statement = (
@@ -76,15 +90,25 @@ def search_chunks_legacy(
         statement = statement.where(Paper.id.in_([int(paper_id) for paper_id in paper_ids]))
     rows = db.execute(statement).all()
     if not rows:
+        record_embedding_status(
+            embedding_debug,
+            "not_configured" if not is_embedding_configured() else "available",
+        )
         return []
 
     query_tokens = set(legacy_rag._tokenize(query))
     query_embedding: list[float] | None = None
-    if is_embedding_configured() and any(chunk.embedding for chunk, _ in rows):
+    if not is_embedding_configured():
+        record_embedding_status(embedding_debug, "not_configured")
+    elif any(chunk.embedding for chunk, _ in rows):
         try:
             query_embedding = legacy_rag.embed_texts([query])[0]
+            record_embedding_status(embedding_debug, "available")
         except Exception:
             query_embedding = None
+            record_embedding_status(embedding_debug, "embed_failed")
+    else:
+        record_embedding_status(embedding_debug, "available")
 
     scored: list[legacy_rag.RetrievalResult] = []
     for chunk, paper in rows:
