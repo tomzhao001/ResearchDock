@@ -78,8 +78,12 @@ class Settings(BaseSettings):
     glm_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
     glm_api_key: str = ""
     glm_model: str = ""
+    glm_embedding_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
+    glm_embedding_api_key: str = ""
     glm_embedding_model: str = "embedding-3"
     glm_embedding_dimensions: int = 1024
+    glm_rerank_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
+    glm_rerank_api_key: str = ""
     glm_rerank_model: str = "rerank"
     glm_timeout_seconds: int = 120
     glm_verify_ssl: bool = True

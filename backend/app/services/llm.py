@@ -84,10 +84,46 @@ def _get_llm_provider() -> str:
 def _get_embedding_provider() -> str:
     provider = (settings.embedding_provider or "").strip().lower()
     if not provider or provider == "auto":
-        return "glm" if settings.glm_api_key.strip() else "openai"
+        return "glm" if settings.glm_embedding_api_key.strip() else "openai"
     if provider in {"openai", "glm"}:
         return provider
     raise RuntimeError("EMBEDDING_PROVIDER must be one of: auto, openai, glm")
+
+
+def _resolve_glm_chat_credentials() -> tuple[str, str]:
+    return (settings.glm_base_url or "").strip(), settings.glm_api_key.strip()
+
+
+def _resolve_glm_embedding_credentials() -> tuple[str, str]:
+    return (settings.glm_embedding_base_url or "").strip(), settings.glm_embedding_api_key.strip()
+
+
+def _resolve_glm_rerank_credentials() -> tuple[str, str]:
+    return (settings.glm_rerank_base_url or "").strip(), settings.glm_rerank_api_key.strip()
+
+
+def is_glm_embedding_configured() -> bool:
+    base_url, api_key = _resolve_glm_embedding_credentials()
+    return bool(base_url and api_key)
+
+
+def is_glm_rerank_configured() -> bool:
+    base_url, api_key = _resolve_glm_rerank_credentials()
+    return bool(base_url and api_key)
+
+
+def is_embedding_configured() -> bool:
+    try:
+        provider = _get_embedding_provider()
+    except RuntimeError:
+        return False
+    if provider == "glm":
+        return is_glm_embedding_configured()
+    return bool(settings.openai_api_key.strip() and (settings.openai_base_url or "").strip())
+
+
+def is_rerank_configured() -> bool:
+    return is_glm_rerank_configured()
 
 
 def is_chat_llm_configured() -> bool:
@@ -155,7 +191,7 @@ def _build_embeddings_url(base_url: str) -> str:
 def _build_rerank_url(base_url: str) -> str:
     normalized = (base_url or "").strip().rstrip("/")
     if not normalized:
-        raise RuntimeError("GLM_BASE_URL is not configured")
+        raise RuntimeError("GLM_RERANK_BASE_URL is not configured")
     if normalized.endswith("/rerank"):
         return normalized
     return f"{normalized}/rerank"
@@ -356,8 +392,9 @@ def _request_glm_embeddings(inputs: Sequence[str]) -> list[list[float]]:
     cleaned_inputs = _clean_embedding_inputs(inputs)
     if not cleaned_inputs:
         return []
-    if not settings.glm_api_key.strip():
-        raise RuntimeError("GLM_API_KEY is not configured")
+    base_url, api_key = _resolve_glm_embedding_credentials()
+    if not api_key:
+        raise RuntimeError("GLM_EMBEDDING_API_KEY is not configured")
 
     payload_data: dict[str, object] = {
         "model": settings.glm_embedding_model,
@@ -368,9 +405,9 @@ def _request_glm_embeddings(inputs: Sequence[str]) -> list[list[float]]:
 
     try:
         payload = _post_json(
-            _build_embeddings_url(settings.glm_base_url),
-            client_name="glm",
-            api_key=settings.glm_api_key,
+            _build_embeddings_url(base_url),
+            client_name="glm_embedding",
+            api_key=api_key,
             payload=payload_data,
             timeout=settings.glm_timeout_seconds,
             verify_ssl=settings.glm_verify_ssl,
@@ -411,8 +448,9 @@ def _request_glm_rerank(
     cleaned_documents = [item.strip() for item in documents if item and item.strip()]
     if not cleaned_query or not cleaned_documents:
         return []
-    if not settings.glm_api_key.strip():
-        raise RuntimeError("GLM_API_KEY is not configured")
+    base_url, api_key = _resolve_glm_rerank_credentials()
+    if not api_key:
+        raise RuntimeError("GLM_RERANK_API_KEY is not configured")
 
     payload_data: dict[str, object] = {
         "model": settings.glm_rerank_model,
@@ -425,9 +463,9 @@ def _request_glm_rerank(
 
     try:
         payload = _post_json(
-            _build_rerank_url(settings.glm_base_url),
-            client_name="glm",
-            api_key=settings.glm_api_key,
+            _build_rerank_url(base_url),
+            client_name="glm_rerank",
+            api_key=api_key,
             payload=payload_data,
             timeout=settings.glm_timeout_seconds,
             verify_ssl=settings.glm_verify_ssl,
@@ -526,6 +564,8 @@ def rerank_documents(
     *,
     top_n: int | None = None,
 ) -> list[RerankResult]:
+    if not is_rerank_configured():
+        return []
     return _request_glm_rerank(query, documents, top_n=top_n)
 
 

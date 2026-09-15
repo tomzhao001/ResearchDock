@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.models import ChatMessage, PaperChunk
 from app.services import rag as legacy_rag
+from app.services.llm import is_embedding_configured, is_rerank_configured
 from app.services.chat_rag import query_planning
 from app.services.chat_rag import retrieval_low_level as low_level
 from app.services.chat_rag import tracing as retrieval_tracing
@@ -128,7 +129,7 @@ def search_chunks(
 
     dense_query_texts = legacy_rag._unique_strings([variant.query for variant in query_plan.variants if variant.use_dense])
     dense_embeddings: dict[str, list[float] | None] = {}
-    if dense_query_texts and (legacy_rag.settings.glm_api_key.strip() or legacy_rag.settings.openai_api_key.strip()):
+    if dense_query_texts and is_embedding_configured():
         try:
             embedding_rows = legacy_rag.embed_texts(dense_query_texts)
             dense_embeddings = {
@@ -240,7 +241,7 @@ def search_chunks(
         "max_document_chars": 0,
         "over_budget_truncated_count": 0,
     }
-    if expanded_candidates:
+    if expanded_candidates and is_rerank_configured():
         try:
             reranked_candidates, rerank_context_stats = low_level.apply_reranking(
                 db,

@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.models import Paper, PaperChunk
 from app.services import rag as legacy_rag
+from app.services.llm import is_embedding_configured
 
 
 def cosine_similarity(left: list[float], right: list[float]) -> float:
@@ -79,7 +80,7 @@ def search_chunks_legacy(
 
     query_tokens = set(legacy_rag._tokenize(query))
     query_embedding: list[float] | None = None
-    if (legacy_rag.settings.glm_api_key.strip() or legacy_rag.settings.openai_api_key.strip()) and any(chunk.embedding for chunk, _ in rows):
+    if is_embedding_configured() and any(chunk.embedding for chunk, _ in rows):
         try:
             query_embedding = legacy_rag.embed_texts([query])[0]
         except Exception:

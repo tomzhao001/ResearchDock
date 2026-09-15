@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import ChatMessage, ChatTopic, Paper, PaperChunk, PaperDocumentBlock, PaperDocumentPicture, PaperDocumentTable, User
-from app.services.llm import chat_with_messages, embed_texts, get_chat_llm_configuration, rerank_documents
+from app.services.llm import chat_with_messages, embed_texts, get_chat_llm_configuration, is_chat_llm_configured, rerank_documents
 
 logger = logging.getLogger(__name__)
 
@@ -718,7 +718,7 @@ def _build_heuristic_retrieval_query_en(query: str, exact_terms: list[str]) -> t
 
 
 def _llm_available_for_grounding() -> bool:
-    return bool(settings.glm_api_key.strip() or settings.openai_api_key.strip())
+    return is_chat_llm_configured()
 
 
 def _query_variants_for_plan(

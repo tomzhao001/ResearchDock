@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models import PaperChunk
 from app.services import rag as legacy_rag
-from app.services.llm import embed_texts
+from app.services.llm import embed_texts, is_embedding_configured
 
 
 class PaperIndexingService:
@@ -27,7 +27,7 @@ class PaperIndexingService:
             structured_summary=structured_summary,
         )
         embeddings: list[list[float]] = []
-        if chunks and (settings.glm_api_key.strip() or settings.openai_api_key.strip()):
+        if chunks and is_embedding_configured():
             try:
                 embeddings = embed_texts([str(chunk.get("embedding_input") or chunk["content"]) for chunk in chunks])
             except Exception:
