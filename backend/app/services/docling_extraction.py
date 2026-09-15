@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import gc
 import io
 import importlib
 import shutil
 import time
 import urllib.request
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
 from app.config import settings
-from app.services.model_cache import configure_model_cache_env, model_cache_metadata
+from app.services.model_cache import configure_model_cache_env, model_cache_metadata, resolve_model_cache_paths
 from app.services.document_extraction import (
     ExtractedBlock,
     ExtractedDocument,
@@ -35,6 +37,68 @@ _RAPIDOCR_V5_LANGUAGE_ARTIFACTS = {
         "rec_keys_path": "paddle/PP-OCRv5/rec/en_PP-OCRv5_rec_mobile/ppocrv5_en_dict.txt",
     },
 }
+
+_CONVERTER_CACHE_MAXSIZE = 2
+_CONVERTER_CACHE: OrderedDict[tuple, object] = OrderedDict()
+
+
+def _converter_config_snapshot(*, ocr_engine: str, force_full_page_ocr: bool, languages: tuple[str, ...]) -> dict[str, Any]:
+    return {
+        "ocr_engine": ocr_engine,
+        "force_full_page_ocr": force_full_page_ocr,
+        "languages": languages,
+        "do_ocr": bool(settings.docling_do_ocr),
+        "do_table_structure": bool(settings.docling_do_table_structure),
+        "generate_picture_images": bool(settings.docling_generate_picture_images),
+        "images_scale": max(0.0, float(settings.docling_images_scale)),
+        "artifacts_path": str(resolve_model_cache_paths().docling),
+        "document_timeout": max(0.0, float(settings.docling_document_timeout_seconds)),
+    }
+
+
+def _converter_cache_key(*, ocr_engine: str, force_full_page_ocr: bool, languages: tuple[str, ...]) -> tuple:
+    snapshot = _converter_config_snapshot(
+        ocr_engine=ocr_engine,
+        force_full_page_ocr=force_full_page_ocr,
+        languages=languages,
+    )
+    return tuple(snapshot.values())
+
+
+def _apply_pdf_pipeline_options(pipeline_options, snapshot: dict[str, Any], *, ocr_options=None) -> None:
+    if hasattr(pipeline_options, "artifacts_path"):
+        pipeline_options.artifacts_path = snapshot["artifacts_path"]
+    pipeline_options.do_ocr = snapshot["do_ocr"]
+    pipeline_options.do_table_structure = snapshot["do_table_structure"]
+    pipeline_options.generate_picture_images = snapshot["generate_picture_images"]
+    pipeline_options.images_scale = snapshot["images_scale"]
+    if snapshot["document_timeout"] > 0:
+        pipeline_options.document_timeout = snapshot["document_timeout"]
+    if ocr_options is not None:
+        pipeline_options.ocr_options = ocr_options
+    current_ocr = getattr(pipeline_options, "ocr_options", None)
+    if current_ocr is not None and hasattr(current_ocr, "force_full_page_ocr"):
+        current_ocr.force_full_page_ocr = snapshot["force_full_page_ocr"]
+
+
+def _get_or_create_converter(key: tuple, pipeline_options) -> object:
+    converter = _CONVERTER_CACHE.get(key)
+    if converter is not None:
+        _CONVERTER_CACHE.move_to_end(key)
+        return converter
+    from docling.datamodel.base_models import InputFormat
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    converter = DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
+        }
+    )
+    _CONVERTER_CACHE[key] = converter
+    while len(_CONVERTER_CACHE) > _CONVERTER_CACHE_MAXSIZE:
+        _evicted_key, evicted = _CONVERTER_CACHE.popitem(last=False)
+        del evicted
+        gc.collect()
+    return converter
 
 
 def _label_name(item: Any) -> str | None:
@@ -301,31 +365,28 @@ class DoclingDocumentExtractor:
     def extract(self, pdf_path: Path) -> ExtractedDocument:
         started = time.monotonic()
         try:
-            from docling.datamodel.base_models import InputFormat
             from docling.datamodel.pipeline_options import EasyOcrOptions, PdfPipelineOptions, RapidOcrOptions, TesseractCliOcrOptions, TesseractOcrOptions
-            from docling.document_converter import DocumentConverter, PdfFormatOption
+            from docling.document_converter import DocumentConverter  # ImportError probe; construction is in _get_or_create_converter
         except ImportError as exc:
             raise RuntimeError("Docling is not installed. Install backend requirements before running PDF ingest.") from exc
 
         cache_paths = configure_model_cache_env()
         _prepare_docling_standard_artifacts(cache_paths.docling)
-        pipeline_options = PdfPipelineOptions()
-        if hasattr(pipeline_options, "artifacts_path"):
-            pipeline_options.artifacts_path = str(cache_paths.docling)
-        pipeline_options.do_ocr = settings.docling_do_ocr
-        pipeline_options.do_table_structure = settings.docling_do_table_structure
-        pipeline_options.generate_picture_images = settings.docling_generate_picture_images
-        pipeline_options.images_scale = float(settings.docling_images_scale)
-        if settings.docling_document_timeout_seconds > 0:
-            pipeline_options.document_timeout = float(settings.docling_document_timeout_seconds)
 
         ocr_engine = self._resolve_docling_ocr_engine()
         languages = [item.strip() for item in (settings.docling_ocr_languages or "").split(",") if item.strip()]
+        snapshot = _converter_config_snapshot(
+            ocr_engine=ocr_engine,
+            force_full_page_ocr=self._resolve_force_full_page_ocr(),
+            languages=tuple(languages),
+        )
+        pipeline_options = PdfPipelineOptions()
+        ocr_options = None
         if ocr_engine == "easyocr":
-            pipeline_options.ocr_options = EasyOcrOptions(lang=languages or ["ch_sim", "en"])
+            ocr_options = EasyOcrOptions(lang=languages or ["ch_sim", "en"])
         elif ocr_engine == "rapidocr":
             manifest = _build_rapidocr_v5_manifest(cache_paths.docling, languages or ["chinese", "english"])
-            pipeline_options.ocr_options = RapidOcrOptions(
+            ocr_options = RapidOcrOptions(
                 lang=languages or ["chinese", "english"],
                 det_model_path=str(_resolve_rapidocr_artifact(*manifest["det_model_path"])),
                 cls_model_path=str(_resolve_rapidocr_artifact(*manifest["cls_model_path"])),
@@ -334,18 +395,22 @@ class DoclingDocumentExtractor:
                 rapidocr_params=_build_rapidocr_v5_params(languages or ["chinese", "english"]),
             )
         elif ocr_engine == "tesserocr":
-            pipeline_options.ocr_options = TesseractOcrOptions(lang=languages or ["chi_sim", "eng"])
+            ocr_options = TesseractOcrOptions(lang=languages or ["chi_sim", "eng"])
         elif ocr_engine == "tesseract":
-            pipeline_options.ocr_options = TesseractCliOcrOptions(lang=languages or ["chi_sim", "eng"])
-        if pipeline_options.ocr_options is not None and hasattr(pipeline_options.ocr_options, "force_full_page_ocr"):
-            pipeline_options.ocr_options.force_full_page_ocr = self._resolve_force_full_page_ocr()
+            ocr_options = TesseractCliOcrOptions(lang=languages or ["chi_sim", "eng"])
+        _apply_pdf_pipeline_options(pipeline_options, snapshot, ocr_options=ocr_options)
 
-        converter = DocumentConverter(
-            format_options={
-                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
-            }
+        key = _converter_cache_key(
+            ocr_engine=ocr_engine,
+            force_full_page_ocr=self._resolve_force_full_page_ocr(),
+            languages=tuple(languages),
         )
-        conversion = converter.convert(str(pdf_path))
+        converter = _get_or_create_converter(key, pipeline_options)
+        try:
+            conversion = converter.convert(str(pdf_path))
+        except Exception:
+            _CONVERTER_CACHE.pop(key, None)
+            raise
         doc = conversion.document
 
         markdown_text = str(doc.export_to_markdown()).strip()

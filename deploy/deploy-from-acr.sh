@@ -46,6 +46,18 @@ require_env() {
   fi
 }
 
+# Warn if leftover celery-queue messages may still be PDF extract tasks.
+# Never blocks deploy. Runs redis-cli inside the redis container.
+check_celery_queue_backlog() {
+  local llen
+  llen=$(docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" exec -T redis redis-cli -n 1 LLEN celery 2>/dev/null) || true
+
+  if [[ -n "$llen" && "$llen" =~ ^[0-9]+$ && "$llen" -gt 0 ]]; then
+    printf '\033[33m%s\033[0m\n' "检测到 celery 队列仍有 ${llen} 条遗留消息。遗留 celery 队列中的旧 PDF 提取任务会被主 worker 转交 extract 队列执行，extract worker 内存充足，一般不会 OOM；仍建议发布前确认队列无 in-flight 遗留任务。"
+  fi
+  return 0
+}
+
 load_env_file "$ENV_FILE"
 
 require_env "ACR_REGISTRY"
@@ -56,14 +68,14 @@ case "$DEPLOY_TARGET" in
     UP_SERVICES=()
     ;;
   app)
-    UP_SERVICES=(backend frontend celery-worker nginx)
+    UP_SERVICES=(backend frontend celery-worker celery-extract-worker nginx)
     ;;
   -h|--help|help)
     cat <<'EOF'
 Usage: bash deploy/deploy-from-acr.sh [all|app]
 
   all  Recreate and deploy the full compose stack.
-  app  Recreate only application services (backend, frontend, celery-worker, nginx).
+  app  Recreate only application services (backend, frontend, celery-worker, celery-extract-worker, nginx).
 EOF
     exit 0
     ;;
@@ -92,13 +104,18 @@ services:
   celery-worker:
     image: ${BACKEND_IMAGE}
     build: null
+  celery-extract-worker:
+    image: ${BACKEND_IMAGE}
+    build: null
   frontend:
     image: ${FRONTEND_IMAGE}
     build: null
 EOF
 
 echo "Pulling images"
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" -f "$OVERRIDE_FILE" pull backend celery-worker frontend
+docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" -f "$OVERRIDE_FILE" pull backend celery-worker celery-extract-worker frontend
+
+check_celery_queue_backlog
 
 if [[ "$DEPLOY_TARGET" == "all" ]]; then
   echo "Starting full stack"
